@@ -1,0 +1,228 @@
+INFO:     Started server process [6796]
+INFO:     Waiting for application startup.
+09:27:44 INFO     Adding job tentatively -- it will be properly scheduled when the scheduler starts
+09:27:44 INFO     Added job "SignalBolt 15-min scan" to job store "default"
+09:27:44 INFO     Scheduler started
+09:27:44 INFO     [runner] Scheduler started — every 15 minutes
+09:27:44 INFO     Running job "SignalBolt 15-min scan (trigger: interval[0:15:00], next run at: 2026-05-14 09:42:44 CDT)" (scheduled at 2026-05-14 14:27:44.056984+00:00)
+09:27:44 INFO     SignalBolt engine started — scanning every 15 minutes
+INFO:     Application startup complete.
+09:27:44 INFO     [runner] Scan started at 2026-05-14 14:27:44 UTC — 11 tickers
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+09:27:44 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.AAPL&status=eq.active "HTTP/2 200 OK"
+09:27:45 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.MSFT&status=eq.active "HTTP/2 200 OK"
+09:27:47 INFO     [runner] MSFT: score=71 (L1=20 L2=17 L3=10 L4=10)
+09:27:47 INFO     HTTP Request: POST https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals "HTTP/2 201 Created"
+09:27:47 INFO     [runner] SIGNAL SAVED  MSFT   LONG  entry=405.63  score=71
+09:27:47 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.NVDA&status=eq.active "HTTP/2 200 OK"
+09:27:48 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.GOOGL&status=eq.active "HTTP/2 200 OK"
+09:27:49 INFO     [runner] GOOGL: score=51 (L1=7 L2=14 L3=10 L4=10)
+09:27:49 INFO     [runner] GOOGL: score 51 < 75 — not firing
+09:27:49 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.META&status=eq.active "HTTP/2 200 OK"
+09:27:50 INFO     [runner] META: score=71 (L1=20 L2=17 L3=10 L4=10)
+09:27:50 INFO     HTTP Request: POST https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals "HTTP/2 201 Created"
+09:27:50 INFO     [runner] SIGNAL SAVED  META   LONG  entry=616.6001  score=71
+09:27:50 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.TSLA&status=eq.active "HTTP/2 200 OK"
+09:27:51 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.AMD&status=eq.active "HTTP/2 200 OK"
+09:27:52 INFO     [runner] AMD: score=57 (L1=13 L2=13 L3=10 L4=10)
+09:27:52 INFO     [runner] AMD: score 57 < 75 — not firing
+09:27:52 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.SPY&status=eq.active "HTTP/2 200 OK"
+09:27:52 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.QQQ&status=eq.active "HTTP/2 200 OK"
+09:27:54 INFO     [runner] QQQ: score=65 (L1=17 L2=17 L3=10 L4=8)
+09:27:54 INFO     HTTP Request: POST https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals "HTTP/2 201 Created"
+09:27:54 INFO     [runner] SIGNAL SAVED  QQQ    LONG  entry=715.69  score=65
+09:27:54 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.COIN&status=eq.active "HTTP/2 200 OK"
+09:27:55 INFO     [runner] COIN: score=42 (L1=8 L2=6 L3=10 L4=10)
+09:27:55 INFO     [runner] COIN: score 42 < 75 — not firing
+09:27:55 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.PLTR&status=eq.active "HTTP/2 200 OK"
+09:27:57 INFO     [runner] PLTR: score=40 (L1=6 L2=6 L3=10 L4=10)
+09:27:57 INFO     [runner] PLTR: score 40 < 75 — not firing
+09:27:57 INFO     [runner] Scan complete — processed 11/11 tickers
+09:27:57 INFO     Job "SignalBolt 15-min scan (trigger: interval[0:15:00], next run at: 2026-05-14 09:42:44 CDT)" executed successfully
+09:32:44 INFO     [runner] Scan started at 2026-05-14 14:32:44 UTC — 1 tickers
+09:32:47 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.STRING&status=eq.active "HTTP/2 200 OK"
+09:32:50 ERROR    HTTP Error 404: {"quoteSummary":{"result":null,"error":{"code":"Not Found","description":"Quote not found for symbol: STRING"}}}
+09:32:52 ERROR    $STRING: possibly delisted; no price data found  (period=10d) (Yahoo error = "No data found, symbol may be delisted")
+09:32:52 ERROR    
+1 Failed download:
+09:32:52 ERROR    ['STRING']: possibly delisted; no price data found  (period=10d) (Yahoo error = "No data found, symbol may be delisted")
+09:32:52 INFO     [runner] STRING: no clear SMC direction
+09:32:52 INFO     [runner] Scan complete — processed 1/1 tickers
+09:34:34 INFO     [runner] Scan started at 2026-05-14 14:34:34 UTC — 5 tickers
+09:34:36 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.QQQ&status=eq.active "HTTP/2 200 OK"
+09:34:36 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.META&status=eq.active "HTTP/2 200 OK"
+09:34:36 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.AMD&status=eq.active "HTTP/2 200 OK"
+09:34:38 INFO     [runner] AMD: score=57 (L1=13 L2=13 L3=10 L4=10)
+09:34:38 INFO     [runner] AMD: score 57 < 75 — not firing
+09:34:38 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.MSFT&status=eq.active "HTTP/2 200 OK"
+09:34:38 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.GOOGL&status=eq.active "HTTP/2 200 OK"
+09:34:39 INFO     [runner] GOOGL: score=51 (L1=7 L2=14 L3=10 L4=10)
+09:34:39 INFO     [runner] GOOGL: score 51 < 75 — not firing
+09:34:39 INFO     [runner] Scan complete — processed 5/5 tickers
+09:35:28 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+09:37:47 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+09:42:44 INFO     Running job "SignalBolt 15-min scan (trigger: interval[0:15:00], next run at: 2026-05-14 09:57:44 CDT)" (scheduled at 2026-05-14 09:42:44.056984-05:00)
+09:42:44 INFO     [runner] Scan started at 2026-05-14 14:42:44 UTC — 11 tickers
+09:42:46 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.AAPL&status=eq.active "HTTP/2 200 OK"
+09:42:47 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.MSFT&status=eq.active "HTTP/2 200 OK"
+09:42:47 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.NVDA&status=eq.active "HTTP/2 200 OK"
+09:42:47 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.GOOGL&status=eq.active "HTTP/2 200 OK"
+09:42:49 INFO     [runner] GOOGL: score=51 (L1=7 L2=14 L3=10 L4=10)
+09:42:49 INFO     [runner] GOOGL: score 51 < 75 — not firing
+09:42:49 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.META&status=eq.active "HTTP/2 200 OK"
+09:42:49 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.TSLA&status=eq.active "HTTP/2 200 OK"
+09:42:49 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.AMD&status=eq.active "HTTP/2 200 OK"
+09:42:50 INFO     [runner] AMD: score=56 (L1=12 L2=13 L3=10 L4=10)
+09:42:50 INFO     [runner] AMD: score 56 < 75 — not firing
+09:42:51 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.SPY&status=eq.active "HTTP/2 200 OK"
+09:42:51 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.QQQ&status=eq.active "HTTP/2 200 OK"
+09:42:51 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.COIN&status=eq.active "HTTP/2 200 OK"
+09:42:52 INFO     [runner] COIN: score=45 (L1=10 L2=6 L3=10 L4=10)
+09:42:52 INFO     [runner] COIN: score 45 < 75 — not firing
+09:42:52 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.PLTR&status=eq.active "HTTP/2 200 OK"
+09:42:54 INFO     [runner] PLTR: score=49 (L1=8 L2=11 L3=10 L4=10)
+09:42:54 INFO     [runner] PLTR: score 49 < 75 — not firing
+09:42:54 INFO     [runner] Scan complete — processed 11/11 tickers
+09:42:54 INFO     Job "SignalBolt 15-min scan (trigger: interval[0:15:00], next run at: 2026-05-14 09:57:44 CDT)" executed successfully
+09:54:16 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+09:54:18 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+09:55:16 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+09:56:16 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+09:57:16 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+09:57:44 INFO     Running job "SignalBolt 15-min scan (trigger: interval[0:15:00], next run at: 2026-05-14 10:12:44 CDT)" (scheduled at 2026-05-14 09:57:44.056984-05:00)
+09:57:44 INFO     [runner] Scan started at 2026-05-14 14:57:44 UTC — 11 tickers
+09:57:46 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.AAPL&status=eq.active "HTTP/2 200 OK"
+09:57:46 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.MSFT&status=eq.active "HTTP/2 200 OK"
+09:57:46 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.NVDA&status=eq.active "HTTP/2 200 OK"
+09:57:46 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.GOOGL&status=eq.active "HTTP/2 200 OK"
+09:57:48 INFO     [runner] GOOGL: score=57 (L1=12 L2=14 L3=10 L4=10)
+09:57:48 INFO     [runner] GOOGL: score 57 < 75 — not firing
+09:57:48 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.META&status=eq.active "HTTP/2 200 OK"
+09:57:48 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.TSLA&status=eq.active "HTTP/2 200 OK"
+09:57:48 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.AMD&status=eq.active "HTTP/2 200 OK"
+09:57:50 INFO     [runner] AMD: score=54 (L1=10 L2=13 L3=10 L4=10)
+09:57:50 INFO     [runner] AMD: score 54 < 75 — not firing
+09:57:50 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.SPY&status=eq.active "HTTP/2 200 OK"
+09:57:50 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.QQQ&status=eq.active "HTTP/2 200 OK"
+09:57:50 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.COIN&status=eq.active "HTTP/2 200 OK"
+09:57:52 INFO     [runner] COIN: score=48 (L1=5 L2=13 L3=10 L4=10)
+09:57:52 INFO     [runner] COIN: score 48 < 75 — not firing
+09:57:52 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.PLTR&status=eq.active "HTTP/2 200 OK"
+09:57:53 INFO     [runner] PLTR: score=49 (L1=8 L2=11 L3=10 L4=10)
+09:57:53 INFO     [runner] PLTR: score 49 < 75 — not firing
+09:57:53 INFO     [runner] Scan complete — processed 11/11 tickers
+09:57:53 INFO     Job "SignalBolt 15-min scan (trigger: interval[0:15:00], next run at: 2026-05-14 10:12:44 CDT)" executed successfully
+09:58:16 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+09:59:16 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:00:16 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:02:00 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:03:00 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:04:01 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:05:00 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:06:00 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:07:00 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:08:00 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:08:33 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:08:39 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:09:39 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:10:39 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:11:39 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:12:22 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:12:39 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:12:44 INFO     Running job "SignalBolt 15-min scan (trigger: interval[0:15:00], next run at: 2026-05-14 10:27:44 CDT)" (scheduled at 2026-05-14 10:12:44.056984-05:00)
+10:12:44 INFO     [runner] Scan started at 2026-05-14 15:12:44 UTC — 11 tickers
+10:12:46 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.AAPL&status=eq.active "HTTP/2 200 OK"
+10:12:46 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.MSFT&status=eq.active "HTTP/2 200 OK"
+10:12:46 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.NVDA&status=eq.active "HTTP/2 200 OK"
+10:12:46 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.GOOGL&status=eq.active "HTTP/2 200 OK"
+10:12:49 INFO     [runner] GOOGL: score=57 (L1=12 L2=14 L3=10 L4=10)
+10:12:49 INFO     [runner] GOOGL: score 57 < 75 — not firing
+10:12:49 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.META&status=eq.active "HTTP/2 200 OK"
+10:12:49 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.TSLA&status=eq.active "HTTP/2 200 OK"
+10:12:49 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.AMD&status=eq.active "HTTP/2 200 OK"
+10:12:50 INFO     [runner] AMD: score=54 (L1=10 L2=13 L3=10 L4=10)
+10:12:50 INFO     [runner] AMD: score 54 < 75 — not firing
+10:12:50 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.SPY&status=eq.active "HTTP/2 200 OK"
+10:12:50 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.QQQ&status=eq.active "HTTP/2 200 OK"
+10:12:51 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.COIN&status=eq.active "HTTP/2 200 OK"
+10:12:52 INFO     [runner] COIN: score=50 (L1=7 L2=13 L3=10 L4=10)
+10:12:52 INFO     [runner] COIN: score 50 < 75 — not firing
+10:12:52 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.PLTR&status=eq.active "HTTP/2 200 OK"
+10:12:54 INFO     [runner] PLTR: score=54 (L1=8 L2=15 L3=10 L4=10)
+10:12:54 INFO     [runner] PLTR: score 54 < 75 — not firing
+10:12:54 INFO     [runner] Scan complete — processed 11/11 tickers
+10:12:54 INFO     Job "SignalBolt 15-min scan (trigger: interval[0:15:00], next run at: 2026-05-14 10:27:44 CDT)" executed successfully
+10:13:23 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:13:40 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:14:23 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:14:39 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:15:23 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:16:01 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:16:23 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:17:00 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:17:23 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:18:00 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:18:23 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:18:39 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:19:39 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:20:00 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:21:00 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:21:02 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:22:00 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:22:03 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:22:45 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:22:59 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:23:23 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:23:39 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:24:23 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:25:01 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:25:24 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:26:00 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:27:00 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:27:02 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:27:44 INFO     Running job "SignalBolt 15-min scan (trigger: interval[0:15:00], next run at: 2026-05-14 10:42:44 CDT)" (scheduled at 2026-05-14 10:27:44.056984-05:00)
+10:27:44 INFO     [runner] Scan started at 2026-05-14 15:27:44 UTC — 11 tickers
+10:27:45 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.AAPL&status=eq.active "HTTP/2 200 OK"
+10:27:45 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.MSFT&status=eq.active "HTTP/2 200 OK"
+10:27:45 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.NVDA&status=eq.active "HTTP/2 200 OK"
+10:27:45 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.GOOGL&status=eq.active "HTTP/2 200 OK"
+10:27:47 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:27:47 INFO     [runner] GOOGL: score=57 (L1=12 L2=14 L3=10 L4=10)
+10:27:47 INFO     [runner] GOOGL: score 57 < 75 — not firing
+10:27:47 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.META&status=eq.active "HTTP/2 200 OK"
+10:27:47 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.TSLA&status=eq.active "HTTP/2 200 OK"
+10:27:47 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.AMD&status=eq.active "HTTP/2 200 OK"
+10:27:48 INFO     [runner] AMD: score=54 (L1=10 L2=13 L3=10 L4=10)
+10:27:48 INFO     [runner] AMD: score 54 < 75 — not firing
+10:27:48 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.SPY&status=eq.active "HTTP/2 200 OK"
+10:27:48 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.QQQ&status=eq.active "HTTP/2 200 OK"
+10:27:49 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.COIN&status=eq.active "HTTP/2 200 OK"
+10:27:50 INFO     [runner] COIN: score=62 (L1=17 L2=13 L3=10 L4=10)
+10:27:50 INFO     HTTP Request: POST https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals "HTTP/2 201 Created"
+10:27:50 INFO     [runner] SIGNAL SAVED  COIN   LONG  entry=201.25  score=62
+10:27:50 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=id&ticker=eq.PLTR&status=eq.active "HTTP/2 200 OK"
+10:27:51 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:27:51 INFO     [runner] PLTR: score=54 (L1=8 L2=15 L3=10 L4=10)
+10:27:51 INFO     [runner] PLTR: score 54 < 75 — not firing
+10:27:51 INFO     [runner] Scan complete — processed 11/11 tickers
+10:27:51 INFO     Job "SignalBolt 15-min scan (trigger: interval[0:15:00], next run at: 2026-05-14 10:42:44 CDT)" executed successfully
+10:27:59 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:28:51 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:29:00 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:29:51 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:30:00 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:30:52 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:31:01 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:31:52 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:37:54 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:37:55 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:37:56 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:38:52 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:39:02 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:39:52 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:40:00 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:41:00 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:41:03 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:41:57 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:42:00 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"
+10:42:26 INFO     HTTP Request: GET https://hjfgfeytefituywnopwt.supabase.co/rest/v1/signals?select=%2A&order=created_at.desc&limit=20 "HTTP/2 200 OK"

@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile main.py)",
+      "Bash(python -m py_compile engine/smc.py)",
+      "Bash(python -m py_compile engine/scorer.py)",
+      "Bash(python -m py_compile engine/explainer.py)",
+      "Bash(python -m py_compile engine/runner.py)",
+      "Bash(py --version)",
+      "PowerShell(Get-Command *)",
+      "PowerShell(Get-ChildItem \"C:\\\\Users\\\\jaaik\" -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match \"python|conda|pyenv|venv|env\" } | Select-Object Name)",
+      "PowerShell(Invoke-RestMethod -Uri \"http://localhost:8000/signals\" -Method GET | ConvertTo-Json -Depth 5)",
+      "Bash(curl -s http://localhost:8000/health)",
+      "Bash(curl -s http://localhost:8000/signals)",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl *)",
+      "Bash(python3 -c ' *)",
+      "PowerShell(npm *)"
+    ]
+  }
+}
