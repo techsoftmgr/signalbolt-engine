@@ -41,6 +41,15 @@ from engine import smc, push
 
 logger = logging.getLogger("signalbolt.monitor")
 
+# ── In-memory status cache ────────────────────────────────────────────────────
+# Tracks last known status per signal_id so we only log events on transitions.
+# Lost on engine restart — that's fine, the signal_events table is the truth.
+# Structure: { signal_id: "near_stop" | "below_entry" | "in_profit" |
+#                         "building_profit" | "strong_profit" | "at_target" }
+_STATUS_CACHE: dict[str, str] = {}
+# Track which signals have already received an EOD warning this session
+_EOD_WARNED: set[str] = set()
+
 ET = ZoneInfo("America/New_York")
 
 # ── Strategy close rules ──────────────────────────────────────────────────────
@@ -106,6 +115,98 @@ def _current_price(ticker: str) -> Optional[float]:
         return float(p) if p else None
     except Exception:
         return None
+
+
+# ── Status derivation ─────────────────────────────────────────────────────────
+
+def _derive_status(price: float, entry: float, t1: float, sl: float,
+                   direction: str) -> str:
+    """
+    Compute a status label from price vs key levels.
+    Returns one of: near_stop | below_entry | in_profit |
+                    building_profit | strong_profit | at_target
+    """
+    is_long    = direction == "LONG"
+    stop_dist  = abs(entry - sl)
+    target_dist = abs(t1 - entry)
+
+    if target_dist == 0:
+        return "in_profit" if (is_long and price > entry) or (not is_long and price < entry) else "below_entry"
+
+    # Progress toward target (negative = going wrong way)
+    progress = ((price - entry) / target_dist) if is_long else ((entry - price) / target_dist)
+
+    near_stop_pct = ((entry - price) / stop_dist) if is_long else ((price - entry) / stop_dist)
+
+    if near_stop_pct >= 0.80:          return "near_stop"
+    if progress >= 1.0:                return "at_target"
+    if progress >= 0.60:               return "strong_profit"
+    if progress >= 0.30:               return "building_profit"
+    if progress > 0:                   return "in_profit"
+    return "below_entry"
+
+
+# ── Momentum analysis for early booking ──────────────────────────────────────
+
+def _momentum_check(ticker: str, direction: str) -> tuple[bool, str]:
+    """
+    Returns (book_now, reason) using RSI + MACD on 5-min bars.
+    book_now=True means momentum is failing — engine recommends booking profit.
+    """
+    try:
+        import ta
+        df = yf.download(ticker, period="2d", interval="5m", progress=False, auto_adjust=True)
+        if df.empty or len(df) < 20:
+            return False, ""
+
+        close = df["Close"].squeeze()
+        rsi   = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
+        macd  = ta.trend.MACD(close)
+        macd_line = macd.macd().iloc[-1]
+        signal_line = macd.macd_signal().iloc[-1]
+
+        is_long = direction == "LONG"
+
+        # Overbought / oversold
+        if is_long and rsi > 72:
+            return True, f"RSI overbought ({rsi:.0f}) — momentum likely to stall"
+        if not is_long and rsi < 28:
+            return True, f"RSI oversold ({rsi:.0f}) — momentum likely to stall"
+
+        # MACD bearish crossover (for LONG) or bullish (for SHORT)
+        if is_long and macd_line < signal_line and macd_line > 0:
+            return True, "MACD bearish crossover — momentum weakening near target"
+        if not is_long and macd_line > signal_line and macd_line < 0:
+            return True, "MACD bullish crossover — momentum weakening near target"
+
+    except Exception as e:
+        logger.debug(f"[monitor] Momentum check failed for {ticker}: {e}")
+
+    return False, ""
+
+
+# ── Status event helpers ──────────────────────────────────────────────────────
+
+_STATUS_LABELS = {
+    "near_stop":       ("⚠️", "Near Stop — Watch closely"),
+    "below_entry":     ("↩",  "Below Entry — Waiting for recovery"),
+    "in_profit":       ("💹", "In Profit — Hold, target not reached"),
+    "building_profit": ("📈", "Building Profit — Approaching target"),
+    "strong_profit":   ("🔥", "Strong Profit — Consider booking partial"),
+    "at_target":       ("🎯", "At Target — Book profit"),
+}
+
+
+def _log_status_event(sb: Client, sig_id: str, status: str,
+                      price: float | None, extra: str = "") -> None:
+    """Log a status-change event to signal_events timeline."""
+    emoji, base_label = _STATUS_LABELS.get(status, ("•", status))
+    note = f"{emoji} {base_label}"
+    if extra:
+        note += f" — {extra}"
+    if price:
+        note += f" (${price:.2f})"
+    _log_event(sb, sig_id, status, price=price, note=note)
 
 
 def _close_signal(
@@ -230,12 +331,30 @@ def _push_market_close(ticker: str, direction: str, strategy: str, pnl_pct: floa
 
 
 def _push_eod_warning(ticker: str, direction: str, pnl_pct: float) -> None:
-    """Push a 'closing soon' alert when a signal is in profit at 3 PM ET."""
-    mins_left = 60  # approx minutes to 4 PM when warning fires at 3 PM
+    now_et   = datetime.now(ZoneInfo("America/New_York"))
+    mins_left = max(0, (16 * 60) - (now_et.hour * 60 + now_et.minute))
     push._send_raw(
         title=f"📊 {ticker} +{pnl_pct:.1f}% — {mins_left} min to close",
         body=f"Your {direction} signal is in profit. Consider booking before market close.",
         data={"type": "eod_warning", "ticker": ticker},
+    )
+
+
+def _push_early_book(ticker: str, direction: str, pnl_pct: float, reason: str) -> None:
+    push._send_raw(
+        title=f"💡 Book Profit Now — {ticker} +{pnl_pct:.1f}%",
+        body=reason,
+        data={"type": "book_profit", "ticker": ticker},
+    )
+
+
+def _push_status_change(ticker: str, status: str, pnl_pct: float | None) -> None:
+    emoji, label = _STATUS_LABELS.get(status, ("•", status))
+    pnl_str = f" ({'+' if pnl_pct and pnl_pct > 0 else ''}{pnl_pct:.1f}%)" if pnl_pct is not None else ""
+    push._send_raw(
+        title=f"{emoji} {ticker}{pnl_str} — {label.split(' — ')[0]}",
+        body=label.split(" — ", 1)[-1] if " — " in label else label,
+        data={"type": "status_change", "ticker": ticker, "status": status},
     )
 
 
@@ -379,25 +498,58 @@ def _monitor_stocks(sb: Client) -> None:
         if not market_open:
             continue
 
-        # ── 3. T1 → breakeven SL upgrade ─────────────────────────────────────
+        # ── Get price + levels once for all checks below ──────────────────────
         try:
             entry  = float(sig["entry_price"])
             t1     = float(sig["target_one"])
-            sl     = float(sig["stop_loss"])
             t2     = float(sig["target_two"])
+            sl     = float(sig["stop_loss"])
             price  = _current_price(ticker)
+        except Exception as e:
+            logger.debug(f"[monitor] Level parse error for {ticker}: {e}")
+            continue
 
-            if price and sl != entry:   # SL not already at breakeven
-                is_long = direction == "LONG"
-                t1_hit  = (is_long and price >= t1) or (not is_long and price <= t1)
-                t2_hit  = (is_long and price >= t2) or (not is_long and price <= t2)
+        if not price:
+            continue
+
+        is_long  = direction == "LONG"
+        pnl_pct  = ((price - entry) / entry * 100) if is_long else ((entry - price) / entry * 100)
+
+        # ── 3. Status change tracking + event logging ─────────────────────────
+        try:
+            new_status = _derive_status(price, entry, t1, sl, direction)
+            old_status = _STATUS_CACHE.get(sig["id"])
+
+            if new_status != old_status:
+                _STATUS_CACHE[sig["id"]] = new_status
+                _log_status_event(sb, sig["id"], new_status, price,
+                                  extra=f"{'+' if pnl_pct >= 0 else ''}{pnl_pct:.1f}%")
+                # Push notification for important transitions only
+                push_statuses = {"near_stop", "strong_profit", "at_target"}
+                if new_status in push_statuses:
+                    try:
+                        _push_status_change(ticker, new_status, pnl_pct)
+                    except Exception:
+                        pass
+                logger.info(
+                    f"[monitor] {ticker} status: {old_status} → {new_status} "
+                    f"price={price:.2f} pnl={pnl_pct:+.2f}%"
+                )
+        except Exception as e:
+            logger.debug(f"[monitor] Status tracking error for {ticker}: {e}")
+
+        # ── 4. T1 hit → move SL to breakeven ─────────────────────────────────
+        try:
+            if sl != entry:   # not already at breakeven
+                t1_hit = (is_long and price >= t1) or (not is_long and price <= t1)
+                t2_hit = (is_long and price >= t2) or (not is_long and price <= t2)
 
                 if t1_hit and not t2_hit:
                     pct = abs(price - entry) / entry * 100
-                    logger.info(f"[monitor] {ticker} T1 hit @ {price:.2f} — moving SL to breakeven {entry:.2f}")
+                    logger.info(f"[monitor] {ticker} T1 hit @ {price:.2f} — moving SL to breakeven")
                     _update_sl(sb, sig["id"], entry)
                     _log_event(sb, sig["id"], "t1_hit", price=price,
-                               note=f"T1 hit @ ${price:.2f} (+{pct:.1f}%) — stop moved to breakeven ${entry:.2f}")
+                               note=f"🎯 T1 hit @ ${price:.2f} (+{pct:.1f}%) — stop moved to breakeven ${entry:.2f}")
                     try:
                         _push_t1_breakeven(ticker, direction, pct)
                     except Exception:
@@ -405,14 +557,53 @@ def _monitor_stocks(sb: Client) -> None:
         except Exception as e:
             logger.debug(f"[monitor] T1 check error for {ticker}: {e}")
 
-        # ── 4. Structure reversal detection ───────────────────────────────────
+        # ── 5. Intelligent early booking ──────────────────────────────────────
+        # Book profit early when quant conditions indicate momentum is failing.
+        # Only applies to in-profit signals that are building/strong profit.
+        try:
+            current_status = _STATUS_CACHE.get(sig["id"], "")
+            should_assess  = current_status in ("building_profit", "strong_profit") and pnl_pct > 0.5
+
+            if should_assess:
+                book_now, reason = _momentum_check(ticker, direction)
+
+                # Also book early if age > 2h and signal is stuck (stalling)
+                if not book_now and age_mins > 120 and current_status == "building_profit":
+                    book_now = True
+                    reason   = f"Signal stalling after {age_mins:.0f} min — booking profit to protect gains"
+
+                # Book if session is winding down (2:00 PM+) and building profit
+                if not book_now and current_status in ("building_profit", "strong_profit"):
+                    now_et = datetime.now(ZoneInfo("America/New_York"))
+                    if now_et.hour >= 14 and now_et.minute >= 0:
+                        book_now = True
+                        reason   = f"Afternoon session — booking profit at +{pnl_pct:.1f}% to avoid reversal"
+
+                if book_now:
+                    logger.info(f"[monitor] {ticker} EARLY BOOK — {reason} pnl={pnl_pct:.1f}%")
+                    _close_signal(sb, sig["id"], "target_hit",
+                                  current_price=price, entry_price=entry, direction=direction)
+                    _log_event(sb, sig["id"], "closed_win", price=price,
+                               note=f"💡 Profit booked @ ${price:.2f} (+{pnl_pct:.1f}%) — {reason}")
+                    _STATUS_CACHE.pop(sig["id"], None)
+                    try:
+                        _push_early_book(ticker, direction, pnl_pct, reason)
+                    except Exception:
+                        pass
+                    continue   # signal is now closed
+        except Exception as e:
+            logger.debug(f"[monitor] Early booking check error for {ticker}: {e}")
+
+        # ── 6. Structure reversal detection ───────────────────────────────────
         try:
             if _detect_structure_reversal(ticker, direction):
                 logger.info(f"[monitor] {ticker} structure reversed — closing {direction} early")
-                _close_signal(sb, sig["id"], "structure_reversal")
+                _close_signal(sb, sig["id"], "structure_reversal",
+                              current_price=price, entry_price=entry, direction=direction)
                 opposite = "bearish" if direction == "LONG" else "bullish"
-                _log_event(sb, sig["id"], "reversal",
-                           note=f"{opposite.capitalize()} CHoCH detected — {direction} closed early")
+                _log_event(sb, sig["id"], "reversal", price=price,
+                           note=f"⚠️ {opposite.capitalize()} CHoCH detected — {direction} closed early @ ${price:.2f} ({'+' if pnl_pct >= 0 else ''}{pnl_pct:.1f}%)")
+                _STATUS_CACHE.pop(sig["id"], None)
                 try:
                     _push_reversal(ticker, direction)
                 except Exception:

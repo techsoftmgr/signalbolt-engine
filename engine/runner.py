@@ -1115,30 +1115,36 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled maintenance every 15 min")
 
-    # ── EOD signal monitor: every 5 min from 2:55 PM to 4:05 PM ET ──────
-    # Runs signal_monitor only — no strategy scans. Fires frequently enough
-    # to catch the 3:00 PM warning window and the 3:30 PM force-close window
-    # without the coarse 15-min gap of the main maintenance cycle.
-    def _eod_monitor_job():
+    # ── Market-hours signal monitor: every 5 min during full trading day ────
+    # Runs signal_monitor only (no strategy scans). Fires throughout the trading
+    # day so status tracking, T1 breakeven moves, and intelligent early booking
+    # react within 5 min instead of waiting for the coarse 15-min maintenance
+    # cycle. The 15-min maintenance still runs track_signals + _close_signals in
+    # addition to signal_monitor.
+    #
+    # Market hours window: 9:30 AM (570 min) to 4:05 PM (965 min) ET, Mon-Fri.
+    # The 35-min cushion past 4:00 PM ensures the 3:30 PM force-close job
+    # fires even if the scheduler fires slightly late.
+    def _market_monitor_job():
         from zoneinfo import ZoneInfo as _ZI
         from datetime import datetime as _dt
         _now = _dt.now(_ZI("America/New_York"))
         _mins = _now.hour * 60 + _now.minute
-        # Only run during 2:55 PM (875) to 4:05 PM (965) ET window
-        if 875 <= _mins <= 965 and _now.weekday() < 5:
+        # 9:30 AM = 570 min, 4:05 PM = 965 min
+        if 570 <= _mins <= 965 and _now.weekday() < 5:
             try:
                 signal_monitor.run()
             except Exception as _e:
-                logger.error(f"[runner] EOD monitor failed: {_e}")
+                logger.error(f"[runner] Market monitor failed: {_e}")
 
     scheduler.add_job(
-        _eod_monitor_job,
+        _market_monitor_job,
         trigger=IntervalTrigger(minutes=5),
         id="eod_monitor",
-        name="EOD signal monitor (5-min near close)",
+        name="Market-hours signal monitor (5-min, 9:30 AM–4:05 PM ET)",
         replace_existing=True,
     )
-    logger.info("[runner] Scheduled EOD signal monitor every 5 min (active 2:55–4:05 PM ET)")
+    logger.info("[runner] Scheduled market-hours signal monitor every 5 min (9:30 AM–4:05 PM ET)")
 
     # ── Weekly self-learning optimization (Sunday 2 AM UTC) ──────────────
     from apscheduler.triggers.cron import CronTrigger
