@@ -198,11 +198,36 @@ def _has_active_signal(sb: Client, ticker: str, strategy_type: str) -> bool:
 
 def _write_signal(sb: Client, row: dict) -> None:
     try:
-        sb.table("signals").insert(row).execute()
+        result = sb.table("signals").insert(row).execute()
         logger.info(
             f"[runner] SIGNAL SAVED  {row['ticker']:6s} {row['direction']:5s} "
             f"[{row.get('strategy_type','?')}]  entry={row['entry_price']}  score={row['confidence_score']}"
         )
+        # Log the initial "fired" event so History always has a starting entry
+        try:
+            sig_id = result.data[0]["id"] if result.data else None
+            if sig_id:
+                strategy   = (row.get("strategy_type") or "day_trade").replace("_", " ").title()
+                direction  = row.get("direction", "LONG")
+                entry      = row.get("entry_price", 0)
+                score      = row.get("confidence_score", 0)
+                t1         = row.get("target_one", 0)
+                sl         = row.get("stop_loss", 0)
+                regime     = row.get("regime_type", "")
+                regime_str = f" · Regime: {regime}" if regime else ""
+                note = (
+                    f"🟢 {direction} signal fired @ ${entry:.2f} — "
+                    f"{score}% conviction ({strategy}){regime_str} · "
+                    f"Target ${t1:.2f} · Stop ${sl:.2f}"
+                )
+                sb.table("signal_events").insert({
+                    "signal_id":  sig_id,
+                    "event_type": "fired",
+                    "price":      float(entry),
+                    "note":       note,
+                }).execute()
+        except Exception as _e:
+            logger.debug(f"[runner] fired event log failed: {_e}")
     except Exception as e:
         logger.error(f"[runner] Supabase insert failed for {row['ticker']}: {e}")
 
@@ -1114,6 +1139,37 @@ def start_scheduler() -> BackgroundScheduler:
         next_run_time=now,
     )
     logger.info("[runner] Scheduled maintenance every 15 min")
+
+    # ── Market-hours signal monitor: every 5 min during full trading day ────
+    # Runs signal_monitor only (no strategy scans). Fires throughout the trading
+    # day so status tracking, T1 breakeven moves, and intelligent early booking
+    # react within 5 min instead of waiting for the coarse 15-min maintenance
+    # cycle. The 15-min maintenance still runs track_signals + _close_signals in
+    # addition to signal_monitor.
+    #
+    # Market hours window: 9:30 AM (570 min) to 4:05 PM (965 min) ET, Mon-Fri.
+    # The 35-min cushion past 4:00 PM ensures the 3:30 PM force-close job
+    # fires even if the scheduler fires slightly late.
+    def _market_monitor_job():
+        from zoneinfo import ZoneInfo as _ZI
+        from datetime import datetime as _dt
+        _now = _dt.now(_ZI("America/New_York"))
+        _mins = _now.hour * 60 + _now.minute
+        # 9:30 AM = 570 min, 4:05 PM = 965 min
+        if 570 <= _mins <= 965 and _now.weekday() < 5:
+            try:
+                signal_monitor.run()
+            except Exception as _e:
+                logger.error(f"[runner] Market monitor failed: {_e}")
+
+    scheduler.add_job(
+        _market_monitor_job,
+        trigger=IntervalTrigger(minutes=5),
+        id="eod_monitor",
+        name="Market-hours signal monitor (5-min, 9:30 AM–4:05 PM ET)",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled market-hours signal monitor every 5 min (9:30 AM–4:05 PM ET)")
 
     # ── Weekly self-learning optimization (Sunday 2 AM UTC) ──────────────
     from apscheduler.triggers.cron import CronTrigger

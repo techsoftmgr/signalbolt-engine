@@ -41,6 +41,15 @@ from engine import smc, push
 
 logger = logging.getLogger("signalbolt.monitor")
 
+# ── In-memory status cache ────────────────────────────────────────────────────
+# Tracks last known status per signal_id so we only log events on transitions.
+# Lost on engine restart — that's fine, the signal_events table is the truth.
+# Structure: { signal_id: "near_stop" | "below_entry" | "in_profit" |
+#                         "building_profit" | "strong_profit" | "at_target" }
+_STATUS_CACHE: dict[str, str] = {}
+# Track which signals have already received an EOD warning this session
+_EOD_WARNED: set[str] = set()
+
 ET = ZoneInfo("America/New_York")
 
 # ── Strategy close rules ──────────────────────────────────────────────────────
@@ -50,9 +59,11 @@ INTRADAY_STRATEGIES = {"scalping", "day_trade", "options_flow"}
 # Scalping max hold in minutes (regardless of market hours)
 SCALP_MAX_HOLD_MINS = 30
 
-# Market close trigger: close all intraday signals at this ET time
-MARKET_CLOSE_HOUR   = 15   # 3 PM
-MARKET_CLOSE_MINUTE = 50   # 3:50 PM → 10 min buffer before 4 PM
+# Market close stages for intraday signals
+# EOD_WARN  → push "N min to close, consider booking profit" (no auto-close)
+# FORCE_CLOSE → auto-close all intraday positions with accurate P&L
+EOD_WARN_HOUR,   EOD_WARN_MINUTE   = 15, 0    # 3:00 PM ET — early profit warning
+MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE = 15, 30  # 3:30 PM ET — force-close all intraday
 
 
 # ---------------------------------------------------------------------------
@@ -79,16 +90,23 @@ def _is_market_hours() -> bool:
 
 
 def _is_near_market_close() -> bool:
-    """True from 3:50 PM ET onwards on a trading day."""
+    """True from 3:30 PM ET — force-close window for all intraday positions."""
     now = _now_et()
     if now.weekday() >= 5:
         return False
-    trigger = now.replace(
-        hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MINUTE,
-        second=0, microsecond=0,
-    )
-    close = now.replace(hour=16, minute=0, second=0, microsecond=0)
-    return trigger <= now <= close
+    trigger = now.replace(hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MINUTE, second=0, microsecond=0)
+    hard_close = now.replace(hour=16, minute=5, second=0, microsecond=0)
+    return trigger <= now <= hard_close
+
+
+def _is_eod_warning() -> bool:
+    """True from 3:00 PM until force-close kicks in at 3:30 PM."""
+    now = _now_et()
+    if now.weekday() >= 5:
+        return False
+    warn_start  = now.replace(hour=EOD_WARN_HOUR,    minute=EOD_WARN_MINUTE,    second=0, microsecond=0)
+    force_start = now.replace(hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MINUTE, second=0, microsecond=0)
+    return warn_start <= now < force_start
 
 
 def _current_price(ticker: str) -> Optional[float]:
@@ -99,16 +117,137 @@ def _current_price(ticker: str) -> Optional[float]:
         return None
 
 
-def _close_signal(sb: Client, sig_id: str, reason: str, close_type: str = "stock") -> None:
-    """Write closed status to Supabase for a stock or option signal."""
-    table = "option_signals" if close_type == "option" else "signals"
+# ── Status derivation ─────────────────────────────────────────────────────────
+
+def _derive_status(price: float, entry: float, t1: float, sl: float,
+                   direction: str) -> str:
+    """
+    Compute a status label from price vs key levels.
+    Returns one of: near_stop | below_entry | in_profit |
+                    building_profit | strong_profit | at_target
+    """
+    is_long    = direction == "LONG"
+    stop_dist  = abs(entry - sl)
+    target_dist = abs(t1 - entry)
+
+    if target_dist == 0:
+        return "in_profit" if (is_long and price > entry) or (not is_long and price < entry) else "below_entry"
+
+    # Progress toward target (negative = going wrong way)
+    progress = ((price - entry) / target_dist) if is_long else ((entry - price) / target_dist)
+
+    near_stop_pct = ((entry - price) / stop_dist) if is_long else ((price - entry) / stop_dist)
+
+    if near_stop_pct >= 0.80:          return "near_stop"
+    if progress >= 1.0:                return "at_target"
+    if progress >= 0.60:               return "strong_profit"
+    if progress >= 0.30:               return "building_profit"
+    if progress > 0:                   return "in_profit"
+    return "below_entry"
+
+
+# ── Momentum analysis for early booking ──────────────────────────────────────
+
+def _momentum_check(ticker: str, direction: str) -> tuple[bool, str]:
+    """
+    Returns (book_now, reason) using RSI + MACD on 5-min bars.
+    book_now=True means momentum is failing — engine recommends booking profit.
+    """
     try:
-        sb.table(table).update({
-            "status":        "closed",
-            "closed_reason": reason,
-            "result":        "expired",
-            "closed_at":     datetime.now(timezone.utc).isoformat(),
-        }).eq("id", sig_id).execute()
+        import ta
+        df = yf.download(ticker, period="2d", interval="5m", progress=False, auto_adjust=True)
+        if df.empty or len(df) < 20:
+            return False, ""
+
+        close = df["Close"].squeeze()
+        rsi   = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
+        macd  = ta.trend.MACD(close)
+        macd_line = macd.macd().iloc[-1]
+        signal_line = macd.macd_signal().iloc[-1]
+
+        is_long = direction == "LONG"
+
+        # Overbought / oversold
+        if is_long and rsi > 72:
+            return True, f"RSI overbought ({rsi:.0f}) — momentum likely to stall"
+        if not is_long and rsi < 28:
+            return True, f"RSI oversold ({rsi:.0f}) — momentum likely to stall"
+
+        # MACD bearish crossover (for LONG) or bullish (for SHORT)
+        if is_long and macd_line < signal_line and macd_line > 0:
+            return True, "MACD bearish crossover — momentum weakening near target"
+        if not is_long and macd_line > signal_line and macd_line < 0:
+            return True, "MACD bullish crossover — momentum weakening near target"
+
+    except Exception as e:
+        logger.debug(f"[monitor] Momentum check failed for {ticker}: {e}")
+
+    return False, ""
+
+
+# ── Status event helpers ──────────────────────────────────────────────────────
+
+_STATUS_LABELS = {
+    "near_stop":       ("⚠️", "Near Stop — Watch closely"),
+    "below_entry":     ("↩",  "Below Entry — Waiting for recovery"),
+    "in_profit":       ("💹", "In Profit — Hold, target not reached"),
+    "building_profit": ("📈", "Building Profit — Approaching target"),
+    "strong_profit":   ("🔥", "Strong Profit — Consider booking partial"),
+    "at_target":       ("🎯", "At Target — Book profit"),
+}
+
+
+def _log_status_event(sb: Client, sig_id: str, status: str,
+                      price: float | None, extra: str = "") -> None:
+    """Log a status-change event to signal_events timeline."""
+    emoji, base_label = _STATUS_LABELS.get(status, ("•", status))
+    note = f"{emoji} {base_label}"
+    if extra:
+        note += f" — {extra}"
+    if price:
+        note += f" (${price:.2f})"
+    _log_event(sb, sig_id, status, price=price, note=note)
+
+
+def _close_signal(
+    sb: Client,
+    sig_id: str,
+    reason: str,
+    close_type: str = "stock",
+    current_price: float | None = None,
+    entry_price: float | None = None,
+    direction: str = "LONG",
+) -> None:
+    """
+    Write closed status to Supabase.
+    When current_price + entry_price are provided (e.g. market_close, time_limit)
+    the actual P&L is recorded so history shows win/loss — not just 'expired'.
+    """
+    table = "option_signals" if close_type == "option" else "signals"
+
+    result    = "expired"
+    pnl_pct   = None
+    pnl_abs   = None
+
+    if current_price and entry_price and entry_price > 0:
+        is_long = direction == "LONG"
+        raw_pct = ((current_price - entry_price) / entry_price * 100)
+        pnl_pct = raw_pct if is_long else -raw_pct
+        pnl_abs = (current_price - entry_price) if is_long else (entry_price - current_price)
+        result  = "win" if pnl_pct > 0 else "loss"
+
+    payload: dict = {
+        "status":        "closed",
+        "closed_reason": reason,
+        "result":        result,
+        "closed_at":     datetime.now(timezone.utc).isoformat(),
+    }
+    if pnl_pct is not None:
+        payload["result_pct"] = round(pnl_pct, 4)
+        payload["result_pnl"] = round(pnl_abs, 4)
+
+    try:
+        sb.table(table).update(payload).eq("id", sig_id).execute()
     except Exception as e:
         logger.error(f"[monitor] Close failed for {sig_id}: {e}")
 
@@ -175,12 +314,47 @@ def _detect_structure_reversal(ticker: str, direction: str) -> bool:
 # Push helpers
 # ---------------------------------------------------------------------------
 
-def _push_market_close(ticker: str, direction: str, strategy: str) -> None:
-    emoji = "📈" if direction == "LONG" else "📉"
+def _push_market_close(ticker: str, direction: str, strategy: str, pnl_pct: float | None = None) -> None:
+    if pnl_pct is not None and pnl_pct > 0:
+        title = f"✅ {ticker} closed +{pnl_pct:.1f}% — Market Close"
+        body  = f"Booked profit on {direction} {strategy.replace('_',' ')} before 4 PM ET"
+    elif pnl_pct is not None and pnl_pct <= 0:
+        title = f"⏰ {ticker} closed {pnl_pct:.1f}% — Market Close"
+        body  = f"Position exited to avoid overnight risk. {direction} {strategy.replace('_',' ')}"
+    else:
+        title = f"⏰ Market Closing — {ticker}"
+        body  = f"Close your {direction} {strategy.replace('_',' ')} position before 4 PM ET"
     push._send_raw(
-        title=f"⏰ Market Closing — {ticker}",
-        body=f"Close your {direction} {strategy.replace('_',' ')} position before 4 PM ET",
+        title=title, body=body,
         data={"type": "market_close", "ticker": ticker},
+    )
+
+
+def _push_eod_warning(ticker: str, direction: str, pnl_pct: float) -> None:
+    now_et   = datetime.now(ZoneInfo("America/New_York"))
+    mins_left = max(0, (16 * 60) - (now_et.hour * 60 + now_et.minute))
+    push._send_raw(
+        title=f"📊 {ticker} +{pnl_pct:.1f}% — {mins_left} min to close",
+        body=f"Your {direction} signal is in profit. Consider booking before market close.",
+        data={"type": "eod_warning", "ticker": ticker},
+    )
+
+
+def _push_early_book(ticker: str, direction: str, pnl_pct: float, reason: str) -> None:
+    push._send_raw(
+        title=f"💡 Book Profit Now — {ticker} +{pnl_pct:.1f}%",
+        body=reason,
+        data={"type": "book_profit", "ticker": ticker},
+    )
+
+
+def _push_status_change(ticker: str, status: str, pnl_pct: float | None) -> None:
+    emoji, label = _STATUS_LABELS.get(status, ("•", status))
+    pnl_str = f" ({'+' if pnl_pct and pnl_pct > 0 else ''}{pnl_pct:.1f}%)" if pnl_pct is not None else ""
+    push._send_raw(
+        title=f"{emoji} {ticker}{pnl_str} — {label.split(' — ')[0]}",
+        body=label.split(" — ", 1)[-1] if " — " in label else label,
+        data={"type": "status_change", "ticker": ticker, "status": status},
     )
 
 
@@ -246,36 +420,76 @@ def _monitor_stocks(sb: Client) -> None:
 
     logger.info(f"[monitor] Checking {len(rows)} active stock signal(s)")
     near_close  = _is_near_market_close()
+    eod_warning = _is_eod_warning()
     market_open = _is_market_hours()
     now_utc     = datetime.now(timezone.utc)
 
     for sig in rows:
-        ticker   = sig["ticker"]
-        strategy = sig.get("strategy_type") or "day_trade"
+        ticker    = sig["ticker"]
+        strategy  = sig.get("strategy_type") or "day_trade"
         direction = sig["direction"]
-        created  = datetime.fromisoformat(sig["created_at"].replace("Z", "+00:00"))
-        age_mins = (now_utc - created).total_seconds() / 60
+        created   = datetime.fromisoformat(sig["created_at"].replace("Z", "+00:00"))
+        age_mins  = (now_utc - created).total_seconds() / 60
 
         # ── 1. Scalp time limit (30 min, any time) ───────────────────────────
         if strategy == "scalping" and age_mins >= SCALP_MAX_HOLD_MINS:
+            price = _current_price(ticker)
             logger.info(f"[monitor] {ticker} scalp time limit ({age_mins:.0f} min) — closing")
-            _close_signal(sb, sig["id"], "time_limit")
+            _close_signal(sb, sig["id"], "time_limit",
+                          current_price=price,
+                          entry_price=float(sig.get("entry_price") or 0),
+                          direction=direction)
             _log_event(sb, sig["id"], "time_limit",
-                       note=f"30-min scalp window closed — position exited")
+                       price=price,
+                       note=f"30-min scalp window expired — position exited at ${price:.2f}" if price else
+                            "30-min scalp window closed — position exited")
             try:
                 _push_scalp_expired(ticker, direction)
             except Exception:
                 pass
             continue
 
-        # ── 2. Market-close enforcer (intraday strategies only) ───────────────
-        if near_close and strategy in INTRADAY_STRATEGIES:
-            logger.info(f"[monitor] {ticker} [{strategy}] market closing — force close")
-            _close_signal(sb, sig["id"], "market_close")
-            _log_event(sb, sig["id"], "market_close",
-                       note=f"Market closing — {direction} position closed at 3:50 PM ET")
+        # ── 2a. EOD early warning (3:00–3:30 PM) — alert if in profit ────────
+        if eod_warning and strategy in INTRADAY_STRATEGIES:
             try:
-                _push_market_close(ticker, direction, strategy)
+                price = _current_price(ticker)
+                entry = float(sig.get("entry_price") or 0)
+                if price and entry:
+                    is_long = direction == "LONG"
+                    pnl_pct = ((price - entry) / entry * 100) if is_long else ((entry - price) / entry * 100)
+                    if pnl_pct > 0.5:   # only warn if meaningfully in profit (>0.5%)
+                        logger.info(f"[monitor] {ticker} EOD warning — in profit {pnl_pct:.1f}%")
+                        _push_eod_warning(ticker, direction, pnl_pct)
+            except Exception:
+                pass
+            # Do NOT continue — still run normal checks below
+
+        # ── 2b. Market-close force-close (3:30 PM+) — exit all intraday ──────
+        if near_close and strategy in INTRADAY_STRATEGIES:
+            price = _current_price(ticker)
+            entry = float(sig.get("entry_price") or 0)
+            is_long = direction == "LONG"
+            pnl_pct = None
+            if price and entry:
+                raw = ((price - entry) / entry * 100)
+                pnl_pct = raw if is_long else -raw
+
+            logger.info(
+                f"[monitor] {ticker} [{strategy}] force-close at market end "
+                f"price={price} pnl={pnl_pct:.1f}%" if pnl_pct is not None else
+                f"[monitor] {ticker} [{strategy}] force-close at market end"
+            )
+            _close_signal(sb, sig["id"], "market_close",
+                          current_price=price,
+                          entry_price=entry,
+                          direction=direction)
+            pnl_str = f"+{pnl_pct:.1f}%" if pnl_pct and pnl_pct > 0 else f"{pnl_pct:.1f}%" if pnl_pct else ""
+            _log_event(sb, sig["id"], "market_close",
+                       price=price,
+                       note=f"Market closing — {direction} exited at ${price:.2f} {pnl_str}".strip()
+                            if price else f"Market closing — {direction} position force-closed")
+            try:
+                _push_market_close(ticker, direction, strategy, pnl_pct)
             except Exception:
                 pass
             continue
@@ -284,25 +498,58 @@ def _monitor_stocks(sb: Client) -> None:
         if not market_open:
             continue
 
-        # ── 3. T1 → breakeven SL upgrade ─────────────────────────────────────
+        # ── Get price + levels once for all checks below ──────────────────────
         try:
             entry  = float(sig["entry_price"])
             t1     = float(sig["target_one"])
-            sl     = float(sig["stop_loss"])
             t2     = float(sig["target_two"])
+            sl     = float(sig["stop_loss"])
             price  = _current_price(ticker)
+        except Exception as e:
+            logger.debug(f"[monitor] Level parse error for {ticker}: {e}")
+            continue
 
-            if price and sl != entry:   # SL not already at breakeven
-                is_long = direction == "LONG"
-                t1_hit  = (is_long and price >= t1) or (not is_long and price <= t1)
-                t2_hit  = (is_long and price >= t2) or (not is_long and price <= t2)
+        if not price:
+            continue
+
+        is_long  = direction == "LONG"
+        pnl_pct  = ((price - entry) / entry * 100) if is_long else ((entry - price) / entry * 100)
+
+        # ── 3. Status change tracking + event logging ─────────────────────────
+        try:
+            new_status = _derive_status(price, entry, t1, sl, direction)
+            old_status = _STATUS_CACHE.get(sig["id"])
+
+            if new_status != old_status:
+                _STATUS_CACHE[sig["id"]] = new_status
+                _log_status_event(sb, sig["id"], new_status, price,
+                                  extra=f"{'+' if pnl_pct >= 0 else ''}{pnl_pct:.1f}%")
+                # Push notification for important transitions only
+                push_statuses = {"near_stop", "strong_profit", "at_target"}
+                if new_status in push_statuses:
+                    try:
+                        _push_status_change(ticker, new_status, pnl_pct)
+                    except Exception:
+                        pass
+                logger.info(
+                    f"[monitor] {ticker} status: {old_status} → {new_status} "
+                    f"price={price:.2f} pnl={pnl_pct:+.2f}%"
+                )
+        except Exception as e:
+            logger.debug(f"[monitor] Status tracking error for {ticker}: {e}")
+
+        # ── 4. T1 hit → move SL to breakeven ─────────────────────────────────
+        try:
+            if sl != entry:   # not already at breakeven
+                t1_hit = (is_long and price >= t1) or (not is_long and price <= t1)
+                t2_hit = (is_long and price >= t2) or (not is_long and price <= t2)
 
                 if t1_hit and not t2_hit:
                     pct = abs(price - entry) / entry * 100
-                    logger.info(f"[monitor] {ticker} T1 hit @ {price:.2f} — moving SL to breakeven {entry:.2f}")
+                    logger.info(f"[monitor] {ticker} T1 hit @ {price:.2f} — moving SL to breakeven")
                     _update_sl(sb, sig["id"], entry)
                     _log_event(sb, sig["id"], "t1_hit", price=price,
-                               note=f"T1 hit @ ${price:.2f} (+{pct:.1f}%) — stop moved to breakeven ${entry:.2f}")
+                               note=f"🎯 T1 hit @ ${price:.2f} (+{pct:.1f}%) — stop moved to breakeven ${entry:.2f}")
                     try:
                         _push_t1_breakeven(ticker, direction, pct)
                     except Exception:
@@ -310,14 +557,53 @@ def _monitor_stocks(sb: Client) -> None:
         except Exception as e:
             logger.debug(f"[monitor] T1 check error for {ticker}: {e}")
 
-        # ── 4. Structure reversal detection ───────────────────────────────────
+        # ── 5. Intelligent early booking ──────────────────────────────────────
+        # Book profit early when quant conditions indicate momentum is failing.
+        # Only applies to in-profit signals that are building/strong profit.
+        try:
+            current_status = _STATUS_CACHE.get(sig["id"], "")
+            should_assess  = current_status in ("building_profit", "strong_profit") and pnl_pct > 0.5
+
+            if should_assess:
+                book_now, reason = _momentum_check(ticker, direction)
+
+                # Also book early if age > 2h and signal is stuck (stalling)
+                if not book_now and age_mins > 120 and current_status == "building_profit":
+                    book_now = True
+                    reason   = f"Signal stalling after {age_mins:.0f} min — booking profit to protect gains"
+
+                # Book if session is winding down (2:00 PM+) and building profit
+                if not book_now and current_status in ("building_profit", "strong_profit"):
+                    now_et = datetime.now(ZoneInfo("America/New_York"))
+                    if now_et.hour >= 14 and now_et.minute >= 0:
+                        book_now = True
+                        reason   = f"Afternoon session — booking profit at +{pnl_pct:.1f}% to avoid reversal"
+
+                if book_now:
+                    logger.info(f"[monitor] {ticker} EARLY BOOK — {reason} pnl={pnl_pct:.1f}%")
+                    _close_signal(sb, sig["id"], "target_hit",
+                                  current_price=price, entry_price=entry, direction=direction)
+                    _log_event(sb, sig["id"], "closed_win", price=price,
+                               note=f"💡 Profit booked @ ${price:.2f} (+{pnl_pct:.1f}%) — {reason}")
+                    _STATUS_CACHE.pop(sig["id"], None)
+                    try:
+                        _push_early_book(ticker, direction, pnl_pct, reason)
+                    except Exception:
+                        pass
+                    continue   # signal is now closed
+        except Exception as e:
+            logger.debug(f"[monitor] Early booking check error for {ticker}: {e}")
+
+        # ── 6. Structure reversal detection ───────────────────────────────────
         try:
             if _detect_structure_reversal(ticker, direction):
                 logger.info(f"[monitor] {ticker} structure reversed — closing {direction} early")
-                _close_signal(sb, sig["id"], "structure_reversal")
+                _close_signal(sb, sig["id"], "structure_reversal",
+                              current_price=price, entry_price=entry, direction=direction)
                 opposite = "bearish" if direction == "LONG" else "bullish"
-                _log_event(sb, sig["id"], "reversal",
-                           note=f"{opposite.capitalize()} CHoCH detected — {direction} closed early")
+                _log_event(sb, sig["id"], "reversal", price=price,
+                           note=f"⚠️ {opposite.capitalize()} CHoCH detected — {direction} closed early @ ${price:.2f} ({'+' if pnl_pct >= 0 else ''}{pnl_pct:.1f}%)")
+                _STATUS_CACHE.pop(sig["id"], None)
                 try:
                     _push_reversal(ticker, direction)
                 except Exception:
