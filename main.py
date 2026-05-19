@@ -81,12 +81,12 @@ except Exception as _e:
 # 5-second window regardless of how many users are connected.
 _indices_cache: dict = {}
 _indices_cache_ts: float = 0.0
-_INDICES_CACHE_TTL: float = 5.0   # seconds
+_INDICES_CACHE_TTL: float = 3.0   # seconds
 
 # Per-ticker price cache so the app can poll every 5 s without hammering Alpaca.
 # Keys are individual ticker symbols; each entry is (timestamp, price_dict).
 _prices_cache: dict[str, tuple[float, dict]] = {}
-_PRICES_CACHE_TTL: float = 5.0   # seconds
+_PRICES_CACHE_TTL: float = 3.0   # seconds
 
 
 def _market_session() -> str:
