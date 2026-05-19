@@ -81,7 +81,14 @@ CREATE POLICY "Public read regime snapshots"
 -- No INSERT/UPDATE/DELETE policy for anon/auth — only service role can write.
 
 -- Enable realtime (app can subscribe to live regime changes)
-ALTER PUBLICATION supabase_realtime ADD TABLE market_regime_snapshots;
+-- Wrapped in DO block so re-running is safe if already a member
+DO $$
+BEGIN
+  ALTER PUBLICATION supabase_realtime ADD TABLE market_regime_snapshots;
+EXCEPTION WHEN OTHERS THEN
+  NULL; -- already a member of the publication, ignore
+END;
+$$;
 
 -- ═══════════════════════════════════════════════════════════════
 --  SELF-LEARNING WEIGHTS TABLE
