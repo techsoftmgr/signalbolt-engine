@@ -72,6 +72,19 @@ _scalp_cache: dict = {}
 _scalp_cache_ts: float = 0.0
 _SCALP_CACHE_TTL: float = 60.0   # seconds
 
+# ── Real-time trade-tick level checker (ALL strategies) ────────
+# Every trade tick from Alpaca hits on_trade(). We throttle to at most
+# 1 level check per second per ticker to avoid flooding the executor,
+# while still catching price crosses within ~1 second of them happening.
+#
+# Structure: { ticker: [sig, sig, ...] }  — all active non-scalp signals
+# (scalping is already handled by _check_scalp_levels via bar high/low)
+_rt_cache:    dict[str, list[dict]] = {}  # ticker → active signals list
+_rt_cache_ts: float = 0.0
+_RT_CACHE_TTL:      float = 60.0  # full refresh every 60 s
+_RT_THROTTLE_S:     float = 1.0   # max one level-check per second per ticker
+_rt_last_check: dict[str, float] = {}   # ticker → last monotonic check time
+
 
 # ── Context cache ─────────────────────────────────────────────
 # Regime/session detection hits yfinance + Alpaca REST — expensive.
@@ -279,6 +292,220 @@ def _check_scalp_levels(symbol: str, bar_high: float, bar_low: float) -> None:
             _close_scalp_signal(sig, "t1", bar_low)
 
 
+# ── Real-time level checker — ALL active signals ──────────────
+
+def _refresh_rt_cache() -> None:
+    """
+    Load all active stock signals (every strategy) into the RT cache.
+    Excludes scalping — those are already handled by _check_scalp_levels
+    via bar high/low, which is more accurate than raw trade prices.
+    Called at most once per _RT_CACHE_TTL seconds.
+    """
+    global _rt_cache, _rt_cache_ts
+    try:
+        key = os.environ.get("SUPABASE_KEY") or os.environ["SUPABASE_SECRET_KEY"]
+        from supabase import create_client as _sc
+        sb = _sc(os.environ["SUPABASE_URL"], key)
+        rows = (
+            sb.table("signals")
+            .select("id, ticker, direction, entry_price, stop_loss, target_one, target_two, strategy_type")
+            .eq("status", "active")
+            .neq("strategy_type", "scalping")   # scalping handled by bar checker
+            .execute()
+            .data
+        ) or []
+
+        new_cache: dict[str, list[dict]] = {}
+        for r in rows:
+            new_cache.setdefault(r["ticker"], []).append(r)
+
+        _rt_cache    = new_cache
+        _rt_cache_ts = time.monotonic()
+
+        total = sum(len(v) for v in new_cache.values())
+        if total:
+            logger.debug(f"[stream] RT cache refreshed: {total} active signal(s) across {len(new_cache)} ticker(s)")
+    except Exception as e:
+        logger.debug(f"[stream] RT cache refresh failed: {e}")
+
+
+def _close_rt_signal(sig: dict, hit: str, price: float) -> None:
+    """
+    Instantly close a signal when its T2 or stop-loss is breached on a live tick.
+    Records accurate P&L and fires push notification.
+
+    hit: "t2" | "sl"
+    """
+    global _rt_cache
+    try:
+        key = os.environ.get("SUPABASE_KEY") or os.environ["SUPABASE_SECRET_KEY"]
+        from supabase import create_client as _sc
+        from engine import push as _push
+        sb = _sc(os.environ["SUPABASE_URL"], key)
+
+        entry    = float(sig["entry_price"])
+        is_long  = sig["direction"] == "LONG"
+        result   = "win" if hit == "t2" else "loss"
+        hit_label = "Target 2" if hit == "t2" else "Stop Loss"
+
+        pnl_pct = ((price - entry) / entry * 100) if is_long else ((entry - price) / entry * 100)
+        pnl_abs = (price - entry) if is_long else (entry - price)
+
+        sb.table("signals").update({
+            "status":        "closed",
+            "result":        result,
+            "hit_target":    hit,
+            "result_pct":    round(pnl_pct, 4),
+            "result_pnl":    round(pnl_abs, 4),
+            "closed_reason": "target_hit" if result == "win" else "stop_hit",
+            "closed_at":     datetime.now(timezone.utc).isoformat(),
+        }).eq("id", sig["id"]).execute()
+
+        # Timeline event
+        sign_str = "+" if pnl_pct > 0 else ""
+        note = (
+            f"{hit_label} hit @ ${price:.2f} — closed {sign_str}{pnl_pct:.1f}% "
+            f"({'win' if result == 'win' else 'loss'})"
+        )
+        sb.table("signal_events").insert({
+            "signal_id":  sig["id"],
+            "event_type": "closed_win" if result == "win" else "closed_loss",
+            "price":      price,
+            "note":       note,
+        }).execute()
+
+        # Push notification
+        ticker = sig["ticker"]
+        try:
+            if result == "win":
+                _push._send_raw(
+                    title=f"✅ T2 Hit — {ticker}  +{pnl_pct:.1f}%",
+                    body=f"{sig['direction']} {(sig.get('strategy_type') or 'signal').replace('_',' ')} closed at full target.",
+                    data={"type": "signal_closed", "result": "win", "ticker": ticker},
+                )
+            else:
+                _push._send_raw(
+                    title=f"🔴 Stop Hit — {ticker}  {pnl_pct:.1f}%",
+                    body=f"{sig['direction']} stopped out. Position closed.",
+                    data={"type": "signal_closed", "result": "loss", "ticker": ticker},
+                )
+        except Exception:
+            pass
+
+        # Evict from cache immediately — prevents duplicate close
+        sigs = _rt_cache.get(ticker, [])
+        _rt_cache[ticker] = [s for s in sigs if s["id"] != sig["id"]]
+
+        logger.info(
+            f"[stream] ⚡ RT CLOSE {ticker} {sig['direction']} "
+            f"hit={hit.upper()} price={price:.2f} pnl={pnl_pct:+.2f}%"
+        )
+
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        logger.error(f"[stream] RT close failed for {sig.get('id')}: {e}")
+
+
+def _handle_t1_rt(sig: dict, price: float) -> None:
+    """
+    T1 hit detected on a live trade tick (non-scalp signal).
+    Does NOT close the signal — instead moves stop-loss to breakeven
+    so any reversal is a scratch rather than a loss, then rides to T2.
+    """
+    try:
+        key = os.environ.get("SUPABASE_KEY") or os.environ["SUPABASE_SECRET_KEY"]
+        from supabase import create_client as _sc
+        from engine import push as _push
+        sb = _sc(os.environ["SUPABASE_URL"], key)
+
+        entry = float(sig["entry_price"])
+        pct   = abs(price - entry) / entry * 100
+        ticker = sig["ticker"]
+
+        # Move SL to breakeven in DB
+        sb.table("signals").update({"stop_loss": round(entry, 4)}).eq("id", sig["id"]).execute()
+
+        # Timeline event
+        sb.table("signal_events").insert({
+            "signal_id":  sig["id"],
+            "event_type": "t1_hit",
+            "price":      price,
+            "note":       f"🎯 T1 hit @ ${price:.2f} (+{pct:.1f}%) — stop moved to breakeven ${entry:.2f}",
+        }).execute()
+
+        # Push notification
+        try:
+            _push._send_raw(
+                title=f"🎯 T1 Hit — {ticker}  +{pct:.1f}%",
+                body=f"Stop moved to breakeven. Riding to T2. {sig['direction']} still open.",
+                data={"type": "t1_breakeven", "ticker": ticker},
+            )
+        except Exception:
+            pass
+
+        # Update local cache so T1 doesn't re-trigger on next tick
+        sig["stop_loss"] = entry
+
+        logger.info(
+            f"[stream] ⚡ RT T1 HIT {ticker} {sig['direction']} "
+            f"price={price:.2f} pct=+{pct:.2f}% — SL moved to breakeven"
+        )
+
+    except Exception as e:
+        logger.debug(f"[stream] RT T1 handler failed for {sig.get('id')}: {e}")
+
+
+def _check_rt_levels(ticker: str, price: float) -> None:
+    """
+    Check a live trade price against all cached active signals for this ticker.
+    Called at most once per second per ticker (throttled in on_trade).
+
+    Decision tree per signal:
+      T2 crossed  → close as win  (full target)
+      T1 crossed  → move SL to breakeven, ride to T2 (don't close)
+      SL crossed  → close as loss
+      SL already at breakeven (T1 already hit) → only T2 / SL(=entry) matter
+    """
+    global _rt_cache, _rt_cache_ts
+
+    # Refresh cache if stale
+    if time.monotonic() - _rt_cache_ts > _RT_CACHE_TTL:
+        _refresh_rt_cache()
+
+    sigs = _rt_cache.get(ticker)
+    if not sigs:
+        return
+
+    for sig in list(sigs):   # list() copy — we may mutate _rt_cache inside
+        try:
+            is_long = sig["direction"] == "LONG"
+            t1      = float(sig["target_one"])
+            t2      = float(sig["target_two"])
+            sl      = float(sig["stop_loss"])
+            entry   = float(sig["entry_price"])
+
+            # Has T1 already been hit? (SL == entry means breakeven was set)
+            t1_already_hit = abs(sl - entry) < 0.01
+
+            if is_long:
+                if price >= t2:
+                    _close_rt_signal(sig, "t2", price)
+                elif price >= t1 and not t1_already_hit:
+                    _handle_t1_rt(sig, price)
+                elif price <= sl:
+                    _close_rt_signal(sig, "sl", price)
+            else:   # SHORT
+                if price <= t2:
+                    _close_rt_signal(sig, "t2", price)
+                elif price <= t1 and not t1_already_hit:
+                    _handle_t1_rt(sig, price)
+                elif price >= sl:
+                    _close_rt_signal(sig, "sl", price)
+
+        except Exception as e:
+            logger.debug(f"[stream] RT level check error for {ticker}/{sig.get('id')}: {e}")
+
+
 # ── Per-ticker scalp processor (unchanged) ────────────────────
 
 def _process_bar_sync(symbol: str, close: float, volume: int) -> None:
@@ -364,6 +591,13 @@ async def run_stream() -> None:
         f"strategies: scalping(5m) day_trade/options_flow/dark_pool(15m) swing_trade(1h)"
     )
 
+    # Pre-warm RT signal cache so first trades don't miss any active signals
+    try:
+        _refresh_rt_cache()
+        _refresh_scalp_cache()
+    except Exception as _e:
+        logger.debug(f"[stream] Cache pre-warm failed: {_e}")
+
     reconnect_delay = 5
 
     while True:
@@ -428,13 +662,25 @@ async def run_stream() -> None:
                     )
                     _scan_executor.submit(_run_strategy_at_boundary, "swing_trade")
 
-            # ── Trade handler: feeds real-time prices to app WebSocket clients ──
+            # ── Trade handler: price broadcast + real-time level checks ──────
             async def on_trade(trade) -> None:
+                ticker = trade.symbol
+                price  = float(trade.price)
+
+                # 1. Feed price to WebSocket clients (always — no throttle)
                 try:
                     from engine.price_store import update as price_update
-                    price_update(trade.symbol, float(trade.price))
+                    price_update(ticker, price)
                 except Exception:
                     pass   # never let price broadcast errors kill the stream
+
+                # 2. Real-time T1/T2/SL check for ALL active non-scalp signals.
+                #    Throttled to at most once per second per ticker so we don't
+                #    flood the executor with thousands of tasks on liquid stocks.
+                now = time.monotonic()
+                if now - _rt_last_check.get(ticker, 0.0) >= _RT_THROTTLE_S:
+                    _rt_last_check[ticker] = now
+                    _scan_executor.submit(_check_rt_levels, ticker, price)
 
             wss.subscribe_bars(on_bar, *all_subscribe)
             wss.subscribe_trades(on_trade, *all_subscribe)
