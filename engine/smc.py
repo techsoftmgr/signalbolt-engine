@@ -1,6 +1,6 @@
 """
 Smart Money Concepts (SMC) analysis engine.
-Fetches OHLCV from yfinance and detects:
+Fetches OHLCV via Alpaca (primary) or yfinance (fallback) and detects:
   - Swing highs / swing lows
   - Break of Structure (BOS)
   - Change of Character (CHoCH)
@@ -8,22 +8,159 @@ Fetches OHLCV from yfinance and detects:
   - Order Blocks (OB)
 """
 
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
+
+import logging
+from engine.config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_DATA_FEED
+
+logger = logging.getLogger("signalbolt.smc")
+
+try:
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+    _alpaca_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+    _ALPACA_OK = True
+except ImportError:
+    _ALPACA_OK = False
 
 SWING_WINDOW = 3
+
+# Alpaca timeframe mapping: interval → (TimeFrame, days_lookback)
+_ALPACA_TIMEFRAMES = {
+    "5m":  (lambda: TimeFrame(5,  TimeFrameUnit.Minute), 1),
+    "15m": (lambda: TimeFrame(15, TimeFrameUnit.Minute), 5),
+    "1h":  (lambda: TimeFrame(1,  TimeFrameUnit.Hour),  60),
+    # Fix #2: 4H was missing — L5 multiframe always fell back to partial credit
+    "4h":  (lambda: TimeFrame(4,  TimeFrameUnit.Hour),  60),
+}
+
+# Strategy-specific level sizing parameters
+STRATEGY_PARAMS: dict[str, dict] = {
+    'scalping': {
+        'tp1_pct':     0.006,   # +0.6%
+        'tp2_pct':     0.010,   # +1.0%
+        'sl_fallback': 0.004,   # 0.4% fallback SL when no OB or sweep
+        'atr_mult':    1.0,     # ATR × 1.0 below key level
+        'sweep_bars':  5,       # look back 5 candles for liquidity sweep
+    },
+    'day_trade': {
+        'tp1_pct':     0.015,
+        'tp2_pct':     0.030,
+        'sl_fallback': 0.010,
+        'atr_mult':    1.5,
+        'sweep_bars':  5,
+    },
+    'swing_trade': {
+        'tp1_pct':     0.050,
+        'tp2_pct':     0.080,
+        'sl_fallback': 0.025,
+        'atr_mult':    2.0,
+        'sweep_bars':  7,
+    },
+    'options_flow': {
+        'tp1_pct':     0.015,
+        'tp2_pct':     0.030,
+        'sl_fallback': 0.010,
+        'atr_mult':    1.5,
+        'sweep_bars':  5,
+    },
+    'dark_pool': {
+        'tp1_pct':     0.015,
+        'tp2_pct':     0.030,
+        'sl_fallback': 0.010,
+        'atr_mult':    1.5,
+        'sweep_bars':  5,
+    },
+}
 
 
 # ---------------------------------------------------------------------------
 # Data fetching
 # ---------------------------------------------------------------------------
 
-def fetch_candles(ticker: str, period: str = "10d", interval: str = "1h") -> pd.DataFrame:
-    """Fetch OHLCV from yfinance. Returns DataFrame with lowercase columns or empty DF."""
+def _filter_market_hours(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+    """
+    Strip pre-market and post-market bars from intraday data.
+
+    Pre/post market bars (4 AM–9:29 AM and 4:01 PM–8 PM ET) have thin
+    volume and wide spreads — SMC signals fired on them are unreliable.
+    Only applied to 5m and 15m intervals; 1h bars are left as-is.
+
+    Falls back to the full DataFrame if timezone conversion fails or
+    fewer than 10 regular-hours bars remain (prevents empty analysis).
+    """
+    if interval not in ("5m", "15m"):
+        return df
     try:
+        ts = pd.to_datetime(df["timestamp"], utc=True)
+        # Convert to ET — handles EST/EDT automatically
+        ts_et = ts.dt.tz_convert("America/New_York")
+        # Minutes since midnight in ET
+        minutes = ts_et.dt.hour * 60 + ts_et.dt.minute
+        # 9:30 AM = 570 min, 4:00 PM = 960 min
+        mask = (minutes >= 570) & (minutes < 960)
+        filtered = df[mask].reset_index(drop=True)
+        # Guard: if filtering removes too many bars, return original
+        return filtered if len(filtered) >= 10 else df
+    except Exception as e:
+        logger.debug(f"[smc] Market-hours filter failed: {e} — returning full bars")
+        return df
+
+
+def _fetch_alpaca(ticker: str, interval: str = "15m") -> pd.DataFrame:
+    """Fetch OHLCV from Alpaca. Returns normalised DataFrame or empty DF."""
+    if not _ALPACA_OK:
+        return pd.DataFrame()
+    try:
+        tf_factory, days = _ALPACA_TIMEFRAMES.get(interval, _ALPACA_TIMEFRAMES["15m"])
+        # Fix: use timezone-aware datetime (datetime.utcnow() is deprecated in 3.12+)
+        start = datetime.now(timezone.utc) - timedelta(days=days)
+        req = StockBarsRequest(
+            symbol_or_symbols=ticker,
+            timeframe=tf_factory(),
+            start=start,
+            feed=ALPACA_DATA_FEED,   # "sip" on paid plan, "iex" on free
+        )
+        bars = _alpaca_client.get_stock_bars(req)
+        df = bars.df
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.xs(ticker, level="symbol")
+
+        df = df.reset_index()
+        df.columns = [c.lower() for c in df.columns]
+
+        for candidate in ("timestamp", "datetime", "date"):
+            if candidate in df.columns:
+                if candidate != "timestamp":
+                    df = df.rename(columns={candidate: "timestamp"})
+                break
+
+        if "timestamp" not in df.columns:
+            df.rename(columns={df.columns[0]: "timestamp"}, inplace=True)
+
+        df = df.sort_values("timestamp").reset_index(drop=True)
+
+        # Strip pre/post market bars for intraday intervals (Fix #2)
+        df = _filter_market_hours(df, interval)
+
+        return df
+    except Exception as e:
+        logger.warning(f"[smc] Alpaca error for {ticker}: {e}")
+        return pd.DataFrame()
+
+
+def _fetch_yfinance(ticker: str, period: str = "10d", interval: str = "1h") -> pd.DataFrame:
+    """Fetch OHLCV from yfinance. Returns normalised DataFrame or empty DF."""
+    try:
+        import yfinance as yf
         df = yf.download(
             ticker,
             period=period,
@@ -32,17 +169,14 @@ def fetch_candles(ticker: str, period: str = "10d", interval: str = "1h") -> pd.
             progress=False,
         )
         if df.empty or len(df) < 20:
-            print(f"[smc] Insufficient data for {ticker}")
             return pd.DataFrame()
 
-        # Flatten MultiIndex columns if present (older yfinance versions)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = [col[0] for col in df.columns]
 
         df.columns = [c.lower() for c in df.columns]
         df = df.reset_index()
 
-        # Normalise the datetime index column to "timestamp"
         for candidate in ("datetime", "date"):
             if candidate in df.columns:
                 df = df.rename(columns={candidate: "timestamp"})
@@ -53,10 +187,22 @@ def fetch_candles(ticker: str, period: str = "10d", interval: str = "1h") -> pd.
 
         df = df.sort_values("timestamp").reset_index(drop=True)
         return df
-
     except Exception as e:
-        print(f"[smc] yfinance error for {ticker}: {e}")
+        logger.warning(f"[smc] yfinance error for {ticker}: {e}")
         return pd.DataFrame()
+
+
+def fetch_candles(ticker: str, period: str = "10d", interval: str = "1h") -> pd.DataFrame:
+    """Fetch OHLCV — Alpaca primary, yfinance fallback."""
+    df = _fetch_alpaca(ticker, interval)
+    if not df.empty and len(df) >= 20:
+        return df
+    logger.info(f"[smc] Alpaca insufficient for {ticker} — yfinance fallback")
+    df = _fetch_yfinance(ticker, period, interval)
+    if df.empty or len(df) < 20:
+        logger.warning(f"[smc] Insufficient data for {ticker}")
+        return pd.DataFrame()
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -193,36 +339,175 @@ def detect_order_blocks(df: pd.DataFrame) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# ATR calculation
+# ---------------------------------------------------------------------------
+
+def _calculate_atr(df: pd.DataFrame, period: int = 14) -> float:
+    """Average True Range over `period` bars. Returns 0.0 on failure."""
+    try:
+        high  = df["high"]
+        low   = df["low"]
+        prev  = df["close"].shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev).abs(),
+            (low  - prev).abs(),
+        ], axis=1).max(axis=1)
+        val = tr.rolling(period).mean().iloc[-1]
+        return float(val) if not np.isnan(val) else 0.0
+    except Exception:
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Liquidity sweep detection  (market-maker stop-raid logic)
+# ---------------------------------------------------------------------------
+
+def detect_liquidity_sweep(df: pd.DataFrame, direction: str, lookback: int = 5) -> dict:
+    """
+    Detect whether market makers raided retail stop-losses just before the
+    potential entry candle.
+
+    For LONG  — price must have wicked *below* a prior confirmed swing low
+                 in the last `lookback` candles, then *closed back above* it.
+                 This is the classic "sell-side liquidity grab" before a rally.
+
+    For SHORT — price wicked *above* a prior swing high then closed back below.
+                 Classic "buy-side liquidity grab" before a drop.
+
+    Returns a dict:
+        swept       : bool   — True if a valid sweep was found
+        sweep_wick  : float  — extreme wick price (new stop anchor)
+        swept_level : float  — the swing level that was raided
+        candles_ago : int    — how many candles ago the sweep occurred
+    """
+    no_sweep: dict = {"swept": False}
+    min_candles = lookback + SWING_WINDOW + 1
+    if len(df) < min_candles:
+        return no_sweep
+
+    # "Prior" = everything before the lookback window
+    prior  = df.iloc[:-(lookback)]
+    recent = df.iloc[-(lookback):]
+
+    if direction == "LONG":
+        prior_lows = prior[prior["swing_low"]]["low"].values
+        if len(prior_lows) == 0:
+            return no_sweep
+        swept_level = float(prior_lows[-1])
+
+        for i in range(len(recent)):
+            candle = recent.iloc[i]
+            # Wick went below the swing low but candle closed above it
+            if float(candle["low"]) < swept_level and float(candle["close"]) > swept_level:
+                return {
+                    "swept":       True,
+                    "sweep_wick":  float(candle["low"]),
+                    "swept_level": swept_level,
+                    "candles_ago": len(recent) - i,
+                }
+
+    else:  # SHORT
+        prior_highs = prior[prior["swing_high"]]["high"].values
+        if len(prior_highs) == 0:
+            return no_sweep
+        swept_level = float(prior_highs[-1])
+
+        for i in range(len(recent)):
+            candle = recent.iloc[i]
+            if float(candle["high"]) > swept_level and float(candle["close"]) < swept_level:
+                return {
+                    "swept":       True,
+                    "sweep_wick":  float(candle["high"]),
+                    "swept_level": swept_level,
+                    "candles_ago": len(recent) - i,
+                }
+
+    return no_sweep
+
+
+# ---------------------------------------------------------------------------
 # Entry-level calculation
 # ---------------------------------------------------------------------------
 
-def _calculate_levels(direction: str, price: float, obs: dict, df: pd.DataFrame) -> tuple:
+def _calculate_levels(
+    direction: str,
+    price: float,
+    obs: dict,
+    df: pd.DataFrame,
+    strategy_type: str = "day_trade",
+    sweep: Optional[dict] = None,
+) -> tuple:
+    """
+    Determine entry, stop-loss, T1, T2.
+
+    Stop priority (best → fallback):
+      1. Sweep wick  — stop goes ATR×mult below the wick that performed the raid
+      2. Order block — stop goes ATR×mult below the OB bottom (LONG) / above OB top (SHORT)
+      3. Swing level — stop goes ATR×mult below the last swing low (LONG) / above swing high (SHORT)
+      4. Percentage  — sl_fallback % from entry (last resort)
+    """
+    p           = STRATEGY_PARAMS.get(strategy_type, STRATEGY_PARAMS["day_trade"])
+    tp1_pct     = p["tp1_pct"]
+    tp2_pct     = p["tp2_pct"]
+    sl_fallback = p["sl_fallback"]
+    atr_mult    = p["atr_mult"]
+
+    atr = _calculate_atr(df)
+    # Guard: if ATR is unrealistically large (>5% of price) cap the buffer
+    atr_buffer = min(atr * atr_mult, price * sl_fallback * 2)
+    if atr_buffer == 0:
+        atr_buffer = price * sl_fallback
+
     swing_highs = df[df["swing_high"]]["high"].values
     swing_lows  = df[df["swing_low"]]["low"].values
 
     if direction == "LONG":
         ob    = obs.get("ob_bullish")
         entry = round(float(ob["top"]) if ob else price, 4)
-        sl_ref = float(ob["bottom"]) if ob else (float(swing_lows[-1]) if len(swing_lows) else price * 0.985)
-        stop_loss  = round(sl_ref * 0.9985, 4)          # just below OB bottom
-        target_one = round(entry * 1.015, 4)             # tighter: +1.5%
-        target_two = round(entry * 1.030, 4)             # tighter: +3%
-        # Anchor T1 to nearest swing high if closer
+
+        # Stop anchor: sweep wick > OB bottom > last swing low > fallback
+        if sweep and sweep.get("swept"):
+            sl_ref = sweep["sweep_wick"]          # below the raid wick
+        elif ob:
+            sl_ref = float(ob["bottom"])
+        elif len(swing_lows):
+            sl_ref = float(swing_lows[-1])
+        else:
+            sl_ref = price * (1 - sl_fallback)
+
+        stop_loss  = round(sl_ref - atr_buffer, 4)
+        target_one = round(entry * (1 + tp1_pct), 4)
+        target_two = round(entry * (1 + tp2_pct), 4)
+
+        # Override T1 with nearest swing high if it sits within T2 range
         if len(swing_highs):
             sh = float(swing_highs[-1])
-            if entry < sh < entry * 1.04:                # only if within 4%
+            if entry < sh < entry * (1 + tp2_pct * 1.5):
                 target_one = round(sh, 4)
-    else:
+
+    else:  # SHORT
         ob    = obs.get("ob_bearish")
         entry = round(float(ob["bottom"]) if ob else price, 4)
-        sl_ref = float(ob["top"]) if ob else (float(swing_highs[-1]) if len(swing_highs) else price * 1.015)
-        stop_loss  = round(sl_ref * 1.0015, 4)
-        target_one = round(entry * 0.985, 4)             # tighter: -1.5%
-        target_two = round(entry * 0.970, 4)             # tighter: -3%
+
+        # Stop anchor: sweep wick > OB top > last swing high > fallback
+        if sweep and sweep.get("swept"):
+            sl_ref = sweep["sweep_wick"]          # above the raid wick
+        elif ob:
+            sl_ref = float(ob["top"])
+        elif len(swing_highs):
+            sl_ref = float(swing_highs[-1])
+        else:
+            sl_ref = price * (1 + sl_fallback)
+
+        stop_loss  = round(sl_ref + atr_buffer, 4)
+        target_one = round(entry * (1 - tp1_pct), 4)
+        target_two = round(entry * (1 - tp2_pct), 4)
+
         if len(swing_lows):
-            sl = float(swing_lows[-1])
-            if entry * 0.96 < sl < entry:
-                target_one = round(sl, 4)
+            sl_val = float(swing_lows[-1])
+            if entry * (1 - tp2_pct * 1.5) < sl_val < entry:
+                target_one = round(sl_val, 4)
 
     return entry, stop_loss, target_one, target_two
 
@@ -231,10 +516,15 @@ def _calculate_levels(direction: str, price: float, obs: dict, df: pd.DataFrame)
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def analyze(ticker: str, interval: str = "1h") -> Optional[dict]:
+def analyze(
+    ticker: str,
+    interval: str = "1h",
+    period: str = "10d",
+    strategy_type: str = "day_trade",
+) -> Optional[dict]:
     """Run full SMC analysis. Returns analysis dict (with 'candles' key) or None."""
     try:
-        df = fetch_candles(ticker, period="10d", interval=interval)
+        df = fetch_candles(ticker, period=period, interval=interval)
         if df.empty:
             return None
 
@@ -267,26 +557,33 @@ def analyze(ticker: str, interval: str = "1h") -> Optional[dict]:
         else:
             direction = "SHORT"
 
+        sweep: dict = {}
         entry, stop_loss, target_one, target_two = (None, None, None, None)
         if direction:
-            entry, stop_loss, target_one, target_two = _calculate_levels(direction, price, obs, df)
+            sweep_bars = STRATEGY_PARAMS.get(strategy_type, STRATEGY_PARAMS["day_trade"])["sweep_bars"]
+            sweep = detect_liquidity_sweep(df, direction, lookback=sweep_bars)
+            entry, stop_loss, target_one, target_two = _calculate_levels(
+                direction, price, obs, df, strategy_type, sweep=sweep
+            )
 
         return {
-            "ticker":        ticker,
-            "current_price": price,
-            "direction":     direction,
-            "entry":         entry,
-            "stop_loss":     stop_loss,
-            "target_one":    target_one,
-            "target_two":    target_two,
-            "structure":     structure,
-            "fvgs":          fvgs,
-            "obs":           obs,
-            "avg_volume":    avg_volume,
-            "last_volume":   last_volume,
-            "candles":       df,
-            "timeframe":     interval,
+            "ticker":           ticker,
+            "current_price":    price,
+            "direction":        direction,
+            "entry":            entry,
+            "stop_loss":        stop_loss,
+            "target_one":       target_one,
+            "target_two":       target_two,
+            "structure":        structure,
+            "fvgs":             fvgs,
+            "obs":              obs,
+            "liquidity_sweep":  sweep,
+            "avg_volume":       avg_volume,
+            "last_volume":      last_volume,
+            "candles":          df,
+            "timeframe":        interval,
+            "strategy_type":    strategy_type,
         }
     except Exception as e:
-        print(f"[smc] Analysis failed for {ticker}: {e}")
+        logger.error(f"[smc] Analysis failed for {ticker}: {e}")
         return None

@@ -1,0 +1,24 @@
+# Never bake real secrets into the image
+.env
+.env.*
+!.env.example
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Dev artifacts
+.venv/
+venv/
+*.log
+server.log
+server.err
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+.claude/

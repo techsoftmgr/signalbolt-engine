@@ -1,18 +1,23 @@
 """
-Confluence scorer — five independent layers summing to a normalised 0-100 score.
+Confluence scorer — nine independent layers → normalised 0-100 composite score.
 
   L1  SMC structure      25 pts  (BOS, CHoCH, FVG, Order Block)
   L2  Technical          25 pts  (RSI divergence, MACD, VWAP, EMA alignment)
   L3  Sentiment          20 pts  (yfinance news keyword sentiment)
   L4  Risk               15 pts  (ATR regime, session timing, earnings proximity)
   L5  Multi-timeframe    15 pts  (15m + 4h direction alignment)
+  ── Quant layers (bonus — up to +12 pts each, capped at 100 total) ──
+  L6  Market Regime       bonus  (VIX, ADX, SPY/200MA classification)
+  L7  Session Quality     bonus  (time-of-day, OpEx, FOMC)
+  L8  Gamma Exposure      bonus  (SpotGamma walls, pin risk, vanna/charm)
+  L9  Manipulation Check  bonus  (stop raid, momentum ignition detection)
   ──────────────────────────────
-  Raw max               100 pts
-  confidence_score  =  round(raw)   → stored 0-100
-  Fire threshold    >=  78          → raised from 75 after adding L5
+  composite_score = round(weighted_L1_L5 + quant_bonus)  → 0-100
+  Fire threshold  >= session threshold (70 standard / 80 ORB / 85 catalyst)
 """
 
 import logging
+import time
 from datetime import date, datetime, timezone, timedelta
 from typing import Optional
 
@@ -21,16 +26,54 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
-FIRE_THRESHOLD = 78
-_RAW_MAX = 100.0
-_L1_MINIMUM = 13
+# ── L3 news sentiment cache ───────────────────────────────────
+# yf.Ticker(ticker).news called once per scan without cache = 54 calls/cycle.
+# News headlines don't change minute-to-minute — 30-min cache is safe.
+_l3_cache: dict[str, tuple[float, float]] = {}  # ticker → (score, fetched_at)
+_L3_CACHE_TTL = 1800  # 30 minutes
+
+# ── L4 earnings calendar cache ────────────────────────────────
+# Earnings dates are fixed weeks ahead — 24h cache is fine.
+_earnings_cache: dict[str, tuple[Optional[int], float]] = {}  # ticker → (days, fetched_at)
+_EARNINGS_CACHE_TTL = 86400  # 24 hours
+
+FIRE_THRESHOLD = 78  # legacy default — use STRATEGY_THRESHOLDS per strategy
+
+STRATEGY_THRESHOLDS: dict[str, int] = {
+    'scalping':     70,
+    'day_trade':    65,
+    'swing_trade':  68,
+    'options_flow': 75,
+    'dark_pool':    72,
+}
+
+# Weights for each scoring layer (must sum to 100 per strategy)
+STRATEGY_WEIGHTS: dict[str, dict[str, float]] = {
+    'scalping':     {'smc': 15, 'technical': 40, 'sentiment': 15, 'risk': 30},
+    'day_trade':    {'smc': 25, 'technical': 35, 'sentiment': 25, 'risk': 15},
+    'swing_trade':  {'smc': 40, 'technical': 30, 'sentiment': 20, 'risk': 10},
+    'options_flow': {'smc': 10, 'technical': 20, 'sentiment': 50, 'risk': 20},
+    'dark_pool':    {'smc': 10, 'technical': 20, 'sentiment': 60, 'risk': 10},
+}
+
+# Raw max per layer (used to normalise to 0-1 before applying strategy weights)
+_L_MAX = {'smc': 25.0, 'technical': 25.0, 'sentiment': 20.0, 'risk': 15.0}
+
+_L1_MINIMUM = 10
 
 
 # ---------------------------------------------------------------------------
 # L1 — SMC structure  (25 pts)
 # ---------------------------------------------------------------------------
 
-def _l1_smc(structure: dict, fvgs: dict, obs: dict, direction: str, price: float) -> float:
+def _l1_smc(
+    structure: dict,
+    fvgs: dict,
+    obs: dict,
+    direction: str,
+    price: float,
+    sweep: Optional[dict] = None,
+) -> float:
     score = 0.0
 
     if direction == "LONG":
@@ -73,6 +116,14 @@ def _l1_smc(structure: dict, fvgs: dict, obs: dict, direction: str, price: float
                 dist = abs(price - (ob["top"] + ob["bottom"]) / 2) / price
                 score += 5 if dist < 0.01 else (3 if dist < 0.025 else 0)
 
+    # Liquidity sweep bonus — market maker raid confirmed before entry
+    if sweep and sweep.get("swept"):
+        candles_ago = sweep.get("candles_ago", 99)
+        if candles_ago <= 2:
+            score += 8   # very fresh raid (within 2 candles) — high-quality entry
+        elif candles_ago <= 5:
+            score += 5   # recent raid — still valid confirmation
+
     return min(score, 25.0)
 
 
@@ -80,8 +131,16 @@ def _l1_smc(structure: dict, fvgs: dict, obs: dict, direction: str, price: float
 # L2 — Technical indicators  (25 pts)
 # ---------------------------------------------------------------------------
 
-def _l2_technical(df: pd.DataFrame, direction: str) -> float:
+def _l2_technical(df: pd.DataFrame, direction: str, strategy_type: str = "day_trade") -> float:
     score = 0.0
+
+    # EMA windows vary by strategy
+    if strategy_type == "scalping":
+        ema_fast, ema_slow, rsi_window = 9, 21, 7
+    elif strategy_type == "swing_trade":
+        ema_fast, ema_slow, rsi_window = 50, 200, 14
+    else:
+        ema_fast, ema_slow, rsi_window = 20, 50, 14
 
     try:
         from ta.momentum import RSIIndicator
@@ -94,7 +153,7 @@ def _l2_technical(df: pd.DataFrame, direction: str) -> float:
         volumes = df["volume"]
 
         # RSI: up to 8 pts
-        rsi_vals = RSIIndicator(close=closes, window=14).rsi().dropna()
+        rsi_vals = RSIIndicator(close=closes, window=rsi_window).rsi().dropna()
         if len(rsi_vals) >= 5:
             rsi = float(rsi_vals.iloc[-1])
             if direction == "LONG":
@@ -134,16 +193,16 @@ def _l2_technical(df: pd.DataFrame, direction: str) -> float:
                 score += 5
 
         # EMA alignment: up to 5 pts
-        ema20 = EMAIndicator(close=closes, window=20).ema_indicator().dropna()
-        ema50 = EMAIndicator(close=closes, window=50).ema_indicator().dropna()
-        if len(ema20) and len(ema50):
-            e20, e50, last = float(ema20.iloc[-1]), float(ema50.iloc[-1]), float(closes.iloc[-1])
+        ema_f = EMAIndicator(close=closes, window=ema_fast).ema_indicator().dropna()
+        ema_s = EMAIndicator(close=closes, window=ema_slow).ema_indicator().dropna()
+        if len(ema_f) and len(ema_s):
+            ef, es, last = float(ema_f.iloc[-1]), float(ema_s.iloc[-1]), float(closes.iloc[-1])
             if direction == "LONG":
-                if last > e20 > e50: score += 5
-                elif last > e20:     score += 2
+                if last > ef > es: score += 5
+                elif last > ef:    score += 2
             else:
-                if last < e20 < e50: score += 5
-                elif last < e20:     score += 2
+                if last < ef < es: score += 5
+                elif last < ef:    score += 2
 
     except Exception as e:
         logger.debug(f"L2 technical error: {e}")
@@ -162,9 +221,21 @@ _NEGATIVE = {"fall", "drop", "miss", "loss", "decline", "down", "weak", "bearish
 
 
 def _l3_sentiment(ticker: str, direction: str) -> float:
+    """
+    News-keyword sentiment for standard strategies (scalping/day_trade/swing_trade).
+    Cached 30 minutes — yfinance news doesn't change per-minute.
+    """
+    now = time.monotonic()
+    cached = _l3_cache.get(ticker)
+    # Cache key includes direction implicitly: score is stored direction-neutral,
+    # then flipped per direction at return time, so we cache the raw ratio instead.
+    if cached and (now - cached[1]) < _L3_CACHE_TTL:
+        return cached[0] if direction == "LONG" else (20.0 - cached[0])
+
     try:
         news = yf.Ticker(ticker).news
         if not news:
+            _l3_cache[ticker] = (10.0, now)
             return 10.0
 
         pos = neg = 0
@@ -175,15 +246,56 @@ def _l3_sentiment(ticker: str, direction: str) -> float:
 
         total = pos + neg
         if total == 0:
+            _l3_cache[ticker] = (10.0, now)
             return 10.0
 
         ratio = (pos - neg) / total
-        pts = ((ratio + 1) / 2 * 20) if direction == "LONG" else ((-ratio + 1) / 2 * 20)
-        return max(0.0, min(round(pts, 1), 20.0))
+        long_score = round(((ratio + 1) / 2 * 20), 1)
+        long_score = max(0.0, min(long_score, 20.0))
+        _l3_cache[ticker] = (long_score, now)
+        return long_score if direction == "LONG" else (20.0 - long_score)
 
     except Exception as e:
         logger.debug(f"L3 sentiment error for {ticker}: {e}")
         return 10.0
+
+
+def _l3_flow_sentiment(analysis: dict, direction: str) -> float:
+    """
+    Fix #1: For options_flow and dark_pool strategies, use actual UW data
+    (premium-weighted bull/bear sentiment) instead of news keyword scanning.
+
+    options_flow: bull_premium vs bear_premium ratio from UW flow alerts.
+    dark_pool:    total_notional size as a conviction proxy.
+
+    Both are far more reliable signals than headline keyword matching.
+    """
+    strategy = analysis.get("strategy_type", "")
+
+    if strategy == "options_flow":
+        bull_prem = float(analysis.get("bull_premium") or 0)
+        bear_prem = float(analysis.get("bear_premium") or 0)
+        total = bull_prem + bear_prem
+
+        if total == 0:
+            return 10.0  # no UW premium data — neutral
+
+        dominant = bull_prem if direction == "LONG" else bear_prem
+        ratio = dominant / total  # 0.0–1.0 (1.0 = fully aligned)
+
+        # Scale to 0-20: 60% dominance → 12 pts, 80% → 16 pts, 95% → 19 pts
+        score = ratio * 20.0
+        return round(max(0.0, min(score, 20.0)), 1)
+
+    elif strategy == "dark_pool":
+        total_notional = float(analysis.get("total_notional") or 0)
+        # Conviction based on block size — larger blocks = stronger signal
+        if total_notional >= 5_000_000:   return 19.0   # $5M+  — institutional conviction
+        elif total_notional >= 2_000_000: return 17.0   # $2M+
+        elif total_notional >= 1_000_000: return 15.0   # $1M+
+        elif total_notional >= 500_000:   return 13.0   # $500K+
+        elif total_notional >= 200_000:   return 11.0   # $200K+
+        else:                             return 9.0    # below threshold
 
 
 # ---------------------------------------------------------------------------
@@ -191,35 +303,46 @@ def _l3_sentiment(ticker: str, direction: str) -> float:
 # ---------------------------------------------------------------------------
 
 def _earnings_days_away(ticker: str) -> Optional[int]:
-    """Return days until next earnings, or None if unknown."""
+    """
+    Return days until next earnings, or None if unknown.
+    Cached 24h — earnings dates don't change intraday.
+    """
+    now = time.monotonic()
+    cached = _earnings_cache.get(ticker)
+    if cached and (now - cached[1]) < _EARNINGS_CACHE_TTL:
+        return cached[0]
+
+    result: Optional[int] = None
     try:
         cal = yf.Ticker(ticker).calendar
         if cal is None:
-            return None
-        # calendar can be a DataFrame or dict depending on yfinance version
-        if isinstance(cal, pd.DataFrame):
+            pass
+        elif isinstance(cal, pd.DataFrame):
             if "Earnings Date" in cal.index:
                 val = cal.loc["Earnings Date"].iloc[0]
             elif not cal.empty:
                 val = cal.iloc[0, 0]
             else:
-                return None
+                val = None
+            if val is not None:
+                if hasattr(val, "date"):
+                    val = val.date()
+                if isinstance(val, date):
+                    result = abs((val - date.today()).days)
         elif isinstance(cal, dict):
             val = cal.get("Earnings Date") or cal.get("earningsDate")
             if isinstance(val, list):
                 val = val[0] if val else None
-        else:
-            return None
-
-        if val is None:
-            return None
-        if hasattr(val, "date"):
-            val = val.date()
-        elif not isinstance(val, date):
-            return None
-        return abs((val - date.today()).days)
+            if val is not None:
+                if hasattr(val, "date"):
+                    val = val.date()
+                if isinstance(val, date):
+                    result = abs((val - date.today()).days)
     except Exception:
-        return None
+        pass
+
+    _earnings_cache[ticker] = (result, now)
+    return result
 
 
 def _l4_risk(df: pd.DataFrame, ticker: str) -> float:
@@ -294,22 +417,98 @@ def _l5_multiframe(ticker: str, direction: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Confidence factor labels  (human-readable breakdown for the app)
+# ---------------------------------------------------------------------------
+
+def _factors_from_breakdown(breakdown: dict, direction: str) -> list:
+    factors = []
+    l1     = breakdown.get("l1_smc", 0)
+    l2     = breakdown.get("l2_technical", 0)
+    l3     = breakdown.get("l3_sentiment", 0)
+    l4     = breakdown.get("l4_risk", 0)
+    l5     = breakdown.get("l5_mtf", 0)
+    swept  = breakdown.get("sweep_confirmed", False)
+
+    bull = direction == "LONG"
+
+    # Liquidity sweep — show first if confirmed (most distinctive signal)
+    if swept:
+        factors.append("Stop Hunt Confirmed" if bull else "Liquidity Raid Confirmed")
+
+    # L1 — SMC structure
+    if l1 >= 20:
+        factors.append("CHoCH + Order Block")
+    elif l1 >= 15:
+        factors.append("Break of Structure")
+    elif l1 >= 13:
+        factors.append("SMC Setup")
+
+    # L2 — Technicals
+    if l2 >= 20:
+        factors.append("RSI + MACD Aligned")
+    elif l2 >= 14:
+        factors.append("Bullish Technicals" if bull else "Bearish Technicals")
+    elif l2 >= 8:
+        factors.append("VWAP + EMA Stack")
+
+    # L3 — Sentiment
+    if l3 >= 14:
+        factors.append("Bullish News" if bull else "Bearish News")
+    elif l3 >= 11:
+        factors.append("Positive Sentiment" if bull else "Negative Sentiment")
+
+    # L4 — Risk environment
+    if l4 >= 10:
+        factors.append("Optimal Risk Window")
+
+    # L5 — Multi-timeframe
+    if l5 >= 12:
+        factors.append("15m + 4H Aligned")
+    elif l5 >= 7:
+        factors.append("Multi-TF Aligned")
+
+    return factors[:4]
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def score(analysis: dict) -> dict:
+def score(
+    analysis: dict,
+    strategy_type: str = "day_trade",
+    regime: Optional[dict] = None,
+    session: Optional[dict] = None,
+    gamma: Optional[dict] = None,
+    manipulation: Optional[dict] = None,
+) -> dict:
+    """
+    Score a signal candidate across all 9 layers.
+
+    Args:
+        analysis:      SMC analysis dict (from smc.analyze)
+        strategy_type: trading strategy
+        regime:        output of regime_detector.detect()  (optional — adds L6)
+        session:       output of session_classifier.classify()  (optional — adds L7)
+        gamma:         output of gamma_engine.fetch()  (optional — adds L8)
+        manipulation:  output of manipulation_detector.detect()  (optional — adds L9)
+    """
     direction = analysis.get("direction")
     if not direction:
         return {"total": 0, "passes": False, "breakdown": {}}
 
     price  = analysis["current_price"]
-    df     = analysis["candles"]
+    df     = analysis.get("candles") if analysis.get("candles") is not None else __import__("pandas").DataFrame()
     ticker = analysis["ticker"]
 
-    l1 = _l1_smc(analysis["structure"], analysis["fvgs"], analysis["obs"], direction, price)
+    flow_strategy = strategy_type in ("options_flow", "dark_pool")
+    sweep = analysis.get("liquidity_sweep", {})
 
-    # Hard gate: no SMC structure → skip without burning API calls on other layers
-    if l1 < _L1_MINIMUM:
+    # ── L1–L5 (existing layers) ───────────────────────────────
+    l1 = _l1_smc(analysis.get("structure", {}), analysis.get("fvgs", {}), analysis.get("obs", {}), direction, price, sweep)
+
+    # Hard gate: require SMC structure for standard strategies only
+    if l1 < _L1_MINIMUM and not flow_strategy:
         logger.debug(f"[scorer] {ticker} L1={l1:.0f} < {_L1_MINIMUM} — no SMC backing, skip")
         return {
             "total":     round(l1),
@@ -317,40 +516,120 @@ def score(analysis: dict) -> dict:
             "breakdown": {"l1_smc": round(l1), "l2_technical": 0,
                           "l3_sentiment": 0, "l4_risk": 0, "l5_mtf": 0},
             "direction":  direction,
-            "entry":      analysis["entry"],
-            "stop_loss":  analysis["stop_loss"],
-            "target_one": analysis["target_one"],
-            "target_two": analysis["target_two"],
+            "entry":      analysis.get("entry"),
+            "stop_loss":  analysis.get("stop_loss"),
+            "target_one": analysis.get("target_one"),
+            "target_two": analysis.get("target_two"),
         }
 
-    l2 = _l2_technical(df, direction)
-    l3 = _l3_sentiment(ticker, direction)
-    l4 = _l4_risk(df, ticker)
-    l5 = _l5_multiframe(ticker, direction)
+    l2 = _l2_technical(df, direction, strategy_type) if not df.empty else 10.0
+    # Fix #1: flow strategies use UW premium-weighted sentiment, not news keywords
+    l3 = _l3_flow_sentiment(analysis, direction) if flow_strategy else _l3_sentiment(ticker, direction)
+    l4 = _l4_risk(df, ticker) if not df.empty else 5.0
+    l5 = 0.0 if flow_strategy else _l5_multiframe(ticker, direction)
 
-    raw        = l1 + l2 + l3 + l4 + l5
-    normalised = round(raw / _RAW_MAX * 100)
+    # ── Load adaptive weights (learned by optimizer; defaults on first run) ──
+    try:
+        from engine.adaptive_weights import get_weights as _get_adaptive_weights
+        regime_type = (regime or {}).get("regime_type", "ANY")
+        w = _get_adaptive_weights(strategy_type, regime_type)
+    except Exception:
+        w = STRATEGY_WEIGHTS.get(strategy_type, STRATEGY_WEIGHTS["day_trade"])
+
+    weighted = (
+        (l1 / _L_MAX["smc"])       * w["smc"] +
+        (l2 / _L_MAX["technical"]) * w["technical"] +
+        (l3 / _L_MAX["sentiment"]) * w["sentiment"] +
+        (l4 / _L_MAX["risk"])      * w["risk"]
+    )
+    l5_bonus_max = w.get("l5_bonus", 5.0)
+    l5_bonus = (l5 / 15.0) * l5_bonus_max
+    base_score = weighted + l5_bonus
+
+    # ── L6–L9 (quant bonus layers) ────────────────────────────
+    # Each quant layer contributes up to ±10 pts as a weighted bonus
+    quant_bonus = 0.0
+    l6_regime    = 0.0
+    l7_session   = 0.0
+    l8_gamma     = 0.0
+    l9_manip     = 0.0
+
+    # Adaptive bonus magnitudes (optimizer tunes these over time)
+    l6_pts = w.get("l6_bonus", 8.0)
+    l7_pts = w.get("l7_bonus", 6.0)
+    l8_pts = w.get("l8_bonus", 8.0)
+    l9_pts = w.get("l9_bonus", 8.0)
+
+    if regime is not None:
+        from engine.regime_detector import score_for_signal as regime_score
+        l6_regime = regime_score(regime, direction)
+        quant_bonus += (l6_regime - 50) / 50 * l6_pts
+
+    if session is not None:
+        from engine.session_classifier import score_for_signal as session_score
+        l7_session = session_score(session, analysis.get("has_catalyst", False), analysis.get("vol_multiple", 1.0))
+        quant_bonus += (l7_session - 50) / 50 * l7_pts
+
+    if gamma is not None:
+        from engine.gamma_engine import score_for_signal as gamma_score
+        l8_gamma = gamma_score(gamma, direction, session.get("is_opex_day", False) if session else False)
+        quant_bonus += (l8_gamma - 50) / 50 * l8_pts
+
+    if manipulation is not None:
+        from engine.manipulation_detector import score_for_signal as manip_score
+        l9_manip = manip_score(manipulation)
+        quant_bonus += (l9_manip - 50) / 50 * l9_pts
+
+    normalised = round(min(max(base_score + quant_bonus, 0), 100))
+
+    # ── Determine threshold ───────────────────────────────────
+    if session is not None:
+        threshold = session.get("threshold", STRATEGY_THRESHOLDS.get(strategy_type, FIRE_THRESHOLD))
+    else:
+        threshold = STRATEGY_THRESHOLDS.get(strategy_type, FIRE_THRESHOLD)
 
     breakdown = {
-        "l1_smc":       round(l1),
-        "l2_technical": round(l2),
-        "l3_sentiment": round(l3),
-        "l4_risk":      round(l4),
-        "l5_mtf":       round(l5),
+        "l1_smc":          round(l1),
+        "l2_technical":    round(l2),
+        "l3_sentiment":    round(l3),
+        "l4_risk":         round(l4),
+        "l5_mtf":          round(l5),
+        "l6_regime":       round(l6_regime),
+        "l7_session":      round(l7_session),
+        "l8_gamma":        round(l8_gamma),
+        "l9_manipulation": round(l9_manip),
+        "quant_bonus":     round(quant_bonus, 1),
+        "sweep_confirmed": bool(sweep and sweep.get("swept")),
+        "regime_type":     regime.get("regime_type", "") if regime else "",
+        "session_mode":    session.get("mode", "") if session else "",
     }
 
     logger.info(
-        f"[scorer] {ticker} total={normalised} "
-        f"(L1={round(l1)} L2={round(l2)} L3={round(l3)} L4={round(l4)} L5={round(l5)})"
+        f"[scorer] {ticker} [{strategy_type}] total={normalised} threshold={threshold} "
+        f"(L1={round(l1)} L2={round(l2)} L3={round(l3)} L4={round(l4)} L5={round(l5)} "
+        f"L6={round(l6_regime)} L7={round(l7_session)} L8={round(l8_gamma)} "
+        f"L9={round(l9_manip)} bonus={quant_bonus:+.1f})"
     )
 
+    factors = _factors_from_breakdown(breakdown, direction)
+    # Add quant factors
+    if regime and regime.get("regime_type") in ("TRENDING_BULL", "TRENDING_BEAR"):
+        factors.append(f"Regime: {regime['regime_type'].replace('_', ' ').title()}")
+    if gamma and gamma.get("available") and not gamma.get("is_negative_gamma"):
+        factors.append("Gamma Positive Zone")
+    if manipulation and manipulation.get("is_clean"):
+        factors.append("Clean Price Action")
+    factors = factors[:4]
+
     return {
-        "total":      normalised,
-        "passes":     normalised >= FIRE_THRESHOLD,
-        "breakdown":  breakdown,
-        "direction":  direction,
-        "entry":      analysis["entry"],
-        "stop_loss":  analysis["stop_loss"],
-        "target_one": analysis["target_one"],
-        "target_two": analysis["target_two"],
+        "total":              normalised,
+        "passes":             normalised >= threshold,
+        "breakdown":          breakdown,
+        "confidence_factors": factors,
+        "direction":          direction,
+        "entry":              analysis.get("entry"),
+        "stop_loss":          analysis.get("stop_loss"),
+        "target_one":         analysis.get("target_one"),
+        "target_two":         analysis.get("target_two"),
+        "threshold":          threshold,
     }

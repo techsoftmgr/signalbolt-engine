@@ -1,0 +1,486 @@
+"""
+Signal Monitor
+==============
+Runs every 15 minutes alongside tracker.py. Handles everything tracker doesn't:
+
+  1. Market-close enforcer (3:50 PM ET)
+     - day_trade + options_flow signals → force close at 3:50 PM ET
+     - Scalping signals → force close after 30 min regardless of price
+     - Swing trade → not affected (held overnight by design)
+     - Push: "Market closing — close your [TICKER] position now"
+
+  2. Structure reversal detector (stock signals only)
+     - Re-runs SMC structure check on every active signal's ticker
+     - LONG signal + bearish CHoCH detected → early exit
+     - SHORT signal + bullish CHoCH detected → early exit
+     - Push: "Structure reversed on [TICKER] — consider closing"
+
+  3. T1 hit → SL moves to breakeven
+     - When price crosses T1 but T2 not yet hit
+     - Updates stop_loss = entry_price in DB so any reversal is a scratch, not a loss
+     - Push: "[TICKER] hit T1 — stop moved to breakeven, riding to T2"
+
+  4. Close notifications for ALL events
+     - Target hit, stop hit, market close, reversal — all get push notifications
+
+This module is intentionally separate from tracker.py so either can be
+upgraded independently.
+"""
+
+import logging
+import os
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+from zoneinfo import ZoneInfo
+
+import yfinance as yf
+import pandas as pd
+from supabase import create_client, Client
+
+from engine import smc, push
+
+logger = logging.getLogger("signalbolt.monitor")
+
+ET = ZoneInfo("America/New_York")
+
+# ── Strategy close rules ──────────────────────────────────────────────────────
+# Strategies that must be closed by market close (not held overnight)
+INTRADAY_STRATEGIES = {"scalping", "day_trade", "options_flow"}
+
+# Scalping max hold in minutes (regardless of market hours)
+SCALP_MAX_HOLD_MINS = 30
+
+# Market close trigger: close all intraday signals at this ET time
+MARKET_CLOSE_HOUR   = 15   # 3 PM
+MARKET_CLOSE_MINUTE = 50   # 3:50 PM → 10 min buffer before 4 PM
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _supabase() -> Client:
+    key = os.environ.get("SUPABASE_KEY") or os.environ["SUPABASE_SECRET_KEY"]
+    return create_client(os.environ["SUPABASE_URL"], key)
+
+
+def _now_et() -> datetime:
+    return datetime.now(ET)
+
+
+def _is_market_hours() -> bool:
+    """True during regular US market hours (9:30 AM – 4:00 PM ET, Mon-Fri)."""
+    now = _now_et()
+    if now.weekday() >= 5:      # Saturday/Sunday
+        return False
+    open_time  = now.replace(hour=9,  minute=30, second=0, microsecond=0)
+    close_time = now.replace(hour=16, minute=0,  second=0, microsecond=0)
+    return open_time <= now <= close_time
+
+
+def _is_near_market_close() -> bool:
+    """True from 3:50 PM ET onwards on a trading day."""
+    now = _now_et()
+    if now.weekday() >= 5:
+        return False
+    trigger = now.replace(
+        hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MINUTE,
+        second=0, microsecond=0,
+    )
+    close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    return trigger <= now <= close
+
+
+def _current_price(ticker: str) -> Optional[float]:
+    try:
+        p = yf.Ticker(ticker).fast_info["last_price"]
+        return float(p) if p else None
+    except Exception:
+        return None
+
+
+def _close_signal(sb: Client, sig_id: str, reason: str, close_type: str = "stock") -> None:
+    """Write closed status to Supabase for a stock or option signal."""
+    table = "option_signals" if close_type == "option" else "signals"
+    try:
+        sb.table(table).update({
+            "status":        "closed",
+            "closed_reason": reason,
+            "result":        "expired",
+            "closed_at":     datetime.now(timezone.utc).isoformat(),
+        }).eq("id", sig_id).execute()
+    except Exception as e:
+        logger.error(f"[monitor] Close failed for {sig_id}: {e}")
+
+
+def _update_sl(sb: Client, sig_id: str, new_sl: float) -> None:
+    """Move stop loss to new level (e.g. breakeven after T1 hit)."""
+    try:
+        sb.table("signals").update({
+            "stop_loss": round(new_sl, 4),
+        }).eq("id", sig_id).execute()
+    except Exception as e:
+        logger.error(f"[monitor] SL update failed for {sig_id}: {e}")
+
+
+def _log_event(
+    sb: Client,
+    signal_id: str,
+    event_type: str,
+    price: float | None = None,
+    note: str = "",
+) -> None:
+    """Insert a row into signal_events — best-effort, never raises."""
+    try:
+        sb.table("signal_events").insert({
+            "signal_id":  signal_id,
+            "event_type": event_type,
+            "price":      price,
+            "note":       note,
+        }).execute()
+    except Exception as e:
+        logger.debug(f"[monitor] event log failed ({event_type}): {e}")
+
+
+# ---------------------------------------------------------------------------
+# Reversal detection
+# ---------------------------------------------------------------------------
+
+def _detect_structure_reversal(ticker: str, direction: str) -> bool:
+    """
+    Returns True if SMC structure has flipped against the open signal direction.
+    LONG signal + bearish CHoCH → reversal detected.
+    SHORT signal + bullish CHoCH → reversal detected.
+    """
+    try:
+        df = smc.fetch_candles(ticker, period="2d", interval="15m")
+        if df.empty or len(df) < 20:
+            return False
+        df     = smc.detect_swings(df)
+        struct = smc.detect_structure(df)
+
+        if direction == "LONG" and struct.get("choch_bearish"):
+            logger.info(f"[monitor] {ticker} LONG — bearish CHoCH detected → reversal")
+            return True
+        if direction == "SHORT" and struct.get("choch_bullish"):
+            logger.info(f"[monitor] {ticker} SHORT — bullish CHoCH detected → reversal")
+            return True
+        return False
+    except Exception as e:
+        logger.debug(f"[monitor] Reversal check failed for {ticker}: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Push helpers
+# ---------------------------------------------------------------------------
+
+def _push_market_close(ticker: str, direction: str, strategy: str) -> None:
+    emoji = "📈" if direction == "LONG" else "📉"
+    push._send_raw(
+        title=f"⏰ Market Closing — {ticker}",
+        body=f"Close your {direction} {strategy.replace('_',' ')} position before 4 PM ET",
+        data={"type": "market_close", "ticker": ticker},
+    )
+
+
+def _push_reversal(ticker: str, direction: str) -> None:
+    opposite = "BEARISH" if direction == "LONG" else "BULLISH"
+    push._send_raw(
+        title=f"⚠ Structure Reversed — {ticker}",
+        body=f"{opposite} CHoCH detected. Consider closing your {direction} position.",
+        data={"type": "reversal", "ticker": ticker, "direction": direction},
+    )
+
+
+def _push_t1_breakeven(ticker: str, direction: str, pct: float) -> None:
+    push._send_raw(
+        title=f"🎯 T1 Hit — {ticker} +{pct:.1f}%",
+        body=f"Stop moved to breakeven. Riding to T2. {direction} still open.",
+        data={"type": "t1_breakeven", "ticker": ticker},
+    )
+
+
+def _push_scalp_expired(ticker: str, direction: str) -> None:
+    push._send_raw(
+        title=f"⏱ Scalp Time Limit — {ticker}",
+        body=f"30-min scalp window closed. Exit your {direction} position now.",
+        data={"type": "scalp_expired", "ticker": ticker},
+    )
+
+
+def _push_closed(ticker: str, direction: str, result: str, pct: float) -> None:
+    if result == "win":
+        push._send_raw(
+            title=f"✅ Target Hit — {ticker} +{pct:.1f}%",
+            body=f"{direction} signal closed with a win.",
+            data={"type": "signal_closed", "result": "win", "ticker": ticker},
+        )
+    elif result == "loss":
+        push._send_raw(
+            title=f"🔴 Stop Hit — {ticker} {pct:.1f}%",
+            body=f"{direction} signal stopped out.",
+            data={"type": "signal_closed", "result": "loss", "ticker": ticker},
+        )
+
+
+# ---------------------------------------------------------------------------
+# Stock signal monitor
+# ---------------------------------------------------------------------------
+
+def _monitor_stocks(sb: Client) -> None:
+    try:
+        rows = (
+            sb.table("signals")
+            .select("*")
+            .eq("status", "active")
+            .execute()
+            .data
+        ) or []
+    except Exception as e:
+        logger.error(f"[monitor] Failed to fetch stock signals: {e}")
+        return
+
+    if not rows:
+        return
+
+    logger.info(f"[monitor] Checking {len(rows)} active stock signal(s)")
+    near_close  = _is_near_market_close()
+    market_open = _is_market_hours()
+    now_utc     = datetime.now(timezone.utc)
+
+    for sig in rows:
+        ticker   = sig["ticker"]
+        strategy = sig.get("strategy_type") or "day_trade"
+        direction = sig["direction"]
+        created  = datetime.fromisoformat(sig["created_at"].replace("Z", "+00:00"))
+        age_mins = (now_utc - created).total_seconds() / 60
+
+        # ── 1. Scalp time limit (30 min, any time) ───────────────────────────
+        if strategy == "scalping" and age_mins >= SCALP_MAX_HOLD_MINS:
+            logger.info(f"[monitor] {ticker} scalp time limit ({age_mins:.0f} min) — closing")
+            _close_signal(sb, sig["id"], "time_limit")
+            _log_event(sb, sig["id"], "time_limit",
+                       note=f"30-min scalp window closed — position exited")
+            try:
+                _push_scalp_expired(ticker, direction)
+            except Exception:
+                pass
+            continue
+
+        # ── 2. Market-close enforcer (intraday strategies only) ───────────────
+        if near_close and strategy in INTRADAY_STRATEGIES:
+            logger.info(f"[monitor] {ticker} [{strategy}] market closing — force close")
+            _close_signal(sb, sig["id"], "market_close")
+            _log_event(sb, sig["id"], "market_close",
+                       note=f"Market closing — {direction} position closed at 3:50 PM ET")
+            try:
+                _push_market_close(ticker, direction, strategy)
+            except Exception:
+                pass
+            continue
+
+        # Only run analysis checks during market hours
+        if not market_open:
+            continue
+
+        # ── 3. T1 → breakeven SL upgrade ─────────────────────────────────────
+        try:
+            entry  = float(sig["entry_price"])
+            t1     = float(sig["target_one"])
+            sl     = float(sig["stop_loss"])
+            t2     = float(sig["target_two"])
+            price  = _current_price(ticker)
+
+            if price and sl != entry:   # SL not already at breakeven
+                is_long = direction == "LONG"
+                t1_hit  = (is_long and price >= t1) or (not is_long and price <= t1)
+                t2_hit  = (is_long and price >= t2) or (not is_long and price <= t2)
+
+                if t1_hit and not t2_hit:
+                    pct = abs(price - entry) / entry * 100
+                    logger.info(f"[monitor] {ticker} T1 hit @ {price:.2f} — moving SL to breakeven {entry:.2f}")
+                    _update_sl(sb, sig["id"], entry)
+                    _log_event(sb, sig["id"], "t1_hit", price=price,
+                               note=f"T1 hit @ ${price:.2f} (+{pct:.1f}%) — stop moved to breakeven ${entry:.2f}")
+                    try:
+                        _push_t1_breakeven(ticker, direction, pct)
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.debug(f"[monitor] T1 check error for {ticker}: {e}")
+
+        # ── 4. Structure reversal detection ───────────────────────────────────
+        try:
+            if _detect_structure_reversal(ticker, direction):
+                logger.info(f"[monitor] {ticker} structure reversed — closing {direction} early")
+                _close_signal(sb, sig["id"], "structure_reversal")
+                opposite = "bearish" if direction == "LONG" else "bullish"
+                _log_event(sb, sig["id"], "reversal",
+                           note=f"{opposite.capitalize()} CHoCH detected — {direction} closed early")
+                try:
+                    _push_reversal(ticker, direction)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"[monitor] Reversal check error for {ticker}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Options signal monitor
+# ---------------------------------------------------------------------------
+
+def _monitor_options(sb: Client) -> None:
+    try:
+        rows = (
+            sb.table("option_signals")
+            .select("*")
+            .eq("status", "active")
+            .execute()
+            .data
+        ) or []
+    except Exception as e:
+        logger.error(f"[monitor] Failed to fetch option signals: {e}")
+        return
+
+    if not rows:
+        return
+
+    logger.info(f"[monitor] Checking {len(rows)} active option signal(s)")
+    near_close  = _is_near_market_close()
+    market_open = _is_market_hours()
+    now_utc     = datetime.now(timezone.utc)
+
+    for sig in rows:
+        ticker   = sig["ticker"]
+        strategy = sig.get("strategy_type") or "day_trade"
+        direction = sig.get("direction", "LONG")
+        created  = datetime.fromisoformat(sig["created_at"].replace("Z", "+00:00"))
+        age_mins = (now_utc - created).total_seconds() / 60
+
+        # ── 1. Market-close enforcer ──────────────────────────────────────────
+        # Options day trades MUST be closed before market close — they lose
+        # all time value rapidly in the last 10 minutes and spreads widen.
+        if near_close and strategy in INTRADAY_STRATEGIES:
+            logger.info(f"[monitor] {ticker} [option/{strategy}] market closing — force close")
+            _close_signal(sb, sig["id"], "market_close", close_type="option")
+            _log_event(sb, sig["id"], "market_close",
+                       note=f"Market closing — option position closed at 3:50 PM ET")
+            try:
+                push._send_raw(
+                    title=f"⏰ Close Option Now — {ticker}",
+                    body=f"Market closing in 10 min. Exit your {strategy.replace('_',' ')} option position.",
+                    data={"type": "market_close", "ticker": ticker, "signal_type": "option"},
+                )
+            except Exception:
+                pass
+            continue
+
+        # ── 2. Swing option — expired DTE ────────────────────────────────────
+        # If the option's expiry date has passed → force close
+        try:
+            expiry_str = sig.get("expiry_date")
+            if expiry_str:
+                expiry_dt = datetime.strptime(expiry_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                if now_utc >= expiry_dt:
+                    logger.info(f"[monitor] {ticker} option expired (DTE=0) — closing")
+                    _close_signal(sb, sig["id"], "option_expired", close_type="option")
+                    _log_event(sb, sig["id"], "option_expired",
+                               note=f"{sig.get('contract_type','?')} option reached expiry date")
+                    try:
+                        push._send_raw(
+                            title=f"⚠ Option Expired — {ticker}",
+                            body=f"Your {sig.get('contract_type','?')} option has reached expiry.",
+                            data={"type": "option_expired", "ticker": ticker},
+                        )
+                    except Exception:
+                        pass
+                    continue
+        except Exception:
+            pass
+
+        if not market_open:
+            continue
+
+        # ── 3. Underlying reversal → close option ────────────────────────────
+        # If the underlying stock reverses structure, the option loses value fast.
+        try:
+            if _detect_structure_reversal(ticker, direction):
+                logger.info(f"[monitor] {ticker} underlying reversed — closing option {direction} early")
+                _close_signal(sb, sig["id"], "structure_reversal", close_type="option")
+                try:
+                    push._send_raw(
+                        title=f"⚠ Underlying Reversed — {ticker}",
+                        body=f"Stock structure changed against your {direction} option. Consider closing.",
+                        data={"type": "reversal", "ticker": ticker, "signal_type": "option"},
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"[monitor] Option reversal check error for {ticker}: {e}")
+
+        # ── 4. Premium level check ────────────────────────────────────────────
+        # Estimate current premium via delta × underlying move
+        # Close if estimated premium hit target or stop
+        try:
+            price      = _current_price(ticker)
+            delta      = float(sig.get("delta") or 0)
+            und_price  = float(sig.get("underlying_price") or 0)
+            entry_prem = float(sig.get("entry_premium") or 0)
+            target_prem = float(sig.get("target_premium") or 0)
+            stop_prem   = float(sig.get("stop_premium") or 0)
+
+            if price and und_price and delta and entry_prem:
+                est_prem = entry_prem + delta * (price - und_price)
+                result   = None
+
+                if est_prem >= target_prem:
+                    result = "win"
+                elif est_prem <= stop_prem:
+                    result = "loss"
+
+                if result:
+                    pct = ((est_prem - entry_prem) / entry_prem * 100) if entry_prem else 0
+                    sb.table("option_signals").update({
+                        "status":        "closed",
+                        "closed_reason": "target_hit" if result == "win" else "stop_hit",
+                        "result":        result,
+                        "closed_at":     now_utc.isoformat(),
+                    }).eq("id", sig["id"]).execute()
+                    event_type = "closed_win" if result == "win" else "closed_loss"
+                    event_note = (
+                        f"Target hit — premium ${entry_prem:.2f}→${est_prem:.2f} (+{pct:.1f}%)"
+                        if result == "win"
+                        else f"Stop hit — premium ${entry_prem:.2f}→${est_prem:.2f} ({pct:.1f}%)"
+                    )
+                    _log_event(sb, sig["id"], event_type, price=price, note=event_note)
+                    logger.info(f"[monitor] Option {ticker} {result} — premium {entry_prem:.2f}→{est_prem:.2f} ({pct:+.1f}%)")
+                    try:
+                        _push_closed(ticker, direction, result, pct)
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.debug(f"[monitor] Option premium check error for {ticker}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def run() -> None:
+    """
+    Full monitoring pass — stocks + options.
+    Called every 15 minutes from runner.py maintenance job.
+    """
+    logger.info(
+        f"[monitor] Pass started — "
+        f"ET={_now_et().strftime('%H:%M')} "
+        f"near_close={_is_near_market_close()} "
+        f"market_open={_is_market_hours()}"
+    )
+
+    sb = _supabase()
+    _monitor_stocks(sb)
+    _monitor_options(sb)
+
+    logger.info("[monitor] Pass complete")

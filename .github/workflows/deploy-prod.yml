@@ -1,0 +1,86 @@
+name: Deploy → PROD
+
+# Only fires when a PR is merged into main.
+# Requires CI to pass first (GitHub branch protection enforces this).
+# After Railway deploys, runs smoke tests — if they fail, posts a warning.
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  test-before-prod:
+    name: Final test gate (prod)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      SUPABASE_URL:              "https://test.supabase.co"
+      SUPABASE_SECRET_KEY:       "test_secret_key"
+      ALPACA_API_KEY:            "test_alpaca_key"
+      ALPACA_SECRET_KEY:         "test_alpaca_secret"
+      ALPACA_BASE_URL:           "https://paper-api.alpaca.markets"
+      ALPACA_DATA_FEED:          "iex"
+      ANTHROPIC_API_KEY:         "test_anthropic_key"
+      STRIPE_SECRET_KEY:         "sk_test_fake"
+      STRIPE_PUBLISHABLE_KEY:    "pk_test_fake"
+      STRIPE_WEBHOOK_SECRET:     "whsec_fake"
+      STRIPE_PRO_PRICE_ID:       "price_fake_pro"
+      STRIPE_PRO_PLUS_PRICE_ID:  "price_fake_proplus"
+      SENTRY_DSN:                ""
+      ENVIRONMENT:               "test"
+      PORT:                      "8000"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest pytest-asyncio httpx
+
+      - name: Run full test suite
+        run: pytest tests/ -v --tb=short
+
+  deploy-prod:
+    name: Smoke test PROD after Railway deploy
+    runs-on: ubuntu-latest
+    needs: [test-before-prod]
+    environment: production
+
+    steps:
+      - name: Wait for Railway deploy
+        run: sleep 150   # prod deploys can take slightly longer
+
+      - name: Smoke test — /health
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "${{ secrets.PROD_ENGINE_URL }}/health" \
+            --max-time 20 \
+            --retry 5 \
+            --retry-delay 15)
+          echo "Prod health check: HTTP $STATUS"
+          if [ "$STATUS" != "200" ]; then
+            echo "PROD HEALTH CHECK FAILED — manual rollback may be needed!"
+            exit 1
+          fi
+
+      - name: Smoke test — /signals
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "${{ secrets.PROD_ENGINE_URL }}/signals" \
+            --max-time 20)
+          echo "Prod signals endpoint: HTTP $STATUS"
+          if [ "$STATUS" != "200" ] && [ "$STATUS" != "401" ]; then
+            echo "PROD SIGNALS ENDPOINT UNEXPECTED: $STATUS"
+            exit 1
+          fi
+
+      - name: Deploy complete
+        if: success()
+        run: echo "Production deploy verified successfully."
