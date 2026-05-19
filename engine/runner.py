@@ -198,11 +198,36 @@ def _has_active_signal(sb: Client, ticker: str, strategy_type: str) -> bool:
 
 def _write_signal(sb: Client, row: dict) -> None:
     try:
-        sb.table("signals").insert(row).execute()
+        result = sb.table("signals").insert(row).execute()
         logger.info(
             f"[runner] SIGNAL SAVED  {row['ticker']:6s} {row['direction']:5s} "
             f"[{row.get('strategy_type','?')}]  entry={row['entry_price']}  score={row['confidence_score']}"
         )
+        # Log the initial "fired" event so History always has a starting entry
+        try:
+            sig_id = result.data[0]["id"] if result.data else None
+            if sig_id:
+                strategy   = (row.get("strategy_type") or "day_trade").replace("_", " ").title()
+                direction  = row.get("direction", "LONG")
+                entry      = row.get("entry_price", 0)
+                score      = row.get("confidence_score", 0)
+                t1         = row.get("target_one", 0)
+                sl         = row.get("stop_loss", 0)
+                regime     = row.get("regime_type", "")
+                regime_str = f" · Regime: {regime}" if regime else ""
+                note = (
+                    f"🟢 {direction} signal fired @ ${entry:.2f} — "
+                    f"{score}% conviction ({strategy}){regime_str} · "
+                    f"Target ${t1:.2f} · Stop ${sl:.2f}"
+                )
+                sb.table("signal_events").insert({
+                    "signal_id":  sig_id,
+                    "event_type": "fired",
+                    "price":      float(entry),
+                    "note":       note,
+                }).execute()
+        except Exception as _e:
+            logger.debug(f"[runner] fired event log failed: {_e}")
     except Exception as e:
         logger.error(f"[runner] Supabase insert failed for {row['ticker']}: {e}")
 
