@@ -15,8 +15,14 @@ CREATE INDEX IF NOT EXISTS signal_events_created_at_idx ON signal_events(created
 
 ALTER TABLE signal_events ENABLE ROW LEVEL SECURITY;
 -- Read-only for all authenticated users (same as signals table)
-CREATE POLICY "signal_events_read" ON signal_events
-  FOR SELECT USING (true);
+DO $$
+BEGIN
+  CREATE POLICY "signal_events_read" ON signal_events
+    FOR SELECT USING (true);
+EXCEPTION WHEN OTHERS THEN
+  NULL; -- policy already exists, ignore
+END;
+$$;
 
 CREATE OR REPLACE FUNCTION fn_signal_fired()
 RETURNS trigger LANGUAGE plpgsql AS $$
