@@ -7,12 +7,16 @@ Tests win/loss/expired outcome detection:
   - Signal past expiry → result=expired
   - Pending signal with no price movement → stays pending
   - Result written to Supabase with correct fields
+
+Real API:
+  track_signals() → void  (creates own supabase client via _supabase())
+  _current_price(ticker: str) → Optional[float]
 """
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch, MagicMock
 from datetime import datetime, timedelta, timezone
 import pytest
 
@@ -37,13 +41,15 @@ def _signal(ticker="AAPL", direction="LONG", entry=180.0,
     }
 
 
-def _mock_sb_with_signals(signals, current_prices=None):
-    """Mock Supabase; optionally override what price _get_current_price returns."""
+def _mock_sb_with_signals(signals):
+    """Mock Supabase returning the given signals on any .select() chain."""
     sb = MagicMock()
     result = MagicMock()
     result.data = signals
 
+    # Double-eq chain: .select("*").eq(...).eq(...).execute()
     sb.table.return_value.select.return_value.eq.return_value.eq.return_value.execute.return_value = result
+    # Single-eq fallback: .select("*").eq(...).execute()
     sb.table.return_value.select.return_value.eq.return_value.execute.return_value = result
 
     update_result = MagicMock()
@@ -61,17 +67,22 @@ def _mock_sb_with_signals(signals, current_prices=None):
 class TestOutcomeDetection:
 
     def _run_pass(self, signals, prices: dict):
-        """Run tracker pass with given signals and mocked current prices."""
-        from engine.tracker import run_tracking_pass
+        """
+        Run a tracking pass with given signals and mocked current prices.
+
+        Patches:
+          engine.tracker._supabase  — returns mock Supabase client
+          engine.tracker._current_price — returns price from dict
+        """
+        from engine.tracker import track_signals
         mock_sb = _mock_sb_with_signals(signals)
 
-        def mock_price(ticker, _sb=None):
+        def mock_price(ticker):
             return prices.get(ticker, 180.0)
 
-        with patch("engine.tracker._make_supabase", return_value=mock_sb), \
-             patch("engine.tracker._get_current_price", side_effect=mock_price), \
-             patch("engine.push.send_signal_alert", return_value=None):
-            run_tracking_pass()
+        with patch("engine.tracker._supabase", return_value=mock_sb), \
+             patch("engine.tracker._current_price", side_effect=mock_price):
+            track_signals()
 
         return mock_sb
 
@@ -79,7 +90,6 @@ class TestOutcomeDetection:
         sig = _signal(direction="LONG", entry=180.0, sl=177.0, t1=183.0)
         mock_sb = self._run_pass([sig], prices={"AAPL": 176.0})  # below SL
 
-        # Verify update was called with result=loss
         update_calls = mock_sb.table.return_value.update.call_args_list
         assert len(update_calls) > 0
         update_data = update_calls[0][0][0]
@@ -109,7 +119,7 @@ class TestOutcomeDetection:
         mock_sb = self._run_pass([sig], prices={"AAPL": 181.0})  # between SL and T1
 
         update_calls = mock_sb.table.return_value.update.call_args_list
-        # No status change should be made for a pending signal still in range
+        # No status change for a pending signal still in range
         if update_calls:
             update_data = update_calls[0][0][0]
             assert update_data.get("result") != "loss"
@@ -121,11 +131,8 @@ class TestOutcomeDetection:
             strategy="scalping",
             created_hours_ago=4,   # scalping signals expire in ~1-2h
         )
-        # Price is still pending but time is up
         mock_sb = self._run_pass([sig], prices={"AAPL": 181.0})
-
-        # Either expired close OR no update (depending on expiry logic)
-        # Main thing: shouldn't crash
+        # Shouldn't crash — either closed as expired or handled gracefully
         assert mock_sb is not None
 
 
@@ -136,12 +143,11 @@ class TestOutcomeDetection:
 class TestPassStatistics:
 
     def test_pass_with_empty_signals_does_not_crash(self):
-        from engine.tracker import run_tracking_pass
+        from engine.tracker import track_signals
         mock_sb = _mock_sb_with_signals([])
-        with patch("engine.tracker._make_supabase", return_value=mock_sb), \
-             patch("engine.tracker._get_current_price", return_value=180.0), \
-             patch("engine.push.send_signal_alert", return_value=None):
-            run_tracking_pass()  # should not raise
+        with patch("engine.tracker._supabase", return_value=mock_sb), \
+             patch("engine.tracker._current_price", return_value=180.0):
+            track_signals()  # should not raise
 
     def test_pass_with_multiple_signals(self):
         """Run a pass with mixed signals — some hit, some pending."""
@@ -155,9 +161,8 @@ class TestPassStatistics:
             "NVDA": 458.0,  # SL hit → loss
             "SPY":  521.0,  # pending
         }
-        from engine.tracker import run_tracking_pass
+        from engine.tracker import track_signals
         mock_sb = _mock_sb_with_signals(sigs)
-        with patch("engine.tracker._make_supabase", return_value=mock_sb), \
-             patch("engine.tracker._get_current_price", side_effect=lambda t, **kw: prices.get(t, 180.0)), \
-             patch("engine.push.send_signal_alert", return_value=None):
-            run_tracking_pass()  # should not crash with mixed outcomes
+        with patch("engine.tracker._supabase", return_value=mock_sb), \
+             patch("engine.tracker._current_price", side_effect=lambda t: prices.get(t, 180.0)):
+            track_signals()  # should not crash with mixed outcomes

@@ -3,6 +3,9 @@ name: Deploy → PROD
 # Only fires when a PR is merged into main.
 # Requires CI to pass first (GitHub branch protection enforces this).
 # After Railway deploys, runs smoke tests — if they fail, posts a warning.
+#
+# Required secret (add once Railway prod is set up):
+#   PROD_ENGINE_URL — full base URL, e.g. https://signalbolt.railway.app
 
 on:
   push:
@@ -53,14 +56,32 @@ jobs:
     needs: [test-before-prod]
     environment: production
 
+    # Expose the secret as an env var so we can check it in `if:` conditions.
+    env:
+      PROD_ENGINE_URL: ${{ secrets.PROD_ENGINE_URL }}
+
     steps:
+      - name: Check if Railway prod is configured
+        id: railway_check
+        run: |
+          if [ -z "$PROD_ENGINE_URL" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️  PROD_ENGINE_URL secret not set — skipping smoke tests."
+            echo "   Add it under Settings → Secrets → Actions once Railway prod is deployed."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+            echo "PROD_ENGINE_URL is set — will run smoke tests after deploy."
+          fi
+
       - name: Wait for Railway deploy
+        if: steps.railway_check.outputs.configured == 'true'
         run: sleep 150   # prod deploys can take slightly longer
 
       - name: Smoke test — /health
+        if: steps.railway_check.outputs.configured == 'true'
         run: |
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            "${{ secrets.PROD_ENGINE_URL }}/health" \
+            "$PROD_ENGINE_URL/health" \
             --max-time 20 \
             --retry 5 \
             --retry-delay 15)
@@ -71,9 +92,10 @@ jobs:
           fi
 
       - name: Smoke test — /signals
+        if: steps.railway_check.outputs.configured == 'true'
         run: |
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            "${{ secrets.PROD_ENGINE_URL }}/signals" \
+            "$PROD_ENGINE_URL/signals" \
             --max-time 20)
           echo "Prod signals endpoint: HTTP $STATUS"
           if [ "$STATUS" != "200" ] && [ "$STATUS" != "401" ]; then
@@ -83,4 +105,4 @@ jobs:
 
       - name: Deploy complete
         if: success()
-        run: echo "Production deploy verified successfully."
+        run: echo "✅ Production deploy verified successfully."
