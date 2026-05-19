@@ -50,9 +50,11 @@ INTRADAY_STRATEGIES = {"scalping", "day_trade", "options_flow"}
 # Scalping max hold in minutes (regardless of market hours)
 SCALP_MAX_HOLD_MINS = 30
 
-# Market close trigger: close all intraday signals at this ET time
-MARKET_CLOSE_HOUR   = 15   # 3 PM
-MARKET_CLOSE_MINUTE = 50   # 3:50 PM → 10 min buffer before 4 PM
+# Market close stages for intraday signals
+# EOD_WARN  → push "N min to close, consider booking profit" (no auto-close)
+# FORCE_CLOSE → auto-close all intraday positions with accurate P&L
+EOD_WARN_HOUR,   EOD_WARN_MINUTE   = 15, 0    # 3:00 PM ET — early profit warning
+MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE = 15, 30  # 3:30 PM ET — force-close all intraday
 
 
 # ---------------------------------------------------------------------------
@@ -79,16 +81,23 @@ def _is_market_hours() -> bool:
 
 
 def _is_near_market_close() -> bool:
-    """True from 3:50 PM ET onwards on a trading day."""
+    """True from 3:30 PM ET — force-close window for all intraday positions."""
     now = _now_et()
     if now.weekday() >= 5:
         return False
-    trigger = now.replace(
-        hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MINUTE,
-        second=0, microsecond=0,
-    )
-    close = now.replace(hour=16, minute=0, second=0, microsecond=0)
-    return trigger <= now <= close
+    trigger = now.replace(hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MINUTE, second=0, microsecond=0)
+    hard_close = now.replace(hour=16, minute=5, second=0, microsecond=0)
+    return trigger <= now <= hard_close
+
+
+def _is_eod_warning() -> bool:
+    """True from 3:00 PM until force-close kicks in at 3:30 PM."""
+    now = _now_et()
+    if now.weekday() >= 5:
+        return False
+    warn_start  = now.replace(hour=EOD_WARN_HOUR,    minute=EOD_WARN_MINUTE,    second=0, microsecond=0)
+    force_start = now.replace(hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MINUTE, second=0, microsecond=0)
+    return warn_start <= now < force_start
 
 
 def _current_price(ticker: str) -> Optional[float]:
@@ -99,16 +108,45 @@ def _current_price(ticker: str) -> Optional[float]:
         return None
 
 
-def _close_signal(sb: Client, sig_id: str, reason: str, close_type: str = "stock") -> None:
-    """Write closed status to Supabase for a stock or option signal."""
+def _close_signal(
+    sb: Client,
+    sig_id: str,
+    reason: str,
+    close_type: str = "stock",
+    current_price: float | None = None,
+    entry_price: float | None = None,
+    direction: str = "LONG",
+) -> None:
+    """
+    Write closed status to Supabase.
+    When current_price + entry_price are provided (e.g. market_close, time_limit)
+    the actual P&L is recorded so history shows win/loss — not just 'expired'.
+    """
     table = "option_signals" if close_type == "option" else "signals"
+
+    result    = "expired"
+    pnl_pct   = None
+    pnl_abs   = None
+
+    if current_price and entry_price and entry_price > 0:
+        is_long = direction == "LONG"
+        raw_pct = ((current_price - entry_price) / entry_price * 100)
+        pnl_pct = raw_pct if is_long else -raw_pct
+        pnl_abs = (current_price - entry_price) if is_long else (entry_price - current_price)
+        result  = "win" if pnl_pct > 0 else "loss"
+
+    payload: dict = {
+        "status":        "closed",
+        "closed_reason": reason,
+        "result":        result,
+        "closed_at":     datetime.now(timezone.utc).isoformat(),
+    }
+    if pnl_pct is not None:
+        payload["result_pct"] = round(pnl_pct, 4)
+        payload["result_pnl"] = round(pnl_abs, 4)
+
     try:
-        sb.table(table).update({
-            "status":        "closed",
-            "closed_reason": reason,
-            "result":        "expired",
-            "closed_at":     datetime.now(timezone.utc).isoformat(),
-        }).eq("id", sig_id).execute()
+        sb.table(table).update(payload).eq("id", sig_id).execute()
     except Exception as e:
         logger.error(f"[monitor] Close failed for {sig_id}: {e}")
 
@@ -175,12 +213,29 @@ def _detect_structure_reversal(ticker: str, direction: str) -> bool:
 # Push helpers
 # ---------------------------------------------------------------------------
 
-def _push_market_close(ticker: str, direction: str, strategy: str) -> None:
-    emoji = "📈" if direction == "LONG" else "📉"
+def _push_market_close(ticker: str, direction: str, strategy: str, pnl_pct: float | None = None) -> None:
+    if pnl_pct is not None and pnl_pct > 0:
+        title = f"✅ {ticker} closed +{pnl_pct:.1f}% — Market Close"
+        body  = f"Booked profit on {direction} {strategy.replace('_',' ')} before 4 PM ET"
+    elif pnl_pct is not None and pnl_pct <= 0:
+        title = f"⏰ {ticker} closed {pnl_pct:.1f}% — Market Close"
+        body  = f"Position exited to avoid overnight risk. {direction} {strategy.replace('_',' ')}"
+    else:
+        title = f"⏰ Market Closing — {ticker}"
+        body  = f"Close your {direction} {strategy.replace('_',' ')} position before 4 PM ET"
     push._send_raw(
-        title=f"⏰ Market Closing — {ticker}",
-        body=f"Close your {direction} {strategy.replace('_',' ')} position before 4 PM ET",
+        title=title, body=body,
         data={"type": "market_close", "ticker": ticker},
+    )
+
+
+def _push_eod_warning(ticker: str, direction: str, pnl_pct: float) -> None:
+    """Push a 'closing soon' alert when a signal is in profit at 3 PM ET."""
+    mins_left = 60  # approx minutes to 4 PM when warning fires at 3 PM
+    push._send_raw(
+        title=f"📊 {ticker} +{pnl_pct:.1f}% — {mins_left} min to close",
+        body=f"Your {direction} signal is in profit. Consider booking before market close.",
+        data={"type": "eod_warning", "ticker": ticker},
     )
 
 
@@ -246,36 +301,76 @@ def _monitor_stocks(sb: Client) -> None:
 
     logger.info(f"[monitor] Checking {len(rows)} active stock signal(s)")
     near_close  = _is_near_market_close()
+    eod_warning = _is_eod_warning()
     market_open = _is_market_hours()
     now_utc     = datetime.now(timezone.utc)
 
     for sig in rows:
-        ticker   = sig["ticker"]
-        strategy = sig.get("strategy_type") or "day_trade"
+        ticker    = sig["ticker"]
+        strategy  = sig.get("strategy_type") or "day_trade"
         direction = sig["direction"]
-        created  = datetime.fromisoformat(sig["created_at"].replace("Z", "+00:00"))
-        age_mins = (now_utc - created).total_seconds() / 60
+        created   = datetime.fromisoformat(sig["created_at"].replace("Z", "+00:00"))
+        age_mins  = (now_utc - created).total_seconds() / 60
 
         # ── 1. Scalp time limit (30 min, any time) ───────────────────────────
         if strategy == "scalping" and age_mins >= SCALP_MAX_HOLD_MINS:
+            price = _current_price(ticker)
             logger.info(f"[monitor] {ticker} scalp time limit ({age_mins:.0f} min) — closing")
-            _close_signal(sb, sig["id"], "time_limit")
+            _close_signal(sb, sig["id"], "time_limit",
+                          current_price=price,
+                          entry_price=float(sig.get("entry_price") or 0),
+                          direction=direction)
             _log_event(sb, sig["id"], "time_limit",
-                       note=f"30-min scalp window closed — position exited")
+                       price=price,
+                       note=f"30-min scalp window expired — position exited at ${price:.2f}" if price else
+                            "30-min scalp window closed — position exited")
             try:
                 _push_scalp_expired(ticker, direction)
             except Exception:
                 pass
             continue
 
-        # ── 2. Market-close enforcer (intraday strategies only) ───────────────
-        if near_close and strategy in INTRADAY_STRATEGIES:
-            logger.info(f"[monitor] {ticker} [{strategy}] market closing — force close")
-            _close_signal(sb, sig["id"], "market_close")
-            _log_event(sb, sig["id"], "market_close",
-                       note=f"Market closing — {direction} position closed at 3:50 PM ET")
+        # ── 2a. EOD early warning (3:00–3:30 PM) — alert if in profit ────────
+        if eod_warning and strategy in INTRADAY_STRATEGIES:
             try:
-                _push_market_close(ticker, direction, strategy)
+                price = _current_price(ticker)
+                entry = float(sig.get("entry_price") or 0)
+                if price and entry:
+                    is_long = direction == "LONG"
+                    pnl_pct = ((price - entry) / entry * 100) if is_long else ((entry - price) / entry * 100)
+                    if pnl_pct > 0.5:   # only warn if meaningfully in profit (>0.5%)
+                        logger.info(f"[monitor] {ticker} EOD warning — in profit {pnl_pct:.1f}%")
+                        _push_eod_warning(ticker, direction, pnl_pct)
+            except Exception:
+                pass
+            # Do NOT continue — still run normal checks below
+
+        # ── 2b. Market-close force-close (3:30 PM+) — exit all intraday ──────
+        if near_close and strategy in INTRADAY_STRATEGIES:
+            price = _current_price(ticker)
+            entry = float(sig.get("entry_price") or 0)
+            is_long = direction == "LONG"
+            pnl_pct = None
+            if price and entry:
+                raw = ((price - entry) / entry * 100)
+                pnl_pct = raw if is_long else -raw
+
+            logger.info(
+                f"[monitor] {ticker} [{strategy}] force-close at market end "
+                f"price={price} pnl={pnl_pct:.1f}%" if pnl_pct is not None else
+                f"[monitor] {ticker} [{strategy}] force-close at market end"
+            )
+            _close_signal(sb, sig["id"], "market_close",
+                          current_price=price,
+                          entry_price=entry,
+                          direction=direction)
+            pnl_str = f"+{pnl_pct:.1f}%" if pnl_pct and pnl_pct > 0 else f"{pnl_pct:.1f}%" if pnl_pct else ""
+            _log_event(sb, sig["id"], "market_close",
+                       price=price,
+                       note=f"Market closing — {direction} exited at ${price:.2f} {pnl_str}".strip()
+                            if price else f"Market closing — {direction} position force-closed")
+            try:
+                _push_market_close(ticker, direction, strategy, pnl_pct)
             except Exception:
                 pass
             continue

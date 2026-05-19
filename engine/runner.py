@@ -1115,6 +1115,31 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled maintenance every 15 min")
 
+    # ── EOD signal monitor: every 5 min from 2:55 PM to 4:05 PM ET ──────
+    # Runs signal_monitor only — no strategy scans. Fires frequently enough
+    # to catch the 3:00 PM warning window and the 3:30 PM force-close window
+    # without the coarse 15-min gap of the main maintenance cycle.
+    def _eod_monitor_job():
+        from zoneinfo import ZoneInfo as _ZI
+        from datetime import datetime as _dt
+        _now = _dt.now(_ZI("America/New_York"))
+        _mins = _now.hour * 60 + _now.minute
+        # Only run during 2:55 PM (875) to 4:05 PM (965) ET window
+        if 875 <= _mins <= 965 and _now.weekday() < 5:
+            try:
+                signal_monitor.run()
+            except Exception as _e:
+                logger.error(f"[runner] EOD monitor failed: {_e}")
+
+    scheduler.add_job(
+        _eod_monitor_job,
+        trigger=IntervalTrigger(minutes=5),
+        id="eod_monitor",
+        name="EOD signal monitor (5-min near close)",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled EOD signal monitor every 5 min (active 2:55–4:05 PM ET)")
+
     # ── Weekly self-learning optimization (Sunday 2 AM UTC) ──────────────
     from apscheduler.triggers.cron import CronTrigger
     scheduler.add_job(
