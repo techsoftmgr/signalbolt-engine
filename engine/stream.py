@@ -591,6 +591,23 @@ async def run_stream() -> None:
         f"strategies: scalping(5m) day_trade/options_flow/dark_pool(15m) swing_trade(1h)"
     )
 
+    # ── Startup grace period (Railway rolling deploys) ────────────
+    # Railway starts the new container before the old one stops.
+    # Alpaca allows only 1 concurrent WebSocket per account, so both
+    # containers briefly fight for the same connection → "connection limit
+    # exceeded" spam.  Waiting here gives the old container time to die
+    # and release its connection before we try to connect.
+    # Only applied on Railway (detected via RAILWAY_PROJECT_ID env var).
+    # Set STREAM_STARTUP_DELAY_S=0 to disable if running multiple workers.
+    _on_railway = bool(os.environ.get("RAILWAY_PROJECT_ID") or os.environ.get("RAILWAY_ENVIRONMENT"))
+    _startup_delay = int(os.environ.get("STREAM_STARTUP_DELAY_S", "35" if _on_railway else "0"))
+    if _startup_delay > 0:
+        logger.info(
+            f"[stream] Startup grace period — waiting {_startup_delay}s for "
+            f"previous deployment to release Alpaca connection..."
+        )
+        await asyncio.sleep(_startup_delay)
+
     # Pre-warm RT signal cache so first trades don't miss any active signals
     try:
         _refresh_rt_cache()
@@ -704,9 +721,23 @@ async def run_stream() -> None:
 
         except Exception as e:
             sentry_sdk.capture_exception(e)
-            logger.error(
-                f"[stream] Connection error: {e} — "
-                f"reconnecting in {reconnect_delay}s"
-            )
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, 120)
+            err_str = str(e).lower()
+            # Alpaca free tier: only 1 concurrent WebSocket allowed.
+            # During Railway rolling deploys the old container may still hold
+            # the connection when the new one tries to connect.  Back off for
+            # 60 s minimum so the old container has time to die cleanly.
+            if "connection limit" in err_str or "429" in err_str:
+                wait = max(reconnect_delay, 60)
+                logger.warning(
+                    f"[stream] Alpaca connection limit hit — "
+                    f"backing off {wait}s before retry"
+                )
+                await asyncio.sleep(wait)
+                reconnect_delay = min(wait * 2, 120)
+            else:
+                logger.error(
+                    f"[stream] Connection error: {e} — "
+                    f"reconnecting in {reconnect_delay}s"
+                )
+                await asyncio.sleep(reconnect_delay)
+                reconnect_delay = min(reconnect_delay * 2, 120)
