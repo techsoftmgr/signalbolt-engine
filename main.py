@@ -74,6 +74,20 @@ try:
 except Exception as _e:
     logger.debug(f"[main] Alpaca data client init failed: {_e}")
 
+# ── /indices response cache ───────────────────────────────────
+# App polls every 5 s. Without a cache each poll = Alpaca + yfinance calls.
+# Cache stores the last computed result and its timestamp; result is reused
+# if it is less than 5 seconds old. Alpaca/yfinance are only hit once per
+# 5-second window regardless of how many users are connected.
+_indices_cache: dict = {}
+_indices_cache_ts: float = 0.0
+_INDICES_CACHE_TTL: float = 5.0   # seconds
+
+# Per-ticker price cache so the app can poll every 5 s without hammering Alpaca.
+# Keys are individual ticker symbols; each entry is (timestamp, price_dict).
+_prices_cache: dict[str, tuple[float, dict]] = {}
+_PRICES_CACHE_TTL: float = 5.0   # seconds
+
 
 def _market_session() -> str:
     """Return 'pre', 'market', 'post', or 'closed' based on US Eastern time."""
@@ -427,24 +441,45 @@ def get_prices(tickers: str):
         extendedPrice:          float?,  pre/post market price
         extendedChangePercent:  float?,  pre/post market change %
       }
+
+    Results are cached per ticker for 5 s so that multiple signal cards
+    polling simultaneously don't hammer Alpaca on every request.
     """
     symbols = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    now     = time.monotonic()
 
-    # ── 1. Alpaca SIP (real-time, consistent with signal engine) ──
-    result = _alpaca_stock_snapshots(symbols)
+    # ── Serve cached entries; collect symbols that need a fresh fetch ──
+    result:  dict = {}
+    to_fetch: list[str] = []
+    for sym in symbols:
+        cached = _prices_cache.get(sym)
+        if cached and (now - cached[0]) < _PRICES_CACHE_TTL:
+            result[sym] = cached[1]
+        else:
+            to_fetch.append(sym)
 
-    # ── 2. Polygon fallback for any symbols Alpaca missed ─────────
-    missing = [s for s in symbols if s not in result]
-    if missing:
-        poly = _polygon_stock_snapshots(missing)
-        result.update(poly)
+    if to_fetch:
+        # ── 1. Alpaca SIP (real-time, consistent with signal engine) ──
+        fresh = _alpaca_stock_snapshots(to_fetch)
 
-    # ── 3. yfinance last resort, one by one ───────────────────────
-    still_missing = [s for s in symbols if s not in result]
-    for sym in still_missing:
-        data = _yf_price(sym)
-        if data:
-            result[sym] = data
+        # ── 2. Polygon fallback for any symbols Alpaca missed ─────────
+        missing = [s for s in to_fetch if s not in fresh]
+        if missing:
+            poly = _polygon_stock_snapshots(missing)
+            fresh.update(poly)
+
+        # ── 3. yfinance last resort, one by one ───────────────────────
+        still_missing = [s for s in to_fetch if s not in fresh]
+        for sym in still_missing:
+            data = _yf_price(sym)
+            if data:
+                fresh[sym] = data
+
+        # ── Store in cache and merge into result ──────────────────────
+        ts = time.monotonic()
+        for sym, data in fresh.items():
+            _prices_cache[sym] = (ts, data)
+        result.update(fresh)
 
     return result
 
@@ -456,11 +491,21 @@ def get_indices():
     SPY/QQQ: Alpaca SIP primary → Polygon → yfinance.
     BTC: Polygon crypto primary → yfinance.
     VIX: yfinance only (Alpaca doesn't carry ^VIX).
+
+    Result is cached for 5 seconds so the app can poll every 5 s without
+    hammering Alpaca/yfinance on every request from every connected user.
     """
+    global _indices_cache, _indices_cache_ts
+    import time as _time
+
+    # Serve from cache if fresh
+    if _indices_cache and (_time.monotonic() - _indices_cache_ts) < _INDICES_CACHE_TTL:
+        return _indices_cache
+
     result: dict = {}
 
     # ── SPY, QQQ via Alpaca SIP (real-time, same feed as signals) ──
-    alp = _alpaca_stock_snapshots(["SPY", "QQQ"])
+    alp  = _alpaca_stock_snapshots(["SPY", "QQQ"])
     poly = _polygon_stock_snapshots(["SPY", "QQQ"]) if not alp else {}
     for sym in ("SPY", "QQQ"):
         result[sym] = alp.get(sym) or poly.get(sym) or _yf_price(sym) or {"price": 0, "changePercent": 0}
@@ -498,6 +543,10 @@ def get_indices():
     else:
         vix_sentiment = "BEARISH"
     result["VIX_SENTIMENT"] = {"label": vix_sentiment}
+
+    # Store in cache
+    _indices_cache    = result
+    _indices_cache_ts = _time.monotonic()
 
     return result
 
