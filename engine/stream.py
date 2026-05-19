@@ -428,11 +428,20 @@ async def run_stream() -> None:
                     )
                     _scan_executor.submit(_run_strategy_at_boundary, "swing_trade")
 
+            # ── Trade handler: feeds real-time prices to app WebSocket clients ──
+            async def on_trade(trade) -> None:
+                try:
+                    from engine.price_store import update as price_update
+                    price_update(trade.symbol, float(trade.price))
+                except Exception:
+                    pass   # never let price broadcast errors kill the stream
+
             wss.subscribe_bars(on_bar, *all_subscribe)
+            wss.subscribe_trades(on_trade, *all_subscribe)
 
             logger.info(
                 f"[stream] ✅ Connected to Alpaca {feed.value.upper()} — "
-                f"waiting for bar events ({len(all_subscribe)} tickers)"
+                f"bars + trades subscribed ({len(all_subscribe)} tickers)"
             )
             reconnect_delay = 5   # reset on successful connect
 

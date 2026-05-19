@@ -20,7 +20,7 @@ from typing import List, Optional
 import sentry_sdk
 import stripe
 from dotenv import load_dotenv
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
@@ -324,16 +324,38 @@ async def lifespan(app: FastAPI):
     import asyncio
     from engine.runner import start_scheduler
     from engine.stream import run_stream
+    from engine import price_store
+
+    # ── Initialise real-time price store with this event loop ────────────────
+    price_store.init(asyncio.get_event_loop())
+
+    # ── Seed price store from Alpaca REST snapshot so first WS connect gets
+    #    immediate data even before the first trade arrives ───────────────────
+    try:
+        from engine.runner import ALL_TICKERS
+        seed_tickers = list(dict.fromkeys(ALL_TICKERS))[:40]
+        snaps = _alpaca_stock_snapshots(seed_tickers)
+        for ticker, data in snaps.items():
+            price_store.seed(ticker, data["price"], data["changePercent"], data.get("session", "market"))
+            # Derive prev_close so trade-based Δ% is accurate:
+            #   prev_close = price / (1 + changePercent/100)
+            chg = data["changePercent"]
+            prev = data["price"] / (1 + chg / 100) if chg != -100 else data["price"]
+            price_store.set_prev_close(ticker, prev)
+        logger.info(f"[lifespan] Price store seeded with {len(snaps)} tickers")
+    except Exception as e:
+        logger.warning(f"[lifespan] Price store seed failed (non-fatal): {e}")
 
     # ── APScheduler: day_trade / swing / options_flow / dark_pool / maintenance ──
     scheduler = start_scheduler()
 
-    # ── WebSocket stream: scalping fires within 2-5 sec of each 5-min bar close ──
-    stream_task = asyncio.create_task(run_stream(), name="alpaca_bar_stream")
+    # ── Alpaca WebSocket: bars (signal scanning) + trades (price broadcast) ──
+    stream_task = asyncio.create_task(run_stream(), name="alpaca_stream")
 
     logger.info(
         "SignalBolt engine started — "
-        "scalping=WebSocket real-time | day_trade/swing=APScheduler polling"
+        "scalping=WebSocket real-time | day_trade/swing=APScheduler | "
+        "prices=WebSocket push to app"
     )
     yield
 
@@ -482,6 +504,57 @@ def get_prices(tickers: str):
         result.update(fresh)
 
     return result
+
+
+@app.websocket("/ws/prices")
+async def ws_prices(websocket: WebSocket):
+    """
+    Real-time price stream via WebSocket.
+
+    Protocol:
+      1. Client connects → sends {"subscribe": ["SPY", "AAPL", ...]}
+      2. Server replies immediately with current snapshot for those tickers
+      3. Server pushes {"TICKER": {price, changePercent, session}} on every
+         trade from Alpaca (throttled to max 2/sec per ticker)
+      4. Server sends {"ping": true} every 25 s to keep the connection alive
+
+    The app replaces polling with this endpoint for real-time price display.
+    """
+    import asyncio as _asyncio
+    from engine import price_store
+
+    await websocket.accept()
+    queue: _asyncio.Queue = _asyncio.Queue(maxsize=200)
+    tickers: set[str] = set()
+
+    try:
+        # ── Step 1: receive subscription list ─────────────────────────────
+        raw = await _asyncio.wait_for(websocket.receive_text(), timeout=10)
+        msg = json.loads(raw)
+        tickers = {t.strip().upper() for t in msg.get("subscribe", []) if t.strip()}
+
+        price_store.add_client(queue, tickers)
+
+        # ── Step 2: send current snapshot immediately ──────────────────────
+        snap = price_store.snapshot(list(tickers))
+        if snap:
+            await websocket.send_text(json.dumps(snap))
+
+        # ── Step 3: stream live updates ───────────────────────────────────
+        while True:
+            try:
+                update = await _asyncio.wait_for(queue.get(), timeout=25)
+                await websocket.send_text(update)
+            except _asyncio.TimeoutError:
+                # Keepalive ping so the connection stays open
+                await websocket.send_text(json.dumps({"ping": True}))
+
+    except (WebSocketDisconnect, _asyncio.CancelledError):
+        pass
+    except Exception as e:
+        logger.debug(f"[ws/prices] client error: {e}")
+    finally:
+        price_store.remove_client(queue)
 
 
 @app.get("/indices")
