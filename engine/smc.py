@@ -40,40 +40,43 @@ _ALPACA_TIMEFRAMES = {
 }
 
 # Strategy-specific level sizing parameters
+# NOTE: tp1_pct/tp2_pct/sl_fallback are percentage FALLBACKS used only when no
+# SMC structure (OB/sweep/swing) is found.  The sl_tp_engine overrides these
+# with ATR-based levels for all passing signals, so keep these conservative.
 STRATEGY_PARAMS: dict[str, dict] = {
     'scalping': {
-        'tp1_pct':     0.006,   # +0.6%
-        'tp2_pct':     0.010,   # +1.0%
-        'sl_fallback': 0.004,   # 0.4% fallback SL when no OB or sweep
-        'atr_mult':    1.0,     # ATR × 1.0 below key level
-        'sweep_bars':  5,       # look back 5 candles for liquidity sweep
+        'tp1_pct':     0.004,   # +0.4% (tight scalp)
+        'tp2_pct':     0.007,   # +0.7%
+        'sl_fallback': 0.003,   # 0.3% fallback SL
+        'atr_mult':    0.8,     # ATR × 0.8 below key level (intraday H-L ATR)
+        'sweep_bars':  5,
     },
     'day_trade': {
-        'tp1_pct':     0.015,
-        'tp2_pct':     0.030,
-        'sl_fallback': 0.010,
-        'atr_mult':    1.5,
+        'tp1_pct':     0.008,   # +0.8%  ↓ from 1.5% — achievable same day
+        'tp2_pct':     0.015,   # +1.5%  ↓ from 3.0%
+        'sl_fallback': 0.005,   # 0.5%   ↓ from 1.0%
+        'atr_mult':    1.0,     # ATR × 1.0 (intraday H-L ATR — no overnight gap)
         'sweep_bars':  5,
     },
     'swing_trade': {
-        'tp1_pct':     0.050,
-        'tp2_pct':     0.080,
-        'sl_fallback': 0.025,
-        'atr_mult':    2.0,
+        'tp1_pct':     0.040,   # +4.0%
+        'tp2_pct':     0.070,   # +7.0%
+        'sl_fallback': 0.020,   # 2.0%
+        'atr_mult':    2.0,     # True Range ATR for swing
         'sweep_bars':  7,
     },
     'options_flow': {
-        'tp1_pct':     0.015,
-        'tp2_pct':     0.030,
-        'sl_fallback': 0.010,
-        'atr_mult':    1.5,
+        'tp1_pct':     0.008,
+        'tp2_pct':     0.015,
+        'sl_fallback': 0.005,
+        'atr_mult':    1.0,
         'sweep_bars':  5,
     },
     'dark_pool': {
-        'tp1_pct':     0.015,
-        'tp2_pct':     0.030,
-        'sl_fallback': 0.010,
-        'atr_mult':    1.5,
+        'tp1_pct':     0.008,
+        'tp2_pct':     0.015,
+        'sl_fallback': 0.005,
+        'atr_mult':    1.0,
         'sweep_bars':  5,
     },
 }
