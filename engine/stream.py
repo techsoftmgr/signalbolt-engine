@@ -85,6 +85,58 @@ _RT_CACHE_TTL:      float = 60.0  # full refresh every 60 s
 _RT_THROTTLE_S:     float = 1.0   # max one level-check per second per ticker
 _rt_last_check: dict[str, float] = {}   # ticker → last monotonic check time
 
+# ── Dynamic ticker subscription ────────────────────────────────────────────
+# App WS clients may subscribe to tickers beyond ALL_TICKERS (custom watchlists).
+# These are dynamically added to the live Alpaca trade stream so every ticker
+# gets tick-by-tick updates — no REST polling fallback required.
+#
+# Threading model:
+#   _wss_ref / _on_trade_ref are written from run_stream() (background task)
+#   and read from subscribe_extra_tickers() (FastAPI async context).
+#   Simple reference assignments are GIL-atomic in CPython — safe to read/write
+#   without a lock as long as we check `is None` before use.
+_subscribed_tickers: set[str] = set()   # all tickers currently live on Alpaca
+_pending_tickers:    set[str] = set()   # requested before stream connected
+_wss_ref                      = None    # StockDataStream (set while stream is live)
+_on_trade_ref                 = None    # stored handler for re-subscriptions
+
+
+async def subscribe_extra_tickers(tickers: list[str]) -> None:
+    """
+    Dynamically subscribe additional tickers to the live Alpaca trade stream.
+
+    Called from /ws/prices when a client subscribes to tickers not in ALL_TICKERS
+    (e.g. custom watchlist symbols). Once subscribed, Alpaca starts pushing trade
+    ticks for those symbols → price_store.update() → broadcast to WS clients.
+
+    Safe to call at any time — if the stream is not yet connected, the tickers are
+    queued and applied as soon as the stream comes up (or on the next reconnect).
+    """
+    global _subscribed_tickers, _pending_tickers, _wss_ref, _on_trade_ref
+
+    new = [t for t in tickers if t not in _subscribed_tickers]
+    if not new:
+        return
+
+    _subscribed_tickers.update(new)
+
+    if _wss_ref is None or _on_trade_ref is None:
+        _pending_tickers.update(new)
+        logger.debug(f"[stream] Queued dynamic tickers (stream not ready yet): {new}")
+        return
+
+    # subscribe_trades() calls asyncio.run_coroutine_threadsafe().result()
+    # internally — blocks the calling thread, not the FastAPI event loop.
+    # Run it in an executor so we don't block the async event loop.
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, _wss_ref.subscribe_trades, _on_trade_ref, *new)
+        logger.info(f"[stream] ✅ Dynamic trade subscription added: {new}")
+    except Exception as e:
+        # Stream may be mid-reconnect — pending set ensures retry on next connect
+        _pending_tickers.update(new)
+        logger.warning(f"[stream] Dynamic subscription deferred (will retry on reconnect): {e}")
+
 
 # ── Context cache ─────────────────────────────────────────────
 # Regime/session detection hits yfinance + Alpaca REST — expensive.
@@ -578,12 +630,15 @@ async def run_stream() -> None:
     feed_env  = os.environ.get("ALPACA_DATA_FEED", "sip").lower()
     feed      = DataFeed.SIP if feed_env == "sip" else DataFeed.IEX
 
+    global _subscribed_tickers, _pending_tickers, _wss_ref, _on_trade_ref
+
     from engine.runner import ALL_TICKERS, SCALP_TICKERS
     scalp_set = set(SCALP_TICKERS)
 
     # Subscribe to all watched tickers — 1-min bars serve as clock ticks
     # for 5m (scalp), 15m (day_trade/flow), and 1h (swing) boundary detection.
     all_subscribe = list(dict.fromkeys(ALL_TICKERS))   # preserve order, deduplicate
+    _subscribed_tickers = set(all_subscribe)           # track base set for dynamic subs
 
     logger.info(
         f"[stream] Starting event-driven stream — feed={feed.value.upper()} | "
@@ -702,24 +757,57 @@ async def run_stream() -> None:
             wss.subscribe_bars(on_bar, *all_subscribe)
             wss.subscribe_trades(on_trade, *all_subscribe)
 
+            # ── Register live references for dynamic ticker subscriptions ──
+            _wss_ref      = wss
+            _on_trade_ref = on_trade
+
+            # Apply any tickers that were requested by WS clients before
+            # this connection was established (or queued during a reconnect).
+            loop = asyncio.get_running_loop()
+            if _pending_tickers:
+                extra = list(_pending_tickers - set(all_subscribe))
+                if extra:
+                    try:
+                        await loop.run_in_executor(
+                            None, wss.subscribe_trades, on_trade, *extra
+                        )
+                        logger.info(
+                            f"[stream] ✅ Applied {len(extra)} pending dynamic ticker(s): {extra}"
+                        )
+                    except Exception as _pe:
+                        logger.warning(f"[stream] Pending ticker subscribe failed: {_pe}")
+                _pending_tickers.clear()
+
             logger.info(
                 f"[stream] ✅ Connected to Alpaca {feed.value.upper()} — "
-                f"bars + trades subscribed ({len(all_subscribe)} tickers)"
+                f"bars + trades subscribed ({len(all_subscribe)} tickers + "
+                f"{len(_subscribed_tickers) - len(all_subscribe)} dynamic)"
             )
             reconnect_delay = 5   # reset on successful connect
 
-            loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, wss.run)
+
+            # Stream ended — clear live references before reconnecting.
+            # Re-queue any dynamic tickers so they're reapplied on next connect.
+            _wss_ref      = None
+            _on_trade_ref = None
+            dynamic = _subscribed_tickers - set(all_subscribe)
+            if dynamic:
+                _pending_tickers.update(dynamic)
 
             logger.warning("[stream] Stream ended cleanly — reconnecting in 5s")
             await asyncio.sleep(5)
 
         except asyncio.CancelledError:
+            _wss_ref      = None
+            _on_trade_ref = None
             logger.info("[stream] Stream task cancelled — shutting down")
             _scan_executor.shutdown(wait=False)
             return
 
         except Exception as e:
+            _wss_ref      = None
+            _on_trade_ref = None
             sentry_sdk.capture_exception(e)
             err_str = str(e).lower()
             # Alpaca free tier: only 1 concurrent WebSocket allowed.
