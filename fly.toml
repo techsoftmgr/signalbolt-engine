@@ -9,6 +9,7 @@ primary_region = "iad"
 
 [env]
   PORT             = "8000"
+
   ALPACA_DATA_FEED = "sip"
 
 [http_service]
