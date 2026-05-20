@@ -591,16 +591,16 @@ async def run_stream() -> None:
         f"strategies: scalping(5m) day_trade/options_flow/dark_pool(15m) swing_trade(1h)"
     )
 
-    # ── Startup grace period (Railway rolling deploys) ────────────
-    # Railway starts the new container before the old one stops.
+    # ── Startup grace period (Railway / Fly.io rolling deploys) ──────────
+    # Both Railway and Fly.io start the new container before the old one stops.
     # Alpaca allows only 1 concurrent WebSocket per account, so both
     # containers briefly fight for the same connection → "connection limit
     # exceeded" spam.  Waiting here gives the old container time to die
     # and release its connection before we try to connect.
-    # Only applied on Railway (detected via RAILWAY_PROJECT_ID env var).
     # Set STREAM_STARTUP_DELAY_S=0 to disable if running multiple workers.
     _on_railway = bool(os.environ.get("RAILWAY_PROJECT_ID") or os.environ.get("RAILWAY_ENVIRONMENT"))
-    _startup_delay = int(os.environ.get("STREAM_STARTUP_DELAY_S", "35" if _on_railway else "0"))
+    _on_fly     = bool(os.environ.get("FLY_APP_NAME") or os.environ.get("FLY_MACHINE_ID"))
+    _startup_delay = int(os.environ.get("STREAM_STARTUP_DELAY_S", "35" if (_on_railway or _on_fly) else "0"))
     if _startup_delay > 0:
         logger.info(
             f"[stream] Startup grace period — waiting {_startup_delay}s for "
