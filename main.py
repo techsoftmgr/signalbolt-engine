@@ -543,6 +543,19 @@ async def ws_prices(websocket: WebSocket):
 
         price_store.add_client(queue, tickers)
 
+        # ── Dynamic Alpaca subscription for custom tickers ─────────────────
+        # Tickers not in ALL_TICKERS are not subscribed on the Alpaca stream at
+        # startup. Subscribe them now so the stream delivers tick-by-tick updates
+        # for custom watchlist symbols — no REST polling fallback needed.
+        try:
+            from engine.runner import ALL_TICKERS as _ALL_TICKERS
+            from engine.stream import subscribe_extra_tickers
+            extra = [t for t in tickers if t not in set(_ALL_TICKERS)]
+            if extra:
+                asyncio.create_task(subscribe_extra_tickers(extra))
+        except Exception as _dyn_e:
+            logger.debug(f"[ws/prices] dynamic subscribe setup error: {_dyn_e}")
+
         # ── Step 2: send current snapshot immediately ──────────────────────
         snap = price_store.snapshot(list(tickers))
 
