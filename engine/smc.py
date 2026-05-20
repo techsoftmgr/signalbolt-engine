@@ -540,25 +540,41 @@ def analyze(
         avg_volume = float(df["volume"].mean())
         last_volume = float(df["volume"].iloc[-1])
 
-        bullish_signals = sum([
-            structure["bos_bullish"],
-            structure["choch_bullish"],
-            fvgs["fvg_bullish"] is not None,
-            obs["ob_bullish"] is not None,
-        ])
-        bearish_signals = sum([
-            structure["bos_bearish"],
-            structure["choch_bearish"],
-            fvgs["fvg_bearish"] is not None,
-            obs["ob_bearish"] is not None,
-        ])
+        # ── Volume gate for intraday strategies ───────────────────────────────
+        # Use the 2nd-to-last bar (last COMPLETED bar) to avoid partial current bar.
+        # Skip if the last completed bar is below 40% of the recent average —
+        # dead-market conditions produce unreliable SMC signals.
+        if strategy_type in ("scalping", "day_trade") and len(df) >= 6:
+            recent_avg = float(df["volume"].iloc[-5:-1].mean())  # last 4 completed bars
+            last_completed = float(df["volume"].iloc[-2])        # penultimate bar
+            if recent_avg > 0 and last_completed < recent_avg * 0.40:
+                logger.debug(
+                    f"[smc] {ticker} [{strategy_type}] volume too low "
+                    f"({last_completed:.0f} < 40% of avg {recent_avg:.0f}) — skip"
+                )
+                return None
 
-        if bullish_signals == 0 and bearish_signals == 0:
+        # ── Direction: require a genuine structural breakout ─────────────────
+        # FVG and OB almost always exist on both sides of price — using them
+        # to break ties produces a permanent LONG bias in ranging markets.
+        # Only BOS or CHoCH (actual market structure shifts) determine direction.
+        has_bullish_struct = structure["bos_bullish"] or structure["choch_bullish"]
+        has_bearish_struct = structure["bos_bearish"] or structure["choch_bearish"]
+
+        if not has_bullish_struct and not has_bearish_struct:
+            # No structural breakout → ranging/choppy market, skip
             direction = None
-        elif bullish_signals >= bearish_signals:
+        elif has_bullish_struct and not has_bearish_struct:
             direction = "LONG"
-        else:
+        elif has_bearish_struct and not has_bullish_struct:
             direction = "SHORT"
+        elif structure["choch_bullish"] and not structure["choch_bearish"]:
+            direction = "LONG"   # CHoCH overrides conflicting BOS
+        elif structure["choch_bearish"] and not structure["choch_bullish"]:
+            direction = "SHORT"
+        else:
+            # Both bullish and bearish structural breaks — conflicting, skip
+            direction = None
 
         sweep: dict = {}
         entry, stop_loss, target_one, target_two = (None, None, None, None)

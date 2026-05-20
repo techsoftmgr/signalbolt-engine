@@ -40,9 +40,9 @@ _EARNINGS_CACHE_TTL = 86400  # 24 hours
 FIRE_THRESHOLD = 78  # legacy default — use STRATEGY_THRESHOLDS per strategy
 
 STRATEGY_THRESHOLDS: dict[str, int] = {
-    'scalping':     72,   # ↑ tighter — scalps need strong momentum alignment
-    'day_trade':    72,   # ↑ from 65 — raises bar so only high-quality signals fire
-    'swing_trade':  70,   # ↑ from 68 — stronger SMC structure required
+    'scalping':     75,   # ↑ from 72 — tight momentum needs stronger confirmation
+    'day_trade':    75,   # ↑ from 72 — fewer but higher-quality intraday signals
+    'swing_trade':  72,   # ↑ from 70 — requires clear multi-bar structure
     'options_flow': 75,
     'dark_pool':    72,
 }
@@ -59,7 +59,7 @@ STRATEGY_WEIGHTS: dict[str, dict[str, float]] = {
 # Raw max per layer (used to normalise to 0-1 before applying strategy weights)
 _L_MAX = {'smc': 25.0, 'technical': 25.0, 'sentiment': 20.0, 'risk': 15.0}
 
-_L1_MINIMUM = 10
+_L1_MINIMUM = 12   # requires BOS/CHoCH (7-10 pts) + at least one nearby FVG/OB
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +86,8 @@ def _l1_smc(
         if fvg:
             mid = (fvg["top"] + fvg["bottom"]) / 2
             dist = abs(price - mid) / price
-            score += 7 if dist < 0.005 else (5 if dist < 0.02 else 3)
+            # Only award points if price is near the FVG — distant FVGs are noise
+            score += 7 if dist < 0.005 else (5 if dist < 0.015 else (2 if dist < 0.025 else 0))
 
         ob = obs.get("ob_bullish")
         if ob:
@@ -94,7 +95,8 @@ def _l1_smc(
                 score += 8
             else:
                 dist = abs(price - (ob["top"] + ob["bottom"]) / 2) / price
-                score += 5 if dist < 0.01 else (3 if dist < 0.025 else 0)
+                # Only award points for nearby OBs — distant OBs are irrelevant
+                score += 5 if dist < 0.01 else (2 if dist < 0.02 else 0)
 
     else:
         if structure.get("choch_bearish"):
@@ -106,7 +108,7 @@ def _l1_smc(
         if fvg:
             mid = (fvg["top"] + fvg["bottom"]) / 2
             dist = abs(price - mid) / price
-            score += 7 if dist < 0.005 else (5 if dist < 0.02 else 3)
+            score += 7 if dist < 0.005 else (5 if dist < 0.015 else (2 if dist < 0.025 else 0))
 
         ob = obs.get("ob_bearish")
         if ob:
@@ -114,7 +116,7 @@ def _l1_smc(
                 score += 8
             else:
                 dist = abs(price - (ob["top"] + ob["bottom"]) / 2) / price
-                score += 5 if dist < 0.01 else (3 if dist < 0.025 else 0)
+                score += 5 if dist < 0.01 else (2 if dist < 0.02 else 0)
 
     # Liquidity sweep bonus — market maker raid confirmed before entry
     if sweep and sweep.get("swept"):
