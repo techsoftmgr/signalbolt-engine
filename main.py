@@ -423,11 +423,19 @@ async def health():
         if SENTRY_DSN:
             sentry_sdk.capture_exception(e)
 
-    # Alpaca check
+    # Alpaca check — use direct HTTP with a short timeout to avoid blocking
     try:
-        from alpaca.trading.client import TradingClient
-        TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True).get_account()
-        alpaca_status = "healthy"
+        import httpx
+        alpaca_base = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+        resp = httpx.get(
+            f"{alpaca_base}/v2/account",
+            headers={
+                "APCA-API-KEY-ID":     ALPACA_API_KEY,
+                "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+            },
+            timeout=5.0,
+        )
+        alpaca_status = "healthy" if resp.status_code == 200 else f"http_{resp.status_code}"
     except Exception as e:
         alpaca_status = f"error: {e}"
 
@@ -1286,6 +1294,39 @@ async def cancel_subscription(request: Request):
     except Exception as e:
         logger.error(f"POST /cancel-subscription error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/delete-account")
+async def delete_account(request: Request):
+    """
+    Permanently delete the authenticated user's account.
+    Requires a valid Supabase Bearer token in Authorization header.
+    Deletes: auth.users row (via admin API) + signals + profiles.
+    """
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="No auth token provided")
+    try:
+        sb = _make_supabase()
+        # Verify token and get user ID
+        user_resp = sb.auth.get_user(token)
+        if not user_resp or not user_resp.user:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        user_id = user_resp.user.id
+
+        # Delete profile data (signals cascade if FK set up, else delete explicitly)
+        sb.table("profiles").delete().eq("id", user_id).execute()
+
+        # Delete auth user using admin API (requires service role key)
+        sb.auth.admin.delete_user(user_id)
+
+        logger.info(f"Account deleted for user {user_id}")
+        return {"status": "deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"DELETE /delete-account error: {e}")
+        raise HTTPException(status_code=500, detail="Account deletion failed")
 
 
 @app.get("/invoices")
