@@ -537,6 +537,27 @@ async def ws_prices(websocket: WebSocket):
 
         # ── Step 2: send current snapshot immediately ──────────────────────
         snap = price_store.snapshot(list(tickers))
+
+        # Fall back to REST price chain for tickers not yet in the live store
+        # (price_store is empty outside market hours / before first trade arrives)
+        missing = [t for t in tickers if t not in snap]
+        if missing:
+            try:
+                rest_prices = await _asyncio.get_event_loop().run_in_executor(
+                    None, get_prices, ",".join(missing)
+                )
+                snap.update(rest_prices)
+                # Also seed the price store so future WS connects get it instantly
+                for sym, data in rest_prices.items():
+                    price_store.seed(
+                        sym,
+                        data["price"],
+                        data["changePercent"],
+                        data.get("session", "closed"),
+                    )
+            except Exception as _fe:
+                logger.debug(f"[ws/prices] REST fallback error: {_fe}")
+
         if snap:
             await websocket.send_text(json.dumps(snap))
 
