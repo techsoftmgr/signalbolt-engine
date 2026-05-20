@@ -657,7 +657,9 @@ async def run_stream() -> None:
     # Set STREAM_STARTUP_DELAY_S=0 to disable if running multiple workers.
     _on_railway = bool(os.environ.get("RAILWAY_PROJECT_ID") or os.environ.get("RAILWAY_ENVIRONMENT"))
     _on_fly     = bool(os.environ.get("FLY_APP_NAME") or os.environ.get("FLY_MACHINE_ID"))
-    _startup_delay = int(os.environ.get("STREAM_STARTUP_DELAY_S", "35" if (_on_railway or _on_fly) else "0"))
+    # 60 s gives Fly.io's 30 s kill_timeout + ~30 s for Alpaca to release
+    # the slot after the old instance closes the socket.
+    _startup_delay = int(os.environ.get("STREAM_STARTUP_DELAY_S", "60" if (_on_railway or _on_fly) else "0"))
     if _startup_delay > 0:
         logger.info(
             f"[stream] Startup grace period — waiting {_startup_delay}s for "
@@ -822,14 +824,26 @@ async def run_stream() -> None:
             _on_trade_ref = None
             sentry_sdk.capture_exception(e)
             err_str = str(e).lower()
-            # Alpaca free tier: only 1 concurrent WebSocket allowed.
-            # During Railway rolling deploys the old container may still hold
-            # the connection when the new one tries to connect.  Back off for
-            # 60 s minimum so the old container has time to die cleanly.
-            if "connection limit" in err_str or "429" in err_str:
+            # Treat connection limit, 429, AND TimeoutError the same way:
+            # back off for 60 s minimum.
+            #
+            # TimeoutError root cause: Fly.io's default kill_timeout is 5 s.
+            # If the old instance is SIGKILL'd before our graceful shutdown
+            # sends a proper FIN to Alpaca, Alpaca holds the dead TCP slot
+            # for up to 120 s via keepalive.  The new instance gets
+            # TimeoutError (not 429) because Alpaca accepts the TCP handshake
+            # but never completes the WebSocket upgrade.
+            # kill_timeout = "30s" in fly.toml fixes the root cause; this
+            # 60 s backoff is the safety net for any remaining races.
+            _is_conn_limit = (
+                "connection limit" in err_str
+                or "429" in err_str
+                or isinstance(e, (TimeoutError, asyncio.TimeoutError))
+            )
+            if _is_conn_limit:
                 wait = max(reconnect_delay, 60)
                 logger.warning(
-                    f"[stream] Alpaca connection limit hit — "
+                    f"[stream] Alpaca connection unavailable ({type(e).__name__}) — "
                     f"backing off {wait}s before retry"
                 )
                 await asyncio.sleep(wait)
