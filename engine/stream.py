@@ -801,6 +801,16 @@ async def run_stream() -> None:
             await asyncio.sleep(5)
 
         except asyncio.CancelledError:
+            # Stop the Alpaca WebSocket BEFORE clearing the ref so the old
+            # instance releases the SIP connection before the new deployment
+            # tries to claim it.  Without this, Fly.io rolling deploys leave
+            # a zombie connection and the new instance gets "connection limit
+            # exceeded" for up to 60 s.
+            try:
+                wss.stop()
+                logger.info("[stream] Alpaca WebSocket stopped cleanly on shutdown")
+            except Exception as _se:
+                logger.debug(f"[stream] wss.stop() error (non-fatal): {_se}")
             _wss_ref      = None
             _on_trade_ref = None
             logger.info("[stream] Stream task cancelled — shutting down")

@@ -362,6 +362,22 @@ async def lifespan(app: FastAPI):
     yield
 
     # ── Graceful shutdown ─────────────────────────────────────────────────────
+    # Stop the Alpaca WebSocket FIRST so the SIP connection is released
+    # before we cancel the asyncio task.  Fly.io sends SIGTERM to the old
+    # container during a rolling deploy; if we don't close the socket here
+    # the Alpaca connection stays alive while the new container tries to
+    # connect, causing "connection limit exceeded" storms.
+    try:
+        from engine.stream import _wss_ref as _stream_wss
+        if _stream_wss is not None:
+            _stream_wss.stop()
+            logger.info("[lifespan] Alpaca WebSocket stopped — connection released")
+            # Brief pause so the SDK's internal thread fully closes the socket
+            # before we raise CancelledError into the stream task.
+            await asyncio.sleep(2)
+    except Exception as _se:
+        logger.debug(f"[lifespan] stream stop error (non-fatal): {_se}")
+
     stream_task.cancel()
     try:
         await stream_task
