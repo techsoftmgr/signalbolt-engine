@@ -4,6 +4,14 @@
 app            = "signalbolt-engine"
 primary_region = "iad"
 
+# Give the old instance 30 s to close the Alpaca WebSocket cleanly before
+# SIGKILL.  Default is 5 s — too short for our graceful shutdown to send
+# a proper FIN to Alpaca.  Without this, SIGKILL drops the TCP connection
+# hard; Alpaca holds the dead slot for up to 120 s via keepalive, causing
+# the new instance to get TimeoutError instead of a clean 429.
+kill_signal  = "SIGTERM"
+kill_timeout = "30s"
+
 [build]
   dockerfile = "Dockerfile"
 
