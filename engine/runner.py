@@ -160,10 +160,10 @@ STRATEGY_CONFIGS = [
 # Max hold time per strategy before auto-expiry
 STRATEGY_MAX_HOLD_HOURS = {
     "scalping":     0.5,    # 30 minutes
-    "day_trade":    24.0,
+    "day_trade":    8.0,    # ↓ from 24 — day trades close within one session
     "swing_trade":  240.0,  # 10 days
-    "options_flow": 24.0,
-    "dark_pool":    24.0,
+    "options_flow": 8.0,
+    "dark_pool":    8.0,
 }
 
 
@@ -575,7 +575,9 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
     if not scored["passes"]:
         return
 
-    # ── QUANT GATE 5: Gamma-aware SL/TP ──────────────────────
+    # ── QUANT GATE 5: Realistic SL/TP ────────────────────────
+    # interval is used to select the correct ATR method (H-L for intraday)
+    # and to estimate the Average Daily Range for target capping.
     sltp = sl_tp_engine.calculate(
         direction=direction,
         entry=price,
@@ -584,16 +586,19 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
         session=session,
         gamma=gamma,
         strategy_type=strategy_type,
+        interval=config.get("interval", "15m"),
     )
     if not sltp["valid"]:
-        logger.info(f"[runner] {ticker} BLOCKED — R:R={sltp['risk_reward_1']:.2f} < 2.0")
+        logger.info(
+            f"[runner] {ticker} BLOCKED — R:R={sltp['risk_reward_1']:.2f} below minimum "
+            f"(atr={sltp['atr']:.3f} adr={sltp.get('adr', 0):.2f} strategy={strategy_type})"
+        )
         return
 
-    # Use quant SL/TP if better R:R, else keep SMC levels
-    use_quant_sltp = sltp["risk_reward_1"] >= 2.0
-    final_sl = sltp["stop_loss"] if use_quant_sltp else scored["stop_loss"]
-    final_t1 = sltp["target_one"] if use_quant_sltp else scored["target_one"]
-    final_t2 = sltp["target_two"] if use_quant_sltp else scored["target_two"]
+    # SL/TP always comes from the quant engine — SMC fallback removed (dead code)
+    final_sl = sltp["stop_loss"]
+    final_t1 = sltp["target_one"]
+    final_t2 = sltp["target_two"]
 
     # ── QUANT GATE 6: Portfolio risk ──────────────────────────
     risk = risk_manager.check(sb, ticker, scored["total"])

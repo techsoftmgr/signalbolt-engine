@@ -40,9 +40,9 @@ _EARNINGS_CACHE_TTL = 86400  # 24 hours
 FIRE_THRESHOLD = 78  # legacy default — use STRATEGY_THRESHOLDS per strategy
 
 STRATEGY_THRESHOLDS: dict[str, int] = {
-    'scalping':     70,
-    'day_trade':    65,
-    'swing_trade':  68,
+    'scalping':     72,   # ↑ tighter — scalps need strong momentum alignment
+    'day_trade':    72,   # ↑ from 65 — raises bar so only high-quality signals fire
+    'swing_trade':  70,   # ↑ from 68 — stronger SMC structure required
     'options_flow': 75,
     'dark_pool':    72,
 }

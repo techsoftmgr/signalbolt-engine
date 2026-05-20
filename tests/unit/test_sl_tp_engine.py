@@ -18,10 +18,14 @@ from unittest.mock import patch
 from engine.sl_tp_engine import (
     _round_number_adjustment,
     _compute_atr,
-    MIN_RR,
-    MAX_SL_PCT,
-    MIN_SL_PCT,
+    _MIN_RR_T1,
+    _MAX_SL_PCT,
+    _MIN_SL_PCT,
 )
+
+# Backward-compat aliases used in tests below
+MIN_RR    = min(_MIN_RR_T1.values())      # 1.5 — minimum across all strategies
+MAX_SL_PCT = max(_MAX_SL_PCT.values())    # 4.0% — swing trade ceiling (most permissive)
 
 # ── Shared mock dicts for regime / session / gamma ────────────
 _regime = {
