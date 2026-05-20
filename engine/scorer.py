@@ -22,13 +22,14 @@ from datetime import date, datetime, timezone, timedelta
 from typing import Optional
 
 import pandas as pd
-import yfinance as yf
+import yfinance as yf   # kept for L4 earnings calendar ONLY — Alpaca has no earnings data
+                        # L3 news now uses Alpaca News API primary (yfinance fallback)
 
 logger = logging.getLogger(__name__)
 
 # ── L3 news sentiment cache ───────────────────────────────────
-# yf.Ticker(ticker).news called once per scan without cache = 54 calls/cycle.
-# News headlines don't change minute-to-minute — 30-min cache is safe.
+# Alpaca News API called once per scan. News headlines don't change
+# minute-to-minute — 30-min cache is safe.
 _l3_cache: dict[str, tuple[float, float]] = {}  # ticker → (score, fetched_at)
 _L3_CACHE_TTL = 1800  # 30 minutes
 
@@ -40,11 +41,11 @@ _EARNINGS_CACHE_TTL = 86400  # 24 hours
 FIRE_THRESHOLD = 78  # legacy default — use STRATEGY_THRESHOLDS per strategy
 
 STRATEGY_THRESHOLDS: dict[str, int] = {
-    'scalping':     75,   # ↑ from 72 — tight momentum needs stronger confirmation
-    'day_trade':    75,   # ↑ from 72 — fewer but higher-quality intraday signals
-    'swing_trade':  72,   # ↑ from 70 — requires clear multi-bar structure
-    'options_flow': 75,
-    'dark_pool':    72,
+    'scalping':     78,   # quality bar: stricter SMC filters do the heavy lifting
+    'day_trade':    78,   # 78 with stricter filters >> 75 with loose filters
+    'swing_trade':  76,   # swing needs room — structure filters are already tight
+    'options_flow': 78,
+    'dark_pool':    76,
 }
 
 # Weights for each scoring layer (must sum to 100 per strategy)
@@ -225,41 +226,60 @@ _NEGATIVE = {"fall", "drop", "miss", "loss", "decline", "down", "weak", "bearish
 def _l3_sentiment(ticker: str, direction: str) -> float:
     """
     News-keyword sentiment for standard strategies (scalping/day_trade/swing_trade).
-    Cached 30 minutes — yfinance news doesn't change per-minute.
+    Cached 30 minutes — news headlines change slowly.
+
+    Data source: Alpaca News API (real-time, included in SIP plan) with
+    yfinance fallback. Both are keyword-scanned for bullish/bearish signals.
     """
     now = time.monotonic()
     cached = _l3_cache.get(ticker)
-    # Cache key includes direction implicitly: score is stored direction-neutral,
-    # then flipped per direction at return time, so we cache the raw ratio instead.
     if cached and (now - cached[1]) < _L3_CACHE_TTL:
         return cached[0] if direction == "LONG" else (20.0 - cached[0])
 
+    headlines: list[str] = []
+
+    # ── Alpaca News API (primary) ─────────────────────────────────────────────
     try:
-        news = yf.Ticker(ticker).news
-        if not news:
-            _l3_cache[ticker] = (10.0, now)
-            return 10.0
-
-        pos = neg = 0
-        for article in news[:6]:
-            title = (article.get("title") or "").lower()
-            pos += sum(1 for w in _POSITIVE if w in title)
-            neg += sum(1 for w in _NEGATIVE if w in title)
-
-        total = pos + neg
-        if total == 0:
-            _l3_cache[ticker] = (10.0, now)
-            return 10.0
-
-        ratio = (pos - neg) / total
-        long_score = round(((ratio + 1) / 2 * 20), 1)
-        long_score = max(0.0, min(long_score, 20.0))
-        _l3_cache[ticker] = (long_score, now)
-        return long_score if direction == "LONG" else (20.0 - long_score)
-
+        from engine.alpaca_client import get_news
+        articles = get_news(ticker, limit=6)
+        for a in articles:
+            # Alpaca news fields: headline, summary, author, content
+            title = (a.get("headline") or a.get("summary") or "").lower()
+            if title:
+                headlines.append(title)
     except Exception as e:
-        logger.debug(f"L3 sentiment error for {ticker}: {e}")
+        logger.debug(f"L3 Alpaca news error for {ticker}: {e}")
+
+    # ── yfinance fallback ─────────────────────────────────────────────────────
+    if not headlines:
+        try:
+            news_yf = yf.Ticker(ticker).news
+            for article in (news_yf or [])[:6]:
+                title = (article.get("title") or "").lower()
+                if title:
+                    headlines.append(title)
+        except Exception as e:
+            logger.debug(f"L3 yfinance news fallback error for {ticker}: {e}")
+
+    if not headlines:
+        _l3_cache[ticker] = (10.0, now)
         return 10.0
+
+    pos = neg = 0
+    for title in headlines:
+        pos += sum(1 for w in _POSITIVE if w in title)
+        neg += sum(1 for w in _NEGATIVE if w in title)
+
+    total = pos + neg
+    if total == 0:
+        _l3_cache[ticker] = (10.0, now)
+        return 10.0
+
+    ratio      = (pos - neg) / total
+    long_score = round(((ratio + 1) / 2 * 20), 1)
+    long_score = max(0.0, min(long_score, 20.0))
+    _l3_cache[ticker] = (long_score, now)
+    return long_score if direction == "LONG" else (20.0 - long_score)
 
 
 def _l3_flow_sentiment(analysis: dict, direction: str) -> float:

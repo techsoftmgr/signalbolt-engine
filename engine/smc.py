@@ -28,7 +28,7 @@ try:
 except ImportError:
     _ALPACA_OK = False
 
-SWING_WINDOW = 3
+SWING_WINDOW = 5   # ↑ from 3 — 3 bars = 45-min noise, 5 bars = 75-min real structure
 
 # Alpaca timeframe mapping: interval → (TimeFrame, days_lookback)
 _ALPACA_TIMEFRAMES = {
@@ -231,27 +231,68 @@ def detect_swings(df: pd.DataFrame, n: int = SWING_WINDOW) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def detect_structure(df: pd.DataFrame) -> dict:
-    sh = df[df["swing_high"]]["high"].values
-    sl = df[df["swing_low"]]["low"].values
-    price = df["close"].iloc[-1]
+    """
+    Detect BOS and CHoCH with confirmation requirement.
+
+    Confirmation rule: the structural break must have happened at least 1 bar
+    ago AND the CLOSE of that confirmation bar must hold above/below the level.
+    This filters out wick-only fakeouts where price briefly breaks a level
+    but immediately reverses — a common retail trap.
+
+    We also require the break bar to be in the RECENT N bars (max_structure_age),
+    so we don't fire signals based on structure breaks from days ago.
+    """
+    sh_df  = df[df["swing_high"]]
+    sl_df  = df[df["swing_low"]]
+    sh     = sh_df["high"].values
+    sl     = sl_df["low"].values
+    price  = df["close"].iloc[-1]
+    n      = len(df)
+
+    # The break bar must be within the last 20 bars to be considered "current"
+    max_structure_age = 20
 
     bos_bullish = bos_bearish = False
     choch_bullish = choch_bearish = False
 
     if len(sh) >= 2:
-        # BOS: price breaks the most recent confirmed swing high
-        if price > sh[-1]:
-            bos_bullish = True
-        # CHoCH: previous highs were lower (downtrend) and now price breaks above
-        if sh[-1] < sh[-2] and price > sh[-1]:
-            choch_bullish = True
+        level = sh[-1]
+        # Find the index of where this swing high was formed
+        sh_idx = sh_df.index[-1] if hasattr(sh_df.index, '__len__') else n - 1
+        try:
+            sh_pos = df.index.get_loc(sh_idx)
+        except Exception:
+            sh_pos = n - SWING_WINDOW - 1
+
+        bars_since_swing = n - 1 - sh_pos
+
+        # Structure is only valid if the break is recent (within max_structure_age bars)
+        if bars_since_swing <= max_structure_age:
+            # BOS: current close AND at least 1 bar's close above the swing high
+            # (not just a wick poke — requires 2+ consecutive closes above)
+            last2_closes = df["close"].iloc[-2:]
+            if all(c > level for c in last2_closes):
+                bos_bullish = True
+            # CHoCH: was making lower highs, now confirmed break above
+            if sh[-1] < sh[-2] and bos_bullish:
+                choch_bullish = True
 
     if len(sl) >= 2:
-        if price < sl[-1]:
-            bos_bearish = True
-        # CHoCH: previous lows were higher (uptrend) and now price breaks below
-        if sl[-1] > sl[-2] and price < sl[-1]:
-            choch_bearish = True
+        level = sl[-1]
+        sl_idx = sl_df.index[-1] if hasattr(sl_df.index, '__len__') else n - 1
+        try:
+            sl_pos = df.index.get_loc(sl_idx)
+        except Exception:
+            sl_pos = n - SWING_WINDOW - 1
+
+        bars_since_swing = n - 1 - sl_pos
+
+        if bars_since_swing <= max_structure_age:
+            last2_closes = df["close"].iloc[-2:]
+            if all(c < level for c in last2_closes):
+                bos_bearish = True
+            if sl[-1] > sl[-2] and bos_bearish:
+                choch_bearish = True
 
     return {
         "bos_bullish":   bos_bullish,
@@ -265,16 +306,23 @@ def detect_structure(df: pd.DataFrame) -> dict:
 # Fair Value Gaps
 # ---------------------------------------------------------------------------
 
-def detect_fvg(df: pd.DataFrame) -> dict:
+def detect_fvg(df: pd.DataFrame, max_age_bars: int = 30) -> dict:
     """
     Bullish FVG: candle[i-2].high < candle[i].low   — gap up, middle is impulse candle
     Bearish FVG: candle[i-2].low  > candle[i].high  — gap down
     Returns the FVG nearest to current price for each direction.
+
+    max_age_bars: only consider FVGs formed within the last N bars.
+    Stale FVGs (weeks old) are irrelevant to current price action — SMC
+    respects freshness. Default 30 bars = ~7.5 hours on 15m chart.
     """
     bullish_fvgs: list[dict] = []
     bearish_fvgs: list[dict] = []
 
-    for i in range(2, len(df)):
+    # Only scan the most recent max_age_bars bars for fresh FVGs
+    start_idx = max(2, len(df) - max_age_bars)
+
+    for i in range(start_idx, len(df)):
         c0 = df.iloc[i - 2]
         c2 = df.iloc[i]
         if c0["high"] < c2["low"]:
@@ -322,7 +370,9 @@ def detect_order_blocks(df: pd.DataFrame) -> dict:
 
         if curr["close"] < curr["open"]:  # bearish candle
             body_move = (nxt["close"] - nxt["open"]) / nxt["open"] if nxt["open"] else 0
-            if body_move > 0.003:
+            # ↑ threshold 0.003→0.006: real institutional OBs need 0.6%+ impulse moves.
+            # 0.3% is normal price noise — flagging it produces fake OB scores.
+            if body_move > 0.006:
                 bullish_ob = {
                     "top":    float(curr["open"]),
                     "bottom": float(curr["close"]),
@@ -331,7 +381,7 @@ def detect_order_blocks(df: pd.DataFrame) -> dict:
 
         if curr["close"] > curr["open"]:  # bullish candle
             body_move = (nxt["open"] - nxt["close"]) / nxt["open"] if nxt["open"] else 0
-            if body_move > 0.003:
+            if body_move > 0.006:
                 bearish_ob = {
                     "top":    float(curr["close"]),
                     "bottom": float(curr["open"]),
@@ -547,10 +597,12 @@ def analyze(
         if strategy_type in ("scalping", "day_trade") and len(df) >= 6:
             recent_avg = float(df["volume"].iloc[-5:-1].mean())  # last 4 completed bars
             last_completed = float(df["volume"].iloc[-2])        # penultimate bar
-            if recent_avg > 0 and last_completed < recent_avg * 0.40:
+            # ↑ threshold 40%→60%: 40-59% volume = thin market, SMC patterns unreliable.
+            # Raising to 60% filters low-conviction setups without being too restrictive.
+            if recent_avg > 0 and last_completed < recent_avg * 0.60:
                 logger.debug(
                     f"[smc] {ticker} [{strategy_type}] volume too low "
-                    f"({last_completed:.0f} < 40% of avg {recent_avg:.0f}) — skip"
+                    f"({last_completed:.0f} < 60% of avg {recent_avg:.0f}) — skip"
                 )
                 return None
 

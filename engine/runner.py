@@ -32,6 +32,7 @@ from engine.tracker import track_signals
 from engine import regime_detector, session_classifier, gamma_engine, manipulation_detector, sl_tp_engine, risk_manager
 from engine import weight_optimizer, signal_monitor
 from engine import unusual_whales as uw
+from engine import prescreener
 
 load_dotenv()
 
@@ -62,6 +63,13 @@ _RUNNER_REGIME_TTL = 240  # 4 minutes
 # ── News cache: {ticker: (has_news: bool, fetched_at: float)} ─────────────
 _news_cache: dict[str, tuple[bool, float]] = {}
 _NEWS_CACHE_TTL = 900  # 15 minutes
+
+# ── Post-loss cooldown: {(ticker, strategy): stopped_at_monotonic} ─────────
+# After a signal stops out, block that ticker+strategy combo for 45 minutes.
+# Rapid re-entry in the same direction after a stop hit = same bad market
+# conditions; waiting 45 min gives the setup time to fully resolve.
+_stop_cooldown: dict[tuple[str, str], float] = {}
+_STOP_COOLDOWN_SECS = 45 * 60  # 45 minutes
 
 
 def _has_recent_news(ticker: str, lookback_minutes: int = 60) -> bool:
@@ -108,15 +116,14 @@ def _has_recent_news(ticker: str, lookback_minutes: int = 60) -> bool:
 # Ticker lists
 # ---------------------------------------------------------------------------
 
-SCALP_TICKERS = ["SPY", "QQQ", "AAPL", "TSLA", "NVDA", "AMD"]
+SCALP_TICKERS = ["SPY", "QQQ", "AAPL", "TSLA", "NVDA", "AMD", "MSFT", "META", "GOOGL", "COIN"]
 
-ALL_TICKERS = [
-    "AAPL", "MSFT", "NVDA", "GOOGL", "META",
-    "TSLA", "AMD", "SPY", "QQQ", "IWM", "DIA",
-    "COIN", "PLTR", "MSTR", "HOOD", "RBLX",
-    "UBER", "ABNB", "JPM", "GS", "XOM", "CVX",
-    "MARA", "RIOT", "CLSK", "MRNA", "BNTX",
-]
+# ALL_TICKERS is now DYNAMIC — populated by the pre-screener at scan time.
+# The screener covers 500+ liquid US stocks and returns the ~50 showing
+# the most momentum + volume activity at the moment of scanning.
+# CORE_TICKERS are always included as a baseline.
+# For backward-compat (used by /run endpoint), keep a static fallback list.
+ALL_TICKERS = prescreener.CORE_TICKERS  # overridden dynamically in _run_strategy_scan
 
 # ---------------------------------------------------------------------------
 # Strategy configs
@@ -194,6 +201,26 @@ def _has_active_signal(sb: Client, ticker: str, strategy_type: str) -> bool:
     except Exception as e:
         logger.error(f"[runner] Active-signal check failed for {ticker}/{strategy_type}: {e}")
         return False
+
+
+def _in_stop_cooldown(ticker: str, strategy_type: str) -> bool:
+    """
+    Return True if this ticker+strategy recently stopped out and is in cooldown.
+    Prevents rapid re-entry in the same bad market conditions immediately after a loss.
+    """
+    key = (ticker, strategy_type)
+    stopped_at = _stop_cooldown.get(key)
+    if stopped_at and (time.monotonic() - stopped_at) < _STOP_COOLDOWN_SECS:
+        remaining = int((_STOP_COOLDOWN_SECS - (time.monotonic() - stopped_at)) / 60)
+        logger.debug(f"[runner] {ticker} [{strategy_type}] in stop cooldown ({remaining} min left)")
+        return True
+    return False
+
+
+def _record_stop_hit(ticker: str, strategy_type: str) -> None:
+    """Record that this ticker+strategy just stopped out, starting the cooldown clock."""
+    _stop_cooldown[(ticker, strategy_type)] = time.monotonic()
+    logger.info(f"[runner] {ticker} [{strategy_type}] stop cooldown started (45 min)")
 
 
 def _write_signal(sb: Client, row: dict) -> None:
@@ -520,6 +547,9 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
 
     if _has_active_signal(sb, ticker, strategy_type):
         logger.debug(f"[runner] {ticker} [{strategy_type}]: active signal exists — skipping")
+        return
+
+    if _in_stop_cooldown(ticker, strategy_type):
         return
 
     analysis = smc.analyze(
@@ -886,8 +916,11 @@ def _close_signals(sb: Client) -> None:
     """
     Close signals that hit target/stop or exceeded their max hold time.
     Scalping signals expire after 30 min; swing trade after 10 days.
+
+    Uses Alpaca batch price fetch (one API call for all active tickers) then
+    yfinance per-ticker as fallback — never creates a new Alpaca client per call.
     """
-    import yfinance as yf
+    from engine import alpaca_client as _alpaca
 
     now = datetime.now(timezone.utc)
 
@@ -897,6 +930,32 @@ def _close_signals(sb: Client) -> None:
     except Exception as e:
         logger.error(f"[closer] fetch signals failed: {e}")
         rows = []
+
+    # ── Batch price fetch: one Alpaca call for all active tickers ─────────────
+    non_expired_tickers = []
+    for sig in rows:
+        created   = datetime.fromisoformat(sig["created_at"].replace("Z", "+00:00"))
+        strategy  = sig.get("strategy_type") or "day_trade"
+        hold_hours = STRATEGY_MAX_HOLD_HOURS.get(strategy, 48.0)
+        if created >= now - timedelta(hours=hold_hours):
+            non_expired_tickers.append(sig["ticker"])
+
+    price_map: dict[str, float] = {}
+    if non_expired_tickers:
+        # Deduplicate
+        unique_tickers = list(dict.fromkeys(non_expired_tickers))
+        price_map = _alpaca.get_latest_prices(unique_tickers)
+        # yfinance fallback for any ticker Alpaca missed
+        missing = [t for t in unique_tickers if t not in price_map]
+        if missing:
+            try:
+                import yfinance as yf
+                for t in missing:
+                    p = yf.Ticker(t).fast_info.last_price
+                    if p:
+                        price_map[t] = float(p)
+            except Exception:
+                pass
 
     for sig in rows:
         created      = datetime.fromisoformat(sig["created_at"].replace("Z", "+00:00"))
@@ -909,20 +968,20 @@ def _close_signals(sb: Client) -> None:
         if created < cutoff:
             reason = "expired"
         else:
-            try:
-                p = yf.Ticker(sig["ticker"]).fast_info.last_price
-                if p:
-                    close_price = float(p)
-                    if sig["direction"] == "LONG":
-                        if close_price >= sig["target_two"]:  reason = "target_hit"
-                        elif close_price <= sig["stop_loss"]: reason = "stop_hit"
-                    else:
-                        if close_price <= sig["target_two"]:  reason = "target_hit"
-                        elif close_price >= sig["stop_loss"]: reason = "stop_hit"
-            except Exception:
-                pass
+            close_price = price_map.get(sig["ticker"])
+            if close_price:
+                if sig["direction"] == "LONG":
+                    if close_price >= sig["target_two"]:  reason = "target_hit"
+                    elif close_price <= sig["stop_loss"]: reason = "stop_hit"
+                else:
+                    if close_price <= sig["target_two"]:  reason = "target_hit"
+                    elif close_price >= sig["stop_loss"]: reason = "stop_hit"
 
         if reason:
+            # Start cooldown if this was a stop hit — prevents re-entry in same bad conditions
+            if reason == "stop_hit":
+                _record_stop_hit(sig["ticker"], sig.get("strategy_type") or "day_trade")
+
             update: dict = {
                 "status":        "closed",
                 "closed_reason": reason,
@@ -959,6 +1018,27 @@ def _close_signals(sb: Client) -> None:
         logger.error(f"[closer] fetch option_signals failed: {e}")
         opt_rows = []
 
+    # Batch fetch prices for all non-expired option signal underlyings
+    opt_non_expired = [
+        sig["ticker"]
+        for sig in opt_rows
+        if datetime.fromisoformat(sig["created_at"].replace("Z", "+00:00")) >= now - timedelta(hours=24)
+    ]
+    opt_price_map: dict[str, float] = {}
+    if opt_non_expired:
+        unique_opt = list(dict.fromkeys(opt_non_expired))
+        opt_price_map = _alpaca.get_latest_prices(unique_opt)
+        missing_opt = [t for t in unique_opt if t not in opt_price_map]
+        if missing_opt:
+            try:
+                import yfinance as yf
+                for t in missing_opt:
+                    p = yf.Ticker(t).fast_info.last_price
+                    if p:
+                        opt_price_map[t] = float(p)
+            except Exception:
+                pass
+
     option_cutoff = now - timedelta(hours=24)
     for sig in opt_rows:
         created = datetime.fromisoformat(sig["created_at"].replace("Z", "+00:00"))
@@ -968,7 +1048,7 @@ def _close_signals(sb: Client) -> None:
             reason = "expired"
         else:
             try:
-                price      = yf.Ticker(sig["ticker"]).fast_info.last_price
+                price      = opt_price_map.get(sig["ticker"])
                 delta      = sig.get("delta") or 0
                 und_price  = sig.get("underlying_price") or 0
                 entry_prem = sig.get("entry_premium") or 0
@@ -999,7 +1079,20 @@ def _close_signals(sb: Client) -> None:
 
 def _run_strategy_scan(config: dict) -> None:
     strategy_type = config["type"]
-    tickers       = config["tickers"]
+
+    # ── Dynamic ticker list via pre-screener ──────────────────────────────────
+    # Run the fast Alpaca snapshot screen to find the ~50 tickers showing
+    # real momentum or volume activity right now.  Full SMC only runs on those.
+    # Scalping uses a tighter list — needs the highest-liquidity names only.
+    if strategy_type == "scalping":
+        tickers = SCALP_TICKERS
+    else:
+        try:
+            tickers = prescreener.screen(max_results=150)
+        except Exception as e:
+            logger.warning(f"[runner] Pre-screener failed: {e} — using core tickers")
+            tickers = prescreener.CORE_TICKERS
+
     logger.info(
         f"[runner] {strategy_type.upper()} scan started — "
         f"{len(tickers)} tickers @ {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"

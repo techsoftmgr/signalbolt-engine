@@ -33,11 +33,11 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-import yfinance as yf
 import pandas as pd
 from supabase import create_client, Client
 
 from engine import smc, push
+from engine import alpaca_client as _alpaca
 
 logger = logging.getLogger("signalbolt.monitor")
 
@@ -110,7 +110,19 @@ def _is_eod_warning() -> bool:
 
 
 def _current_price(ticker: str) -> Optional[float]:
+    """
+    Get current price via Alpaca (real-time, SIP feed) with yfinance fallback.
+    Uses the shared singleton client — no per-call reconnection overhead.
+    yfinance fast_info is 15-min delayed — Alpaca is real-time SIP.
+    """
+    # ── Alpaca primary (real-time SIP, shared singleton) ─────────────────────
+    price = _alpaca.get_latest_price(ticker)
+    if price:
+        return price
+
+    # ── yfinance fallback (15-min delayed, better than nothing) ──────────────
     try:
+        import yfinance as yf
         p = yf.Ticker(ticker).fast_info["last_price"]
         return float(p) if p else None
     except Exception:
@@ -152,17 +164,30 @@ def _momentum_check(ticker: str, direction: str) -> tuple[bool, str]:
     """
     Returns (book_now, reason) using RSI + MACD on 5-min bars.
     book_now=True means momentum is failing — engine recommends booking profit.
+    Uses Alpaca real-time bars (primary) with yfinance fallback.
     """
     try:
         import ta
-        df = yf.download(ticker, period="2d", interval="5m", progress=False, auto_adjust=True)
-        if df.empty or len(df) < 20:
+
+        # ── Alpaca primary — real-time 5-min bars ─────────────────────────────
+        close = None
+        df_alpaca = _alpaca.get_bars(ticker, timeframe="5Min", days=2)
+        if df_alpaca is not None and len(df_alpaca) >= 20:
+            close = df_alpaca["close"]
+        else:
+            # ── yfinance fallback (15-min delayed) ────────────────────────────
+            import yfinance as yf
+            df_yf = yf.download(ticker, period="2d", interval="5m",
+                                progress=False, auto_adjust=True)
+            if not df_yf.empty and len(df_yf) >= 20:
+                close = df_yf["Close"].squeeze()
+
+        if close is None:
             return False, ""
 
-        close = df["Close"].squeeze()
-        rsi   = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
-        macd  = ta.trend.MACD(close)
-        macd_line = macd.macd().iloc[-1]
+        rsi         = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
+        macd        = ta.trend.MACD(close)
+        macd_line   = macd.macd().iloc[-1]
         signal_line = macd.macd_signal().iloc[-1]
 
         is_long = direction == "LONG"
@@ -567,30 +592,36 @@ def _monitor_stocks(sb: Client) -> None:
             if should_assess:
                 book_now, reason = _momentum_check(ticker, direction)
 
-                # Also book early if age > 2h and signal is stuck (stalling)
-                if not book_now and age_mins > 120 and current_status == "building_profit":
+                # Book early if signal has been stalling for >3h with no progress
+                # (was 2h — raised to 3h to give trades more room to breathe)
+                if not book_now and age_mins > 180 and current_status == "building_profit":
                     book_now = True
                     reason   = f"Signal stalling after {age_mins:.0f} min — booking profit to protect gains"
 
-                # Book if session is winding down (2:00 PM+) and building profit
-                if not book_now and current_status in ("building_profit", "strong_profit"):
-                    now_et = datetime.now(ZoneInfo("America/New_York"))
-                    if now_et.hour >= 14 and now_et.minute >= 0:
-                        book_now = True
-                        reason   = f"Afternoon session — booking profit at +{pnl_pct:.1f}% to avoid reversal"
+                # REMOVED: 2PM blanket auto-book.
+                # Closing at +0.2% because the clock hit 2 PM created hundreds of
+                # microscopic "wins" that masked real loss performance. Trades
+                # that need to run to T1 should be allowed to run. The EOD
+                # force-close at 3:30 PM provides the real time-based exit.
 
                 if book_now:
-                    logger.info(f"[monitor] {ticker} EARLY BOOK — {reason} pnl={pnl_pct:.1f}%")
-                    _close_signal(sb, sig["id"], "target_hit",
-                                  current_price=price, entry_price=entry, direction=direction)
-                    _log_event(sb, sig["id"], "closed_win", price=price,
-                               note=f"💡 Profit booked @ ${price:.2f} (+{pnl_pct:.1f}%) — {reason}")
-                    _STATUS_CACHE.pop(sig["id"], None)
-                    try:
-                        _push_early_book(ticker, direction, pnl_pct, reason)
-                    except Exception:
-                        pass
-                    continue   # signal is now closed
+                    # Only auto-close if profit is meaningful (≥1.0%) — tiny wins
+                    # at +0.2% mask real performance and don't cover losses.
+                    # Below 1.0%, send a push notification but don't auto-close.
+                    if pnl_pct >= 1.0:
+                        logger.info(f"[monitor] {ticker} EARLY BOOK — {reason} pnl={pnl_pct:.1f}%")
+                        _close_signal(sb, sig["id"], "target_hit",
+                                      current_price=price, entry_price=entry, direction=direction)
+                        _log_event(sb, sig["id"], "closed_win", price=price,
+                                   note=f"💡 Profit booked @ ${price:.2f} (+{pnl_pct:.1f}%) — {reason}")
+                        _STATUS_CACHE.pop(sig["id"], None)
+                        try:
+                            _push_early_book(ticker, direction, pnl_pct, reason)
+                        except Exception:
+                            pass
+                        continue   # signal is now closed
+                    else:
+                        logger.debug(f"[monitor] {ticker} early book skipped — pnl {pnl_pct:.1f}% < 1.0% minimum")
         except Exception as e:
             logger.debug(f"[monitor] Early booking check error for {ticker}: {e}")
 

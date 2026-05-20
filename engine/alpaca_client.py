@@ -1,0 +1,179 @@
+"""
+Shared Alpaca client singleton — used by all engine modules.
+
+Why a singleton? Creating StockHistoricalDataClient is expensive (sets up
+a connection pool + auth round-trip). With 5 strategy scans × 150 tickers
+per cycle, re-creating the client per call wastes ~300 ms/cycle and burns
+Alpaca rate-limit budget. One shared client handles everything.
+
+Usage:
+    from engine.alpaca_client import get_latest_price, get_latest_prices, get_bars, get_news
+
+All functions return None / empty dict / [] on failure so callers can fall
+back to yfinance without crashing.
+"""
+
+import logging
+import os
+from typing import Optional
+
+import pandas as pd
+
+logger = logging.getLogger("signalbolt.alpaca")
+
+# ── Module-level singleton ────────────────────────────────────────────────────
+_client = None
+_ok     = False
+
+
+def _init() -> None:
+    """Lazy-initialise the shared client once."""
+    global _client, _ok
+    if _ok:
+        return
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        key    = os.environ.get("ALPACA_API_KEY", "")
+        secret = os.environ.get("ALPACA_SECRET_KEY", "")
+        if not key or not secret:
+            raise ValueError("Alpaca API keys not set")
+        _client = StockHistoricalDataClient(key, secret)
+        _ok     = True
+        logger.info("[alpaca] Singleton client initialised (SIP feed)")
+    except Exception as e:
+        logger.warning(f"[alpaca] Client init failed: {e} — will rely on yfinance fallback")
+
+
+# ── Price helpers ─────────────────────────────────────────────────────────────
+
+def get_latest_price(ticker: str) -> Optional[float]:
+    """
+    Real-time latest trade price (Alpaca SIP).
+    Returns None on any failure — caller should fall back to yfinance.
+    """
+    _init()
+    if not _ok or _client is None:
+        return None
+    try:
+        from alpaca.data.requests import StockLatestTradeRequest
+        resp = _client.get_stock_latest_trade(
+            StockLatestTradeRequest(symbol_or_symbols=ticker)
+        )
+        p = resp[ticker].price
+        return float(p) if p else None
+    except Exception as e:
+        logger.debug(f"[alpaca] latest_price({ticker}) failed: {e}")
+        return None
+
+
+def get_latest_prices(tickers: list[str]) -> dict[str, float]:
+    """
+    Batch real-time prices for multiple tickers in ONE API call.
+    Returns {ticker: price} — missing tickers are omitted (not in response).
+    """
+    _init()
+    if not _ok or _client is None or not tickers:
+        return {}
+    try:
+        from alpaca.data.requests import StockLatestTradeRequest
+        resp = _client.get_stock_latest_trade(
+            StockLatestTradeRequest(symbol_or_symbols=tickers)
+        )
+        return {
+            t: float(resp[t].price)
+            for t in tickers
+            if t in resp and resp[t].price
+        }
+    except Exception as e:
+        logger.debug(f"[alpaca] batch latest_prices failed: {e}")
+        return {}
+
+
+# ── Bar helpers ───────────────────────────────────────────────────────────────
+
+def get_bars(
+    ticker: str,
+    timeframe: str = "5Min",
+    days: int = 2,
+) -> Optional[pd.DataFrame]:
+    """
+    Fetch OHLCV bars from Alpaca (SIP feed, real-time on paid plan).
+
+    timeframe options: "1Min", "5Min", "15Min", "1Hour", "1Day"
+    days: how many calendar days of history to fetch
+
+    Returns a DataFrame with lowercase columns: open, high, low, close, volume
+    indexed by timestamp (UTC). Returns None on failure.
+    """
+    _init()
+    if not _ok or _client is None:
+        return None
+    try:
+        from datetime import datetime, timezone, timedelta
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+        tf_map = {
+            "1Min":  TimeFrame(1,  TimeFrameUnit.Minute),
+            "5Min":  TimeFrame(5,  TimeFrameUnit.Minute),
+            "15Min": TimeFrame(15, TimeFrameUnit.Minute),
+            "1Hour": TimeFrame(1,  TimeFrameUnit.Hour),
+            "1Day":  TimeFrame(1,  TimeFrameUnit.Day),
+        }
+        tf    = tf_map.get(timeframe, TimeFrame(5, TimeFrameUnit.Minute))
+        start = datetime.now(timezone.utc) - timedelta(days=days)
+
+        req  = StockBarsRequest(
+            symbol_or_symbols=ticker,
+            timeframe=tf,
+            start=start,
+            feed="sip",
+        )
+        bars = _client.get_stock_bars(req)
+        df   = bars.df
+
+        if df is None or df.empty:
+            return None
+
+        # Flatten multi-index (symbol, timestamp) → just timestamp index
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.xs(ticker, level=0)
+
+        df.columns = [c.lower() for c in df.columns]
+        df.index   = pd.to_datetime(df.index, utc=True)
+        return df
+
+    except Exception as e:
+        logger.debug(f"[alpaca] get_bars({ticker}, {timeframe}, {days}d) failed: {e}")
+        return None
+
+
+# ── News helper ───────────────────────────────────────────────────────────────
+
+def get_news(ticker: str, limit: int = 6) -> list[dict]:
+    """
+    Fetch latest news articles from Alpaca News API.
+
+    Returns a list of dicts with at least {"headline": str, "summary": str}.
+    Returns [] on failure so callers can fall back gracefully.
+    """
+    try:
+        import requests as _req
+        key    = os.environ.get("ALPACA_API_KEY", "")
+        secret = os.environ.get("ALPACA_SECRET_KEY", "")
+        if not key or not secret:
+            return []
+        resp = _req.get(
+            "https://data.alpaca.markets/v1beta1/news",
+            params={"symbols": ticker, "limit": limit, "sort": "desc"},
+            headers={
+                "APCA-API-KEY-ID":     key,
+                "APCA-API-SECRET-KEY": secret,
+            },
+            timeout=5,
+        )
+        if resp.ok:
+            return resp.json().get("news", [])
+    except Exception as e:
+        logger.debug(f"[alpaca] get_news({ticker}) failed: {e}")
+    return []

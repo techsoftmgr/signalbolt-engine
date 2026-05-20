@@ -24,7 +24,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-import yfinance as yf
+import yfinance as yf           # kept ONLY for ^VIX (Alpaca doesn't carry index tickers)
+import pandas as pd
 
 logger = logging.getLogger("signalbolt.regime")
 
@@ -54,34 +55,56 @@ def _fetch_vix() -> dict:
 
 def _fetch_spy_vs_200ma() -> dict:
     """
-    Check if SPY is above its 200-day MA.
-    Also returns raw history for reuse in _fetch_risk_off_signal so we
-    don't fetch SPY a second time in the same detect() call.
+    Check if SPY is above its 200-day MA using Alpaca daily bars (primary).
+    Returns raw history for reuse in _fetch_risk_off_signal — no double fetch.
+    Falls back to yfinance if Alpaca unavailable.
     """
-    try:
-        hist = yf.Ticker("SPY").history(period="210d", interval="1d")
-        if len(hist) < 200:
-            return {"above_200ma": True, "spy_price": 0, "ma200": 0, "adx": 0, "_hist": None}
+    _EMPTY = {"above_200ma": True, "spy_price": 0, "ma200": 0, "adx": 0, "_hist": None}
 
-        closes  = hist["Close"].tolist()
-        highs   = hist["High"].tolist()
-        lows    = hist["Low"].tolist()
-        price   = closes[-1]
-        ma200   = sum(closes[-200:]) / 200
-
-        # ADX(14) from last 30 bars
-        adx = _compute_adx(highs[-30:], lows[-30:], closes[-30:])
-
+    def _process(closes, highs, lows, hist_df):
+        if len(closes) < 200:
+            return _EMPTY
+        price = closes[-1]
+        ma200 = sum(closes[-200:]) / 200
+        adx   = _compute_adx(highs[-30:], lows[-30:], closes[-30:])
         return {
             "above_200ma": price > ma200,
             "spy_price":   round(price, 2),
             "ma200":       round(ma200, 2),
             "adx":         round(adx, 1),
-            "_hist":       hist,   # reused by _fetch_risk_off_signal — no double fetch
+            "_hist":       hist_df,
         }
+
+    # ── Alpaca primary ─────────────────────────────────────────────────────────
+    try:
+        from engine.alpaca_client import get_bars
+        df = get_bars("SPY", timeframe="1Day", days=215)
+        if df is not None and len(df) >= 200:
+            # Normalize to a DataFrame with "Close" for reuse in risk-off check
+            df_norm = df.rename(columns={"close": "Close", "high": "High", "low": "Low"})
+            return _process(
+                df["close"].tolist(),
+                df["high"].tolist(),
+                df["low"].tolist(),
+                df_norm,
+            )
     except Exception as e:
-        logger.debug(f"SPY/200MA fetch error: {e}")
-        return {"above_200ma": True, "spy_price": 0, "ma200": 0, "adx": 0, "_hist": None}
+        logger.debug(f"SPY/200MA Alpaca error: {e}")
+
+    # ── yfinance fallback ──────────────────────────────────────────────────────
+    try:
+        hist = yf.Ticker("SPY").history(period="210d", interval="1d")
+        if len(hist) < 200:
+            return _EMPTY
+        return _process(
+            hist["Close"].tolist(),
+            hist["High"].tolist(),
+            hist["Low"].tolist(),
+            hist,
+        )
+    except Exception as e:
+        logger.debug(f"SPY/200MA yfinance error: {e}")
+        return _EMPTY
 
 
 def _compute_adx(highs: list, lows: list, closes: list, period: int = 14) -> float:
@@ -120,21 +143,41 @@ def _fetch_risk_off_signal(spy_hist=None) -> bool:
     Check if market is in risk-off rotation:
     bonds (TLT) outperforming SPY over 5 days AND TLT 5-day return > +1%.
 
-    Fix #6: accepts spy_hist from _fetch_spy_vs_200ma so SPY is not
-    fetched twice per detect() call. Falls back to fresh fetch if not provided.
+    SPY history is reused from _fetch_spy_vs_200ma (no double fetch).
+    TLT fetched via Alpaca primary, yfinance fallback.
     """
     try:
-        # Reuse SPY history passed from detect() — tail(5) gives the 5-day window
+        # ── SPY 5-day return (reuse passed history) ────────────────────────────
         if spy_hist is not None and len(spy_hist) >= 2:
-            spy_5d = spy_hist.tail(5)
+            spy_5d = spy_hist.tail(5) if hasattr(spy_hist, "tail") else spy_hist
         else:
-            spy_5d = yf.Ticker("SPY").history(period="5d", interval="1d")
+            # fallback: fetch fresh
+            try:
+                from engine.alpaca_client import get_bars
+                df = get_bars("SPY", timeframe="1Day", days=7)
+                spy_5d = df.rename(columns={"close": "Close"}).tail(5) if df is not None else None
+            except Exception:
+                spy_5d = None
+            if spy_5d is None or len(spy_5d) < 2:
+                spy_5d = yf.Ticker("SPY").history(period="5d", interval="1d")
 
-        tlt_hist = yf.Ticker("TLT").history(period="5d", interval="1d")
-        if len(spy_5d) < 2 or len(tlt_hist) < 2:
+        # ── TLT 5-day return (Alpaca primary, yfinance fallback) ───────────────
+        tlt_5d = None
+        try:
+            from engine.alpaca_client import get_bars
+            df_tlt = get_bars("TLT", timeframe="1Day", days=7)
+            if df_tlt is not None and len(df_tlt) >= 2:
+                tlt_5d = df_tlt.rename(columns={"close": "Close"}).tail(5)
+        except Exception:
+            pass
+        if tlt_5d is None or len(tlt_5d) < 2:
+            tlt_5d = yf.Ticker("TLT").history(period="5d", interval="1d")
+
+        if spy_5d is None or tlt_5d is None or len(spy_5d) < 2 or len(tlt_5d) < 2:
             return False
+
         spy_ret = (float(spy_5d["Close"].iloc[-1]) / float(spy_5d["Close"].iloc[0])) - 1
-        tlt_ret = (float(tlt_hist["Close"].iloc[-1]) / float(tlt_hist["Close"].iloc[0])) - 1
+        tlt_ret = (float(tlt_5d["Close"].iloc[-1]) / float(tlt_5d["Close"].iloc[0])) - 1
         # True risk-off: bonds up meaningfully AND outpacing equities by >1%
         return tlt_ret > 0.01 and tlt_ret > spy_ret + 0.01
     except Exception as e:
