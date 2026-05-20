@@ -423,11 +423,19 @@ async def health():
         if SENTRY_DSN:
             sentry_sdk.capture_exception(e)
 
-    # Alpaca check
+    # Alpaca check — use direct HTTP with a short timeout to avoid blocking
     try:
-        from alpaca.trading.client import TradingClient
-        TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True).get_account()
-        alpaca_status = "healthy"
+        import httpx
+        alpaca_base = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+        resp = httpx.get(
+            f"{alpaca_base}/v2/account",
+            headers={
+                "APCA-API-KEY-ID":     ALPACA_API_KEY,
+                "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+            },
+            timeout=5.0,
+        )
+        alpaca_status = "healthy" if resp.status_code == 200 else f"http_{resp.status_code}"
     except Exception as e:
         alpaca_status = f"error: {e}"
 
