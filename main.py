@@ -327,7 +327,9 @@ async def lifespan(app: FastAPI):
     from engine import price_store
 
     # ── Initialise real-time price store with this event loop ────────────────
-    price_store.init(asyncio.get_event_loop())
+    # Use get_running_loop() — get_event_loop() is deprecated in Python 3.10+
+    # and may return the wrong loop inside an async context manager.
+    price_store.init(asyncio.get_running_loop())
 
     # ── Seed price store from Alpaca REST snapshot so first WS connect gets
     #    immediate data even before the first trade arrives ───────────────────
