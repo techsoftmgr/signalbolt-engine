@@ -627,9 +627,9 @@ async def run_stream() -> None:
 
     # Alpaca SDK requires a DataFeed enum — not a raw string
     from alpaca.data.enums import DataFeed
-    # Default to IEX — works with free/paper Alpaca accounts.
-    # Set ALPACA_DATA_FEED=sip in env only if you have an Alpaca paid plan.
-    feed_env  = os.environ.get("ALPACA_DATA_FEED", "iex").lower()
+    # SIP = full real-time market data (requires Alpaca paid plan — confirmed active).
+    # Override with ALPACA_DATA_FEED=iex only for free/paper-only accounts.
+    feed_env  = os.environ.get("ALPACA_DATA_FEED", "sip").lower()
     feed      = DataFeed.SIP if feed_env == "sip" else DataFeed.IEX
 
     global _subscribed_tickers, _pending_tickers, _wss_ref, _on_trade_ref
