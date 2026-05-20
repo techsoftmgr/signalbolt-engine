@@ -1288,6 +1288,39 @@ async def cancel_subscription(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.delete("/delete-account")
+async def delete_account(request: Request):
+    """
+    Permanently delete the authenticated user's account.
+    Requires a valid Supabase Bearer token in Authorization header.
+    Deletes: auth.users row (via admin API) + signals + profiles.
+    """
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="No auth token provided")
+    try:
+        sb = _make_supabase()
+        # Verify token and get user ID
+        user_resp = sb.auth.get_user(token)
+        if not user_resp or not user_resp.user:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        user_id = user_resp.user.id
+
+        # Delete profile data (signals cascade if FK set up, else delete explicitly)
+        sb.table("profiles").delete().eq("id", user_id).execute()
+
+        # Delete auth user using admin API (requires service role key)
+        sb.auth.admin.delete_user(user_id)
+
+        logger.info(f"Account deleted for user {user_id}")
+        return {"status": "deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"DELETE /delete-account error: {e}")
+        raise HTTPException(status_code=500, detail="Account deletion failed")
+
+
 @app.get("/invoices")
 async def get_invoices(user_id: str):
     """Return the last 10 Stripe invoices for the user."""
