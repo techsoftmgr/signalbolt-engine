@@ -1,0 +1,36 @@
+# Fly.io configuration for signalbolt-engine
+# Deployed as fallback when Railway is unavailable.
+
+app = "signalbolt-engine"
+primary_region = "iad"   # US East — closest to NYSE/NASDAQ
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+
+[http_service]
+  internal_port       = 8080
+  force_https         = true
+  auto_stop_machines  = false   # NEVER sleep — keeps Alpaca stream alive
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type       = "connections"
+    hard_limit = 250
+    soft_limit = 200
+
+[[vm]]
+  size   = "shared-cpu-1x"   # free tier VM
+  memory = "256mb"
+
+[checks]
+  [checks.health]
+    grace_period = "30s"
+    interval     = "15s"
+    method       = "GET"
+    path         = "/health"
+    protocol     = "http"
+    timeout      = "10s"
