@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import time
@@ -570,7 +571,7 @@ async def ws_prices(websocket: WebSocket):
             from engine.stream import subscribe_extra_tickers
             extra = [t for t in tickers if t not in set(_ALL_TICKERS)]
             if extra:
-                asyncio.create_task(subscribe_extra_tickers(extra))
+                _asyncio.create_task(subscribe_extra_tickers(extra))
         except Exception as _dyn_e:
             logger.debug(f"[ws/prices] dynamic subscribe setup error: {_dyn_e}")
 
