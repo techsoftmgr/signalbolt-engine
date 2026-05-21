@@ -145,18 +145,32 @@ def get_missing_confirmations(
     analysis:    dict,
     score_result: dict,
     regime:      dict,
-    chop:        dict,
+    chop,                   # ChopResult object OR dict OR None
 ) -> list[str]:
     """
     Returns a human-readable list of what confirmations the setup is missing
     to reach CONFIRMED_SIGNAL threshold. Shown to users in the "Developing Setup" card.
+
+    chop accepts: ChopResult dataclass, plain dict, or None — all handled safely.
     """
     missing: list[str] = []
 
     breakdown   = score_result.get("breakdown", {})
     total       = score_result.get("total", 0)
     direction   = analysis.get("direction", "")
-    regime_type = regime.get("regime_type", "UNKNOWN")
+    regime_type = (regime or {}).get("regime_type", "UNKNOWN")
+
+    # ── Safely extract chop fields from any input type ─────────
+    if chop is None:
+        chop_vol_ratio = 1.0
+        chop_score_val = 0.0
+    elif isinstance(chop, dict):
+        chop_vol_ratio = chop.get("vol_ratio", 1.0)
+        chop_score_val = chop.get("chop_score", 0.0)
+    else:
+        # ChopResult dataclass
+        chop_vol_ratio = getattr(chop, "vol_ratio", 1.0)
+        chop_score_val = getattr(chop, "chop_score", 0.0)
 
     # Structure: L1 weak
     l1 = breakdown.get("l1_smc", 0)
@@ -176,7 +190,7 @@ def get_missing_confirmations(
         missing.append("Higher-timeframe (4H) structure alignment")
 
     # Volume
-    if chop.get("vol_ratio", 1.0) < 0.80:
+    if chop_vol_ratio < 0.80:
         missing.append("Volume expansion (current volume below average)")
 
     # Regime
@@ -186,9 +200,8 @@ def get_missing_confirmations(
         missing.append("Ranging market — wait for breakout or use mean-reversion setup")
 
     # Chop
-    chop_score = chop.get("chop_score", 0)
-    if chop_score > 50:
-        missing.append(f"Cleaner price action (chop score={chop_score:.0f}/100)")
+    if chop_score_val > 50:
+        missing.append(f"Cleaner price action (chop score={chop_score_val:.0f}/100)")
 
     # Score gap
     gap = CONFIRMED_MIN - total
@@ -275,10 +288,31 @@ class SetupLifecycleManager:
     """
     Manages WATCHLIST/DEVELOPING setups in the setup_watchlist table.
     Promoted setups get written to the main signals table by the runner.
+
+    Supabase client is initialised lazily on first use so the class can be
+    instantiated at module-level without requiring env vars at import time.
     """
 
-    def __init__(self, sb: Client):
-        self.sb = sb
+    def __init__(self, sb: Optional[Client] = None):
+        self._sb_provided = sb   # optional pre-supplied client (tests / DI)
+        self._sb_lazy: Optional[Client] = None
+
+    @property
+    def sb(self) -> Client:
+        """Return a live Supabase client, creating one lazily if needed."""
+        if self._sb_provided is not None:
+            return self._sb_provided
+        if self._sb_lazy is None:
+            try:
+                from supabase import create_client
+                url = os.environ.get("SUPABASE_URL", "")
+                key = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_KEY", "")
+                if not url or not key:
+                    raise ValueError("SUPABASE_URL / SUPABASE_SERVICE_KEY not set")
+                self._sb_lazy = create_client(url, key)
+            except Exception as exc:
+                raise RuntimeError(f"SetupLifecycleManager: cannot connect to Supabase: {exc}") from exc
+        return self._sb_lazy
 
     def upsert_setup(
         self,
@@ -310,10 +344,16 @@ class SetupLifecycleManager:
         strategy   = analysis.get("strategy_type", "day_trade")
         breakdown  = score_result.get("breakdown", {})
         regime_t   = (regime or {}).get("regime_type", "")
-        chop_score = chop_result.get("chop_score", 0) if chop_result else 0
+        # Handle ChopResult dataclass or dict or None
+        if chop_result is None:
+            chop_score = 0
+        elif isinstance(chop_result, dict):
+            chop_score = chop_result.get("chop_score", 0)
+        else:
+            chop_score = getattr(chop_result, "chop_score", 0)
 
-        # Compute missing confirmations
-        missing = get_missing_confirmations(analysis, score_result, regime or {}, chop_result or {})
+        # Compute missing confirmations (handles ChopResult, dict, or None)
+        missing = get_missing_confirmations(analysis, score_result, regime or {}, chop_result)
 
         # Determine grades
         conf_grade = classify_confidence_grade(score)
