@@ -60,7 +60,13 @@ def _get_tokens() -> list[str]:
         return _token_cache   # return stale cache rather than empty on transient error
 
 
-def send_signal_alert(ticker: str, direction: str, confidence: int, signal_type: str = "stock") -> None:
+def send_signal_alert(
+    ticker: str,
+    direction: str,
+    confidence: int,
+    signal_type: str = "stock",
+    signal_id: str | None = None,
+) -> None:
     """Send a push notification to all registered devices when a signal fires."""
     tokens = _get_tokens()
     if not tokens:
@@ -70,12 +76,17 @@ def send_signal_alert(ticker: str, direction: str, confidence: int, signal_type:
     emoji = "📈" if direction == "LONG" else "📉"
     type_label = "Options" if signal_type == "option" else "Stock"
 
+    # Include signal_id so tapping the notification deep-links straight to the signal card
+    notif_data: dict = {"ticker": ticker, "direction": direction, "type": signal_type}
+    if signal_id:
+        notif_data["signal_id"] = signal_id
+
     messages = [
         {
             "to":    token,
             "title": f"{emoji} New {type_label} Signal: {ticker}",
             "body":  f"{direction} · {confidence}% confidence · Tap to view details",
-            "data":  {"ticker": ticker, "direction": direction, "type": signal_type},
+            "data":  notif_data,
             "sound": "default",
             "badge": 1,
         }

@@ -234,7 +234,8 @@ def _record_stop_hit(ticker: str, strategy_type: str) -> None:
     logger.info(f"[runner] {ticker} [{strategy_type}] stop cooldown started (45 min)")
 
 
-def _write_signal(sb: Client, row: dict) -> None:
+def _write_signal(sb: Client, row: dict) -> str | None:
+    """Insert signal row, log the 'fired' event, and return the new signal ID."""
     try:
         result = sb.table("signals").insert(row).execute()
         logger.info(
@@ -242,6 +243,7 @@ def _write_signal(sb: Client, row: dict) -> None:
             f"[{row.get('strategy_type','?')}]  entry={row['entry_price']}  score={row['confidence_score']}"
         )
         # Log the initial "fired" event so History always has a starting entry
+        sig_id: str | None = None
         try:
             sig_id = result.data[0]["id"] if result.data else None
             if sig_id:
@@ -266,8 +268,10 @@ def _write_signal(sb: Client, row: dict) -> None:
                 }).execute()
         except Exception as _e:
             logger.debug(f"[runner] fired event log failed: {_e}")
+        return sig_id   # caller uses this for push deep-link
     except Exception as e:
         logger.error(f"[runner] Supabase insert failed for {row['ticker']}: {e}")
+    return None
 
 
 def _has_active_option_signal(sb: Client, ticker: str) -> bool:
@@ -285,15 +289,18 @@ def _has_active_option_signal(sb: Client, ticker: str) -> bool:
         return False
 
 
-def _write_option_signal(sb: Client, row: dict) -> None:
+def _write_option_signal(sb: Client, row: dict) -> str | None:
+    """Insert option signal row and return the new option signal ID."""
     try:
-        sb.table("option_signals").insert(row).execute()
+        result = sb.table("option_signals").insert(row).execute()
         logger.info(
             f"[runner] OPTION SAVED  {row['ticker']:6s} {row['contract_type']:4s} "
             f"strike={row['strike_price']}  exp={row['expiry_date']}  score={row['confidence_score']}"
         )
+        return result.data[0]["id"] if result.data else None
     except Exception as e:
         logger.error(f"[runner] Option signal insert failed for {row['ticker']}: {e}")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -842,7 +849,7 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
         "missing_confirmations": scored.get("missing_confirmations", []),
     }
     signal_row["ai_explanation"] = explainer.generate(signal_row, scored["breakdown"])
-    _write_signal(sb, signal_row)
+    new_sig_id = _write_signal(sb, signal_row)
 
     # ── Mark setup as promoted to CONFIRMED in lifecycle tracker ─
     try:
@@ -851,7 +858,10 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
         pass
 
     try:
-        push.send_signal_alert(ticker, direction, scored["total"], "stock")
+        push.send_signal_alert(
+            ticker, direction, scored["total"], "stock",
+            signal_id=str(new_sig_id) if new_sig_id else None,
+        )
     except Exception as e:
         logger.warning(f"[runner] Push notification failed for {ticker}: {e}")
 
@@ -869,9 +879,12 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
             opt["timeframe"]          = config["interval"]
             opt["strategy_type"]      = strategy_type
             opt["status"]             = "active"
-            _write_option_signal(sb, opt)
+            opt_sig_id = _write_option_signal(sb, opt)
             try:
-                push.send_signal_alert(ticker, direction, scored["total"], "option")
+                push.send_signal_alert(
+                    ticker, direction, scored["total"], "option",
+                    signal_id=str(opt_sig_id) if opt_sig_id else None,
+                )
             except Exception as e:
                 logger.warning(f"[runner] Push notification failed for option {ticker}: {e}")
 
@@ -965,10 +978,13 @@ def _process_dark_pool_ticker(sb: Client, ticker: str, config: dict,
         "score_breakdown":    scored.get("breakdown", {}),
     }
     signal_row["ai_explanation"] = explainer.generate(signal_row, scored["breakdown"])
-    _write_signal(sb, signal_row)
+    dark_sig_id = _write_signal(sb, signal_row)
 
     try:
-        push.send_signal_alert(ticker, direction, scored["total"], "stock")
+        push.send_signal_alert(
+            ticker, direction, scored["total"], "stock",
+            signal_id=str(dark_sig_id) if dark_sig_id else None,
+        )
     except Exception as e:
         logger.warning(f"[runner] Push failed for dark_pool {ticker}: {e}")
 
@@ -1062,10 +1078,13 @@ def _process_options_flow_ticker(sb: Client, ticker: str, config: dict,
         "score_breakdown":    scored.get("breakdown", {}),
     }
     signal_row["ai_explanation"] = explainer.generate(signal_row, scored["breakdown"])
-    _write_signal(sb, signal_row)
+    flow_sig_id = _write_signal(sb, signal_row)
 
     try:
-        push.send_signal_alert(ticker, direction, scored["total"], "stock")
+        push.send_signal_alert(
+            ticker, direction, scored["total"], "stock",
+            signal_id=str(flow_sig_id) if flow_sig_id else None,
+        )
     except Exception as e:
         logger.warning(f"[runner] Push failed for options_flow {ticker}: {e}")
 
