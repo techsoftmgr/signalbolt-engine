@@ -484,8 +484,20 @@ def _close_rt_signal(sig: dict, hit: str, price: float) -> None:
 def _handle_t1_rt(sig: dict, price: float) -> None:
     """
     T1 hit detected on a live trade tick (non-scalp signal).
-    Does NOT close the signal — instead moves stop-loss to breakeven
-    so any reversal is a scratch rather than a loss, then rides to T2.
+
+    Decision — engine uses its own analysis to decide close vs trail:
+
+      scalping   → already closed by _check_scalp_levels, never reaches here
+      day_trade  → regime-aware:
+                     TRENDING_BULL / TRENDING_BEAR  → trail to T2
+                       (move SL to breakeven, ride the momentum)
+                     RANGING / HIGH_VOL / PANIC / LOW_VOL → close at T1
+                       (take profit, structure unlikely to extend cleanly)
+      swing_trade → always trail to T2
+                       (designed for bigger moves; T1 is a milestone not an exit)
+
+    In all close cases: DB updated, card disappears, "Book Profit" push fires.
+    In all trail cases: SL moved to breakeven, "T1 Hit — Riding to T2" push fires.
     """
     try:
         key = os.environ.get("SUPABASE_KEY") or os.environ["SUPABASE_SECRET_KEY"]
@@ -493,38 +505,97 @@ def _handle_t1_rt(sig: dict, price: float) -> None:
         from engine import push as _push
         sb = _sc(os.environ["SUPABASE_URL"], key)
 
-        entry = float(sig["entry_price"])
-        pct   = abs(price - entry) / entry * 100
-        ticker = sig["ticker"]
+        entry    = float(sig["entry_price"])
+        is_long  = sig["direction"] == "LONG"
+        ticker   = sig["ticker"]
+        strategy = sig.get("strategy_type", "day_trade")
 
-        # Move SL to breakeven in DB
-        sb.table("signals").update({"stop_loss": round(entry, 4)}).eq("id", sig["id"]).execute()
+        pnl_pct = ((price - entry) / entry * 100) if is_long else ((entry - price) / entry * 100)
+        pnl_abs = (price - entry) if is_long else (entry - price)
 
-        # Timeline event
-        sb.table("signal_events").insert({
-            "signal_id":  sig["id"],
-            "event_type": "t1_hit",
-            "price":      price,
-            "note":       f"🎯 T1 hit @ ${price:.2f} (+{pct:.1f}%) — stop moved to breakeven ${entry:.2f}",
-        }).execute()
+        # ── Decide: close at T1 or trail to T2? ──────────────────────────────
+        # Swing always trails. Scalping never reaches here (handled by bar checker).
+        # Day trade defers to the cached regime — no extra API call needed.
+        should_trail = False
+        if strategy == "swing_trade":
+            should_trail = True
+        elif strategy == "day_trade":
+            try:
+                regime_type = _get_regime().get("regime_type", "RANGING")
+                should_trail = regime_type in ("TRENDING_BULL", "TRENDING_BEAR")
+            except Exception:
+                should_trail = False   # safe default: book the profit
 
-        # Push notification
-        try:
-            _push._send_raw(
-                title=f"🎯 T1 Hit — {ticker}  +{pct:.1f}%",
-                body=f"Stop moved to breakeven. Riding to T2. {sig['direction']} still open.",
-                data={"type": "t1_breakeven", "ticker": ticker},
+        if should_trail:
+            # ── TRAIL: move SL to breakeven, keep riding to T2 ───────────────
+            sb.table("signals").update(
+                {"stop_loss": round(entry, 4)}
+            ).eq("id", sig["id"]).execute()
+
+            sb.table("signal_events").insert({
+                "signal_id":  sig["id"],
+                "event_type": "t1_hit",
+                "price":      price,
+                "note":       (
+                    f"🎯 T1 hit @ ${price:.2f} (+{pnl_pct:.1f}%) — "
+                    f"stop moved to breakeven ${entry:.2f}, riding to T2"
+                ),
+            }).execute()
+
+            try:
+                _push._send_raw(
+                    title=f"🎯 T1 Hit — {ticker}  +{pnl_pct:.1f}%",
+                    body=f"Trending regime — stop at breakeven. Riding to T2. {sig['direction']} open.",
+                    data={"type": "t1_breakeven", "ticker": ticker},
+                )
+            except Exception:
+                pass
+
+            # Update local cache SL so T1 doesn't re-trigger on next tick
+            sig["stop_loss"] = entry
+
+            logger.info(
+                f"[stream] 🎯 T1 TRAIL {ticker} {sig['direction']} "
+                f"price={price:.2f} pnl=+{pnl_pct:.2f}% regime=trending — riding to T2"
             )
-        except Exception:
-            pass
 
-        # Update local cache so T1 doesn't re-trigger on next tick
-        sig["stop_loss"] = entry
+        else:
+            # ── CLOSE: book profit at T1, signal done ────────────────────────
+            sb.table("signals").update({
+                "status":        "closed",
+                "result":        "win",
+                "hit_target":    "t1",
+                "result_pct":    round(pnl_pct, 4),
+                "result_pnl":    round(pnl_abs, 4),
+                "closed_reason": "target_hit",
+                "closed_at":     datetime.now(timezone.utc).isoformat(),
+            }).eq("id", sig["id"]).execute()
 
-        logger.info(
-            f"[stream] ⚡ RT T1 HIT {ticker} {sig['direction']} "
-            f"price={price:.2f} pct=+{pct:.2f}% — SL moved to breakeven"
-        )
+            sb.table("signal_events").insert({
+                "signal_id":  sig["id"],
+                "event_type": "closed_win",
+                "price":      price,
+                "note":       f"✅ T1 hit @ ${price:.2f} — profit booked +{pnl_pct:.1f}%",
+            }).execute()
+
+            try:
+                strat_label = strategy.replace("_", " ")
+                _push._send_raw(
+                    title=f"✅ Book Profit — {ticker}  +{pnl_pct:.1f}%",
+                    body=f"T1 hit on {sig['direction']} {strat_label}. Profit locked in at ${price:.2f}.",
+                    data={"type": "signal_closed", "result": "win", "ticker": ticker},
+                )
+            except Exception:
+                pass
+
+            # Evict from cache immediately — prevents duplicate close on next tick
+            sigs = _rt_cache.get(ticker, [])
+            _rt_cache[ticker] = [s for s in sigs if s["id"] != sig["id"]]
+
+            logger.info(
+                f"[stream] ✅ T1 BOOKED {ticker} {sig['direction']} "
+                f"price={price:.2f} pnl=+{pnl_pct:.2f}% strategy={strategy}"
+            )
 
     except Exception as e:
         logger.debug(f"[stream] RT T1 handler failed for {sig.get('id')}: {e}")
