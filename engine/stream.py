@@ -478,13 +478,15 @@ def _close_rt_signal(sig: dict, hit: str, price: float) -> None:
                 _push._send_raw(
                     title=f"✅ T2 Hit — {ticker}  +{pnl_pct:.1f}%",
                     body=f"{sig['direction']} {(sig.get('strategy_type') or 'signal').replace('_',' ')} closed at full target.",
-                    data={"type": "signal_closed", "result": "win", "ticker": ticker},
+                    data={"type": "signal_closed", "result": "win", "ticker": ticker,
+                          "signal_id": str(sig["id"])},
                 )
             else:
                 _push._send_raw(
                     title=f"🔴 Stop Hit — {ticker}  {pnl_pct:.1f}%",
                     body=f"{sig['direction']} stopped out. Position closed.",
-                    data={"type": "signal_closed", "result": "loss", "ticker": ticker},
+                    data={"type": "signal_closed", "result": "loss", "ticker": ticker,
+                          "signal_id": str(sig["id"])},
                 )
         except Exception:
             pass
@@ -575,7 +577,8 @@ def _handle_t1_rt(sig: dict, price: float) -> None:
                 _push._send_raw(
                     title=f"🎯 T1 Hit — {ticker}  +{pnl_pct:.1f}%",
                     body=f"Trending regime — stop at breakeven. Riding to T2. {sig['direction']} open.",
-                    data={"type": "t1_breakeven", "ticker": ticker},
+                    data={"type": "t1_breakeven", "ticker": ticker,
+                          "signal_id": str(sig["id"])},
                 )
             except Exception:
                 pass
@@ -612,7 +615,8 @@ def _handle_t1_rt(sig: dict, price: float) -> None:
                 _push._send_raw(
                     title=f"✅ Book Profit — {ticker}  +{pnl_pct:.1f}%",
                     body=f"T1 hit on {sig['direction']} {strat_label}. Profit locked in at ${price:.2f}.",
-                    data={"type": "signal_closed", "result": "win", "ticker": ticker},
+                    data={"type": "signal_closed", "result": "win", "ticker": ticker,
+                          "signal_id": str(sig["id"])},
                 )
             except Exception:
                 pass
