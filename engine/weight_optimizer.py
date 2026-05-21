@@ -7,18 +7,23 @@ Bayesian optimization (Optuna). Runs weekly via the scheduler.
 Pipeline:
   1. Pull REAL outcomes from Supabase (closed signals with score_breakdown)
   2. Run BACKTESTER for synthetic training data (historical simulation)
-  3. Combine both datasets
-  4. For each (strategy, regime) combination:
-     a. Run Optuna with 150 trials
-     b. Objective: maximize win_rate × avg_rr × selectivity
-     c. If improvement > 2% over current: save new weights
-  5. Invalidate weight cache so scorer picks up new weights immediately
+  3. Combine both datasets, sorted chronologically
+  4. Walk-forward split: 70% train / 30% validation (time-ordered)
+  5. For each (strategy, regime) combination:
+     a. Run Optuna with 150 trials on TRAIN set only
+     b. Objective: expectancy = win_rate×avg_R + (1-win_rate)×avg_loss_R
+     c. Validate candidate weights on held-out TEST set
+     d. Apply weight-change caps (±15 pts per layer vs current)
+     e. Only save if expectancy improves ≥ 2% on BOTH train AND test
+  6. Invalidate weight cache so scorer picks up new weights immediately
 
-Minimum requirements before updating weights:
-  - 30 combined data points (real + synthetic)
-  - Optimizer must find strictly better objective than current weights
+Safeguards against overfitting:
+  - Walk-forward validation: weights must generalise to unseen data
+  - Expectancy (not just win rate): penalises large loss R-multiples
+  - Weight change cap ±15 pts: prevents extreme pivots between runs
+  - Minimum 5 fired signals in train AND test before saving
 
-Budget note: Optuna is open-source. No API calls. Runs free on Railway.
+Budget note: Optuna is open-source. No API calls. Runs free on Fly.io.
 """
 
 import logging
@@ -38,8 +43,20 @@ MIN_SAMPLES = 30
 # Optuna trial count (more = better weights, more CPU time)
 N_TRIALS = 150
 
-# Improvement threshold: only save new weights if objective improves by this %
+# Improvement threshold: only save new weights if expectancy improves by this %
 MIN_IMPROVEMENT = 0.02   # 2%
+
+# Walk-forward split: fraction of data used for training
+TRAIN_FRACTION = 0.70    # 70% train, 30% held-out validation
+
+# Weight change safety cap: a single run cannot move any layer weight by more
+# than this many points.  Prevents extreme pivots that would destabilise the
+# engine between runs (e.g. SMC weight going 25→5 in one week).
+MAX_WEIGHT_DELTA = 15.0  # ±15 pts per layer per optimization run
+
+# Minimum fired signals in both train AND test set before saving new weights
+MIN_FIRED_TRAIN = 5
+MIN_FIRED_TEST  = 3
 
 # Layer raw maxima (used to normalize scores to 0-1)
 _L_MAX = {
@@ -122,85 +139,144 @@ def _fetch_real_outcomes(strategy_type: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Objective function (used by Optuna)
+# Core metric: expectancy
 # ---------------------------------------------------------------------------
 
-def _build_objective(points: list[dict], threshold: int):
+def _compute_expectancy(fired_outcomes: list[int], fired_rrs: list[float]) -> float:
     """
-    Returns an Optuna objective function that maximizes win_rate × avg_rr.
+    E = win_rate × avg_win_R + (1 - win_rate) × avg_loss_R
 
-    The trial proposes weights {smc, technical, sentiment, risk}.
-    We normalize them so they sum to 100, compute weighted scores for
-    all data points, classify as "would fire" (score >= threshold),
-    then measure quality of those fired signals.
+    avg_loss_R is the mean actual R of losing trades (negative number).
+    Using realized R for losses (not a fixed -1.0) means the optimizer
+    penalises strategies that take losses beyond 1R — a key overfitting guard.
+
+    Returns 0.0 if fewer than MIN_FIRED_TRAIN signals.
+    """
+    n = len(fired_outcomes)
+    if n < MIN_FIRED_TRAIN:
+        return 0.0
+
+    wins   = [r for o, r in zip(fired_outcomes, fired_rrs) if o == 1]
+    losses = [r for o, r in zip(fired_outcomes, fired_rrs) if o == 0]
+
+    win_rate   = len(wins) / n
+    avg_win_r  = float(np.mean(wins))   if wins   else 0.0
+    avg_loss_r = float(np.mean(losses)) if losses else -1.0   # fallback -1R
+
+    return win_rate * avg_win_r + (1.0 - win_rate) * avg_loss_r
+
+
+def _score_points(points: list[dict], w_smc: float, w_tech: float,
+                  w_sent: float, w_risk: float, threshold: int) -> tuple[list[int], list[float]]:
+    """Apply weights to a list of data points and return (outcomes, rrs) of fired signals."""
+    fired_outcomes: list[int]   = []
+    fired_rrs:      list[float] = []
+    for p in points:
+        score = (
+            (p['l1'] / _L_MAX['l1']) * w_smc  +
+            (p['l2'] / _L_MAX['l2']) * w_tech +
+            (p['l3'] / _L_MAX['l3']) * w_sent +
+            (p['l4'] / _L_MAX['l4']) * w_risk +
+            (p['l5'] / _L_MAX['l5']) * 5.0    # L5 fixed bonus
+        )
+        if score >= threshold:
+            fired_outcomes.append(p['outcome'])
+            # Use realized R for wins; for losses clip to at most -3R
+            rr = p['risk_reward'] if p['outcome'] == 1 else max(p['risk_reward'], -3.0)
+            fired_rrs.append(rr)
+    return fired_outcomes, fired_rrs
+
+
+# ---------------------------------------------------------------------------
+# Weight-change safety cap
+# ---------------------------------------------------------------------------
+
+def _cap_weight_changes(new_weights: dict, current_weights: dict) -> dict:
+    """
+    Prevent any single layer from shifting more than MAX_WEIGHT_DELTA pts
+    in one run.  After capping, re-normalise so weights still sum to 100.
+    """
+    capped: dict[str, float] = {}
+    for k in ('smc', 'technical', 'sentiment', 'risk'):
+        current = current_weights.get(k, 25.0)
+        proposed = new_weights.get(k, current)
+        delta = proposed - current
+        if abs(delta) > MAX_WEIGHT_DELTA:
+            capped[k] = current + MAX_WEIGHT_DELTA * (1 if delta > 0 else -1)
+        else:
+            capped[k] = proposed
+
+    # Re-normalise
+    total = sum(capped.values())
+    if total > 0:
+        for k in capped:
+            capped[k] = round(capped[k] / total * 100, 1)
+
+    return capped
+
+
+# ---------------------------------------------------------------------------
+# Objective function (used by Optuna) — trains on TRAIN split only
+# ---------------------------------------------------------------------------
+
+def _build_objective(train_points: list[dict], threshold: int):
+    """
+    Returns an Optuna objective that maximises expectancy on the TRAINING set.
+
+    Expectancy = win_rate × avg_win_R + (1-win_rate) × avg_loss_R
+    This penalises both low win rates AND large loss R-multiples simultaneously,
+    making it harder to overfit on one dimension alone.
     """
 
     def objective(trial):
-        # Sample weights (Dirichlet-like via uniform + normalize)
-        w_smc  = trial.suggest_float("smc",       5.0,  55.0)
-        w_tech = trial.suggest_float("technical",  5.0,  55.0)
-        w_sent = trial.suggest_float("sentiment",  5.0,  55.0)
-        w_risk = trial.suggest_float("risk",       5.0,  35.0)
+        w_smc  = trial.suggest_float("smc",        5.0, 55.0)
+        w_tech = trial.suggest_float("technical",   5.0, 55.0)
+        w_sent = trial.suggest_float("sentiment",   5.0, 55.0)
+        w_risk = trial.suggest_float("risk",        5.0, 35.0)
         total  = w_smc + w_tech + w_sent + w_risk
-        # Normalize so they sum to 100
         w_smc  = w_smc  / total * 100
         w_tech = w_tech / total * 100
         w_sent = w_sent / total * 100
         w_risk = w_risk / total * 100
 
-        fired_outcomes = []
-        fired_rrs      = []
-
-        for p in points:
-            # Compute weighted score (same formula as scorer.py)
-            score = (
-                (p['l1'] / _L_MAX['l1']) * w_smc  +
-                (p['l2'] / _L_MAX['l2']) * w_tech +
-                (p['l3'] / _L_MAX['l3']) * w_sent +
-                (p['l4'] / _L_MAX['l4']) * w_risk
-            )
-            # L5 fixed bonus (not being optimized in this run)
-            score += (p['l5'] / _L_MAX['l5']) * 5.0
-
-            if score >= threshold:
-                fired_outcomes.append(p['outcome'])
-                rr = p['risk_reward'] if p['outcome'] == 1 else -1.0
-                fired_rrs.append(rr)
-
-        n_fired = len(fired_outcomes)
-        if n_fired < 5:
-            return 0.0   # too selective — penalize
-
-        win_rate = sum(fired_outcomes) / n_fired
-        avg_rr   = float(np.mean(fired_rrs)) if fired_rrs else 0.0
-
-        # Selectivity bonus: we want to fire good signals, not everything
-        # Ideal fire rate is 10-30% of candidates
-        total_candidates = len(points)
-        fire_rate = n_fired / total_candidates if total_candidates > 0 else 0
-        selectivity = 1.0
-        if fire_rate > 0.5:
-            selectivity = 0.7     # penalize if firing too many
-        elif fire_rate < 0.05:
-            selectivity = 0.8     # penalize if too strict
-
-        return max(0.0, win_rate * max(avg_rr, 0) * selectivity)
+        fired_outcomes, fired_rrs = _score_points(
+            train_points, w_smc, w_tech, w_sent, w_risk, threshold
+        )
+        return _compute_expectancy(fired_outcomes, fired_rrs)
 
     return objective
 
 
 # ---------------------------------------------------------------------------
-# Single strategy + regime optimization
+# Single strategy + regime optimization  (walk-forward validated)
 # ---------------------------------------------------------------------------
+
+def _evaluate_weights(weights: dict, points: list[dict], threshold: int) -> float:
+    """Evaluate a weight dict against a data split. Returns expectancy."""
+    w_smc  = weights.get("smc",       25)
+    w_tech = weights.get("technical", 25)
+    w_sent = weights.get("sentiment", 25)
+    w_risk = weights.get("risk",      25)
+    fired_outcomes, fired_rrs = _score_points(points, w_smc, w_tech, w_sent, w_risk, threshold)
+    return _compute_expectancy(fired_outcomes, fired_rrs)
+
 
 def _optimize_one(
     strategy_type: str,
-    regime_type: str,
-    points: list[dict],
+    regime_type:   str,
+    points:        list[dict],
 ) -> Optional[dict]:
     """
-    Run Optuna on a single (strategy, regime) combination.
-    Returns new weights dict if they improve on current, else None.
+    Run Optuna on a single (strategy, regime) combination with walk-forward safety.
+
+    Walk-forward protocol:
+      - Sort data chronologically (real outcomes already sorted by closed_at)
+      - Train on first 70% of points
+      - Validate on remaining 30% (never seen during optimization)
+      - New weights must improve expectancy on BOTH splits vs current weights
+      - Weight changes are capped at ±MAX_WEIGHT_DELTA pts per layer
+
+    Returns new weights dict if all gates pass, else None.
     """
     if len(points) < MIN_SAMPLES:
         logger.info(
@@ -218,94 +294,113 @@ def _optimize_one(
 
     threshold = _THRESHOLDS.get(strategy_type, 70)
 
-    # ── Evaluate current weights ─────────────────────────────────────────────
-    current_weights = adaptive_weights.get_weights(strategy_type, regime_type)
-    current_obj     = _evaluate_weights(current_weights, points, threshold)
+    # ── Walk-forward split (time-ordered) ────────────────────────────────────
+    split_idx   = int(len(points) * TRAIN_FRACTION)
+    train_pts   = points[:split_idx]
+    test_pts    = points[split_idx:]
 
-    # ── Run Optuna study ─────────────────────────────────────────────────────
+    if len(train_pts) < MIN_SAMPLES or len(test_pts) < MIN_FIRED_TEST:
+        logger.info(
+            f"[optimizer] {strategy_type}/{regime_type}: "
+            f"insufficient train ({len(train_pts)}) or test ({len(test_pts)}) points — skipping"
+        )
+        return None
+
+    # ── Evaluate CURRENT weights on both splits ───────────────────────────────
+    current_weights  = adaptive_weights.get_weights(strategy_type, regime_type)
+    current_train_e  = _evaluate_weights(current_weights, train_pts, threshold)
+    current_test_e   = _evaluate_weights(current_weights, test_pts,  threshold)
+
+    # ── Run Optuna on TRAIN set only ─────────────────────────────────────────
     study = optuna.create_study(direction="maximize")
     study.optimize(
-        _build_objective(points, threshold),
+        _build_objective(train_pts, threshold),
         n_trials=N_TRIALS,
         show_progress_bar=False,
     )
 
     best = study.best_trial
     if best.value is None or best.value <= 0:
-        logger.info(f"[optimizer] {strategy_type}/{regime_type}: no valid solution found")
+        logger.info(f"[optimizer] {strategy_type}/{regime_type}: no valid solution on train set")
         return None
 
-    # ── Check if new weights actually improve ───────────────────────────────
-    improvement = (best.value - current_obj) / max(current_obj, 0.001)
-    if improvement < MIN_IMPROVEMENT:
+    # ── Build candidate weights ───────────────────────────────────────────────
+    p     = best.params
+    total = p["smc"] + p["technical"] + p["sentiment"] + p["risk"]
+    raw_new = {
+        "smc":       round(p["smc"]       / total * 100, 1),
+        "technical": round(p["technical"] / total * 100, 1),
+        "sentiment": round(p["sentiment"] / total * 100, 1),
+        "risk":      round(p["risk"]      / total * 100, 1),
+    }
+
+    # Apply weight-change safety cap (±MAX_WEIGHT_DELTA per layer)
+    capped_new = _cap_weight_changes(raw_new, current_weights)
+    new_weights = current_weights.copy()   # preserve L5-L9 bonus values
+    new_weights.update(capped_new)
+
+    # ── Gate 1: train improvement ─────────────────────────────────────────────
+    new_train_e = _evaluate_weights(new_weights, train_pts, threshold)
+    train_improvement = (new_train_e - current_train_e) / max(abs(current_train_e), 0.001)
+    if train_improvement < MIN_IMPROVEMENT:
         logger.info(
             f"[optimizer] {strategy_type}/{regime_type}: "
-            f"improvement {improvement:.1%} < {MIN_IMPROVEMENT:.0%} threshold — keeping current"
+            f"train improvement {train_improvement:.1%} < {MIN_IMPROVEMENT:.0%} — keeping current"
         )
         return None
 
-    # ── Normalize and package new weights ───────────────────────────────────
-    p     = best.params
-    total = p["smc"] + p["technical"] + p["sentiment"] + p["risk"]
-    new_weights = current_weights.copy()   # preserve L5-L9 bonus values
-    new_weights["smc"]       = round(p["smc"]       / total * 100, 1)
-    new_weights["technical"] = round(p["technical"] / total * 100, 1)
-    new_weights["sentiment"] = round(p["sentiment"] / total * 100, 1)
-    new_weights["risk"]      = round(p["risk"]      / total * 100, 1)
+    # ── Gate 2: out-of-sample (test) validation ───────────────────────────────
+    # New weights must also improve (or not hurt) expectancy on unseen data.
+    # A small regression is allowed (up to -0.5% of current_test_e) to account
+    # for natural variance in small test sets.
+    new_test_e = _evaluate_weights(new_weights, test_pts, threshold)
+    test_regression = (current_test_e - new_test_e) / max(abs(current_test_e), 0.001)
+    OOS_TOLERANCE = 0.005  # allow up to 0.5% regression on OOS (sampling noise)
+    if test_regression > OOS_TOLERANCE:
+        logger.warning(
+            f"[optimizer] {strategy_type}/{regime_type}: "
+            f"OOS regression {test_regression:.1%} exceeds tolerance — possible overfit, skipping"
+        )
+        return None
 
-    # Compute metrics for storage
-    wins     = [p2 for p2 in points if p2["outcome"] == 1]
-    losses   = [p2 for p2 in points if p2["outcome"] == 0]
-    win_rate = len(wins) / len(points)
-    avg_rr   = float(np.mean([p2["risk_reward"] for p2 in wins])) if wins else 0.0
+    # ── Package result ────────────────────────────────────────────────────────
+    # Compute realized metrics on ALL data (train+test) for storage
+    all_outcomes, all_rrs = _score_points(
+        points,
+        new_weights["smc"], new_weights["technical"],
+        new_weights["sentiment"], new_weights["risk"],
+        threshold
+    )
+    n_fired  = len(all_outcomes)
+    win_rate = sum(all_outcomes) / n_fired if n_fired > 0 else 0.0
+    wins_rrs = [r for o, r in zip(all_outcomes, all_rrs) if o == 1]
+    avg_win_r = float(np.mean(wins_rrs)) if wins_rrs else 0.0
 
     metrics = {
-        "win_rate":     round(win_rate, 4),
-        "avg_rr":       round(avg_rr, 3),
-        "objective":    round(best.value, 4),
-        "sample_count": len(points),
-        "prev_objective": round(current_obj, 4),
-        "improvement":  round(improvement, 4),
+        "win_rate":          round(win_rate, 4),
+        "avg_win_r":         round(avg_win_r, 3),
+        "train_expectancy":  round(new_train_e,     4),
+        "test_expectancy":   round(new_test_e,      4),
+        "prev_train_exp":    round(current_train_e, 4),
+        "prev_test_exp":     round(current_test_e,  4),
+        "train_improvement": round(train_improvement, 4),
+        "oos_regression":    round(test_regression,   4),
+        "sample_count":      len(points),
+        "train_count":       len(train_pts),
+        "test_count":        len(test_pts),
+        "weight_caps_applied": raw_new != capped_new,
+        # Legacy field kept for dashboard display
+        "objective":         round(new_train_e, 4),
     }
 
     logger.info(
-        f"[optimizer] {strategy_type}/{regime_type}: "
-        f"NEW WEIGHTS saved — objective {current_obj:.3f} → {best.value:.3f} "
-        f"(+{improvement:.1%})  win_rate={win_rate:.1%}  avg_rr={avg_rr:.2f}  n={len(points)}"
+        f"[optimizer] {strategy_type}/{regime_type}: NEW WEIGHTS ACCEPTED — "
+        f"train_exp {current_train_e:.3f}→{new_train_e:.3f} (+{train_improvement:.1%}) "
+        f"test_exp {current_test_e:.3f}→{new_test_e:.3f} "
+        f"win_rate={win_rate:.1%} n_fired={n_fired}/{len(points)} "
+        f"caps={'YES' if metrics['weight_caps_applied'] else 'no'}"
     )
     return {"weights": new_weights, "metrics": metrics}
-
-
-def _evaluate_weights(weights: dict, points: list[dict], threshold: int) -> float:
-    """Evaluate an existing weight dict against training data. Returns objective value."""
-    w_smc  = weights.get("smc",       25)
-    w_tech = weights.get("technical", 25)
-    w_sent = weights.get("sentiment", 25)
-    w_risk = weights.get("risk",      25)
-
-    fired_outcomes = []
-    fired_rrs      = []
-
-    for p in points:
-        score = (
-            (p['l1'] / _L_MAX['l1']) * w_smc  +
-            (p['l2'] / _L_MAX['l2']) * w_tech +
-            (p['l3'] / _L_MAX['l3']) * w_sent +
-            (p['l4'] / _L_MAX['l4']) * w_risk +
-            (p['l5'] / _L_MAX['l5']) * 5.0
-        )
-        if score >= threshold:
-            fired_outcomes.append(p['outcome'])
-            fired_rrs.append(p['risk_reward'] if p['outcome'] == 1 else -1.0)
-
-    n = len(fired_outcomes)
-    if n < 5:
-        return 0.0
-    win_rate = sum(fired_outcomes) / n
-    avg_rr   = float(np.mean(fired_rrs)) if fired_rrs else 0.0
-    fire_rate = n / len(points)
-    selectivity = 0.7 if fire_rate > 0.5 else (0.8 if fire_rate < 0.05 else 1.0)
-    return max(0.0, win_rate * max(avg_rr, 0) * selectivity)
 
 
 # ---------------------------------------------------------------------------

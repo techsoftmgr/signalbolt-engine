@@ -355,37 +355,54 @@ def detect_fvg(df: pd.DataFrame, max_age_bars: int = 30) -> dict:
 # Order Blocks
 # ---------------------------------------------------------------------------
 
-def detect_order_blocks(df: pd.DataFrame) -> dict:
+def detect_order_blocks(
+    df: pd.DataFrame,
+    atr: float = 0.0,
+    price: float = 0.0,
+) -> dict:
     """
-    Bullish OB: last bearish candle before a strong bullish impulse (>0.3% body move)
-    Bearish OB: last bullish candle before a strong bearish impulse
+    Bullish OB: last bearish candle before a strong bullish impulse.
+    Bearish OB: last bullish candle before a strong bearish impulse.
     Returns the most recently formed OB for each direction.
+
+    Impulse threshold is ATR-relative when ATR/price are provided.
+    Institutional OBs need at least 0.8× ATR body move.  Falls back
+    to the static 0.6% minimum when ATR data is unavailable.
     """
     bullish_ob: Optional[dict] = None
     bearish_ob: Optional[dict] = None
 
+    # ATR-relative impulse floor: 0.8× ATR but never below 0.6% of price
+    # This prevents flagging noise candles as OBs on high-volatility tickers
+    # (e.g. NVDA's 0.6% is $3 — that's noise, not institutional intent)
+    if atr > 0 and price > 0:
+        min_impulse_abs = max(atr * 0.8, price * 0.006)  # whichever is larger
+        min_impulse_pct = min_impulse_abs / price
+    else:
+        min_impulse_pct = 0.006   # static 0.6% fallback
+
     for i in range(1, len(df) - 1):
         curr = df.iloc[i]
-        nxt = df.iloc[i + 1]
+        nxt  = df.iloc[i + 1]
 
         if curr["close"] < curr["open"]:  # bearish candle
             body_move = (nxt["close"] - nxt["open"]) / nxt["open"] if nxt["open"] else 0
-            # ↑ threshold 0.003→0.006: real institutional OBs need 0.6%+ impulse moves.
-            # 0.3% is normal price noise — flagging it produces fake OB scores.
-            if body_move > 0.006:
+            if body_move > min_impulse_pct:
                 bullish_ob = {
                     "top":    float(curr["open"]),
                     "bottom": float(curr["close"]),
                     "ts":     curr.get("timestamp"),
+                    "impulse_pct": round(body_move * 100, 3),
                 }
 
         if curr["close"] > curr["open"]:  # bullish candle
             body_move = (nxt["open"] - nxt["close"]) / nxt["open"] if nxt["open"] else 0
-            if body_move > 0.006:
+            if body_move > min_impulse_pct:
                 bearish_ob = {
                     "top":    float(curr["close"]),
                     "bottom": float(curr["open"]),
                     "ts":     curr.get("timestamp"),
+                    "impulse_pct": round(body_move * 100, 3),
                 }
 
     return {"ob_bullish": bullish_ob, "ob_bearish": bearish_ob}
@@ -583,12 +600,15 @@ def analyze(
 
         df = detect_swings(df)
         structure = detect_structure(df)
-        fvgs = detect_fvg(df)
-        obs = detect_order_blocks(df)
 
         price = float(df["close"].iloc[-1])
         avg_volume = float(df["volume"].mean())
         last_volume = float(df["volume"].iloc[-1])
+
+        # Compute ATR early so OB detection can use ATR-relative threshold
+        atr = _calculate_atr(df)
+        fvgs = detect_fvg(df)
+        obs  = detect_order_blocks(df, atr=atr, price=price)
 
         # ── Volume gate for intraday strategies ───────────────────────────────
         # Use the 2nd-to-last bar (last COMPLETED bar) to avoid partial current bar.
@@ -614,8 +634,7 @@ def analyze(
         has_bearish_struct = structure["bos_bearish"] or structure["choch_bearish"]
 
         if not has_bullish_struct and not has_bearish_struct:
-            # No structural breakout → ranging/choppy market, skip
-            direction = None
+            direction = None   # no structural breakout
         elif has_bullish_struct and not has_bearish_struct:
             direction = "LONG"
         elif has_bearish_struct and not has_bullish_struct:
@@ -625,9 +644,52 @@ def analyze(
         elif structure["choch_bearish"] and not structure["choch_bullish"]:
             direction = "SHORT"
         else:
-            # Both bullish and bearish structural breaks — conflicting, skip
-            direction = None
+            direction = None    # conflict — let smc_quality resolve below
 
+        # ── SMC Quality enrichment ────────────────────────────────────────────
+        # Runs smc_quality.enrich() to:
+        #   1. Resolve conflicting structure (instead of just skipping)
+        #   2. Score FVG/OB quality (ATR-relative, freshness-aware)
+        #   3. Attach quality flags (OB_VIOLATED, FVG_STALE, etc.)
+        quality_result = None
+        quality_meta: dict = {}
+        try:
+            from engine import smc_quality
+            _partial = {
+                "ticker":        ticker,
+                "direction":     direction,
+                "current_price": price,
+                "structure":     structure,
+                "fvgs":          fvgs,
+                "obs":           obs,
+                "candles":       df,
+                "strategy_type": strategy_type,
+            }
+            quality_result = smc_quality.enrich(_partial, df)
+
+            # Use quality resolver to settle conflicts / upgrade ambiguous direction
+            if direction is None and quality_result.direction_override not in (None, "AMBIGUOUS"):
+                direction = quality_result.direction_override
+                logger.info(
+                    f"[smc] {ticker}: structure conflict resolved by quality scorer → {direction}"
+                )
+
+            # Pack quality metadata into the analysis dict for scorer L1 enrichment
+            fq = quality_result.fvg_quality
+            oq = quality_result.ob_quality
+            sq = quality_result.structure_score
+            quality_meta = {
+                "fvg_quality_score":   round(fq.score, 1)  if fq else 0.0,
+                "ob_quality_score":    round(oq.score, 1)  if oq else 0.0,
+                "ob_is_violated":      oq.is_violated       if oq else False,
+                "structure_raw_score": round(sq.raw_score, 2) if sq else 0.0,
+                "quality_flags":       quality_result.quality_flags,
+                "overall_quality":     round(quality_result.overall_quality, 1),
+            }
+        except Exception as _qe:
+            logger.debug(f"[smc] quality enrichment skipped for {ticker}: {_qe}")
+
+        # After conflict resolution, if still no direction → skip
         sweep: dict = {}
         entry, stop_loss, target_one, target_two = (None, None, None, None)
         if direction:
@@ -654,6 +716,9 @@ def analyze(
             "candles":          df,
             "timeframe":        interval,
             "strategy_type":    strategy_type,
+            "atr":              round(atr, 4),
+            # SMC quality scores — used by scorer L1 and lifecycle manager
+            **quality_meta,
         }
     except Exception as e:
         logger.error(f"[smc] Analysis failed for {ticker}: {e}")
