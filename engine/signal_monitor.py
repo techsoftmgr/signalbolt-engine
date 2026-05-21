@@ -245,9 +245,11 @@ def _get_labels(direction: str) -> dict:
     return _STATUS_LABELS_SHORT if direction == "SHORT" else _STATUS_LABELS_LONG
 
 
-def _log_status_event(sb: Client, sig_id: str, status: str,
-                      price: float | None, direction: str = "LONG",
-                      extra: str = "") -> None:
+def _log_status_event(
+    sb: Client, sig_id: str, status: str,
+    price: float | None, direction: str = "LONG",
+    extra: str = "", stop_loss: float | None = None,
+) -> None:
     """Log a status-change event to signal_events timeline."""
     emoji, base_label = _get_labels(direction).get(status, ("•", status))
     note = f"{emoji} {base_label}"
@@ -255,6 +257,14 @@ def _log_status_event(sb: Client, sig_id: str, status: str,
         note += f" — {extra}"
     if price:
         note += f" (${price:.2f})"
+    # For near_stop events: show the stop level and whether price has crossed it
+    if status == "near_stop" and price is not None and stop_loss is not None:
+        is_long = direction == "LONG"
+        dist = price - stop_loss if is_long else stop_loss - price
+        if dist < 0:
+            note += f" · ⚠️ Stop ${stop_loss:.2f} already crossed"
+        else:
+            note += f" · Stop ${stop_loss:.2f} (${dist:.2f} away)"
     _log_event(sb, sig_id, status, price=price, note=note)
 
 
@@ -635,7 +645,8 @@ def _monitor_stocks(sb: Client) -> None:
                 _STATUS_CACHE[sig["id"]] = new_status
                 _log_status_event(sb, sig["id"], new_status, price,
                                   direction=direction,
-                                  extra=f"{'+' if pnl_pct >= 0 else ''}{pnl_pct:.1f}%")
+                                  extra=f"{'+' if pnl_pct >= 0 else ''}{pnl_pct:.1f}%",
+                                  stop_loss=sl)
                 # Push notification for important transitions only
                 push_statuses = {"near_stop", "strong_profit", "at_target"}
                 if new_status in push_statuses:
