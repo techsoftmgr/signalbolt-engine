@@ -117,7 +117,8 @@ COMMENT ON TABLE analytics_reports IS
 -- setup_watchlist: engine writes (service role), app reads (anon for their own data)
 ALTER TABLE setup_watchlist ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY IF NOT EXISTS "Service role full access"
+DROP POLICY IF EXISTS "Service role full access" ON setup_watchlist;
+CREATE POLICY "Service role full access"
   ON setup_watchlist FOR ALL
   TO service_role
   USING (true)
@@ -126,13 +127,15 @@ CREATE POLICY IF NOT EXISTS "Service role full access"
 -- analytics_reports: engine writes, authenticated users read
 ALTER TABLE analytics_reports ENABLE ROW LEVEL SECURITY;
 
-CREATE POLICY IF NOT EXISTS "Service role full access"
+DROP POLICY IF EXISTS "Service role full access" ON analytics_reports;
+CREATE POLICY "Service role full access"
   ON analytics_reports FOR ALL
   TO service_role
   USING (true)
   WITH CHECK (true);
 
-CREATE POLICY IF NOT EXISTS "Authenticated users can read reports"
+DROP POLICY IF EXISTS "Authenticated users can read reports" ON analytics_reports;
+CREATE POLICY "Authenticated users can read reports"
   ON analytics_reports FOR SELECT
   TO authenticated
   USING (true);
