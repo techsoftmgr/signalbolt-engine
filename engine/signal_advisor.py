@@ -165,12 +165,17 @@ def _check_adverse_move(
     is_long = sig["direction"] == "LONG"
     ticker  = sig["ticker"]
 
+    # Swing trades tolerate larger intraday moves — 0.8% in 60s is normal
+    # multi-day volatility and should not trigger an alert. Raise to 1.5%.
+    strategy  = sig.get("strategy_type", "day_trade")
+    threshold = 1.5 if strategy == "swing_trade" else 0.8
+
     if is_long:
         recent_high = max(recent)
         if recent_high <= 0:
             return False, "", ""
         drop_pct = (recent_high - price) / recent_high * 100
-        if drop_pct >= 0.8:
+        if drop_pct >= threshold:
             return (
                 True,
                 f"⚠️ Sudden Dump — {ticker}  -{drop_pct:.1f}% in 60s",
@@ -182,7 +187,7 @@ def _check_adverse_move(
         if recent_low <= 0:
             return False, "", ""
         spike_pct = (price - recent_low) / recent_low * 100
-        if spike_pct >= 0.8:
+        if spike_pct >= threshold:
             return (
                 True,
                 f"⚠️ Sudden Spike — {ticker}  +{spike_pct:.1f}% in 60s",

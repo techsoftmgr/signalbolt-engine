@@ -49,6 +49,10 @@ logger = logging.getLogger("signalbolt.monitor")
 _STATUS_CACHE: dict[str, str] = {}
 # Track which signals have already received an EOD warning this session
 _EOD_WARNED: set[str] = set()
+# Swing trailing stop — tracks the best (peak) price seen after T1 hit per signal.
+# Updated every monitor pass while the swing signal is between T1 and T2.
+# Evicted when the signal closes via any path.
+_SWING_PEAK: dict[str, float] = {}   # signal_id → peak price after T1
 
 ET = ZoneInfo("America/New_York")
 
@@ -681,48 +685,124 @@ def _monitor_stocks(sb: Client) -> None:
         except Exception as e:
             logger.debug(f"[monitor] T1 check error for {ticker}: {e}")
 
-        # ── 5. Intelligent early booking ──────────────────────────────────────
-        # Book profit early when quant conditions indicate momentum is failing.
-        # Only applies to in-profit signals that are building/strong profit.
+        # ── 4b. Swing trailing stop — ride the trend after T1 ─────────────────
+        #
+        # Problem this solves: swing signals were closing too early via early
+        # booking (RSI/MACD checks) when the trend had many more % to run.
+        # Example: VLO SHORT booked at +1.79% but continued to +4–5%.
+        #
+        # Logic:
+        #   • Only runs for swing_trade signals that have hit T1 (stop = breakeven)
+        #   • Tracks the BEST price seen since T1 (peak for LONG, trough for SHORT)
+        #   • When price RETRACES 40% of the peak move from T1 → close and lock profit
+        #   • Minimum move of 1% from T1 before trailing activates (avoid noise)
+        #
+        # Why 40% retrace? It catches genuine reversals while ignoring typical
+        # swing-trade pullbacks. A 40% retrace of a strong move indicates momentum
+        # is genuinely turning — not just a pause.
         try:
-            current_status = _STATUS_CACHE.get(sig["id"], "")
-            should_assess  = current_status in ("building_profit", "strong_profit") and pnl_pct > 0.5
-
-            if should_assess:
-                book_now, reason = _momentum_check(ticker, direction)
-
-                # Book early if signal has been stalling for >3h with no progress
-                # (was 2h — raised to 3h to give trades more room to breathe)
-                if not book_now and age_mins > 180 and current_status == "building_profit":
-                    book_now = True
-                    reason   = f"Signal stalling after {age_mins:.0f} min — booking profit to protect gains"
-
-                # REMOVED: 2PM blanket auto-book.
-                # Closing at +0.2% because the clock hit 2 PM created hundreds of
-                # microscopic "wins" that masked real loss performance. Trades
-                # that need to run to T1 should be allowed to run. The EOD
-                # force-close at 3:30 PM provides the real time-based exit.
-
-                if book_now:
-                    # Only auto-close if profit is meaningful (≥1.0%) — tiny wins
-                    # at +0.2% mask real performance and don't cover losses.
-                    # Below 1.0%, send a push notification but don't auto-close.
-                    if pnl_pct >= 1.0:
-                        logger.info(f"[monitor] {ticker} EARLY BOOK — {reason} pnl={pnl_pct:.1f}%")
-                        _close_signal(sb, sig["id"], "target_hit",
-                                      current_price=price, entry_price=entry, direction=direction)
-                        _log_event(sb, sig["id"], "closed_win", price=price,
-                                   note=f"💡 Profit booked @ ${price:.2f} (+{pnl_pct:.1f}%) — {reason}")
-                        _STATUS_CACHE.pop(sig["id"], None)
-                        try:
-                            _push_early_book(ticker, direction, pnl_pct, reason, signal_id=sig_id_str)
-                        except Exception:
-                            pass
-                        continue   # signal is now closed
+            at_breakeven = abs(sl - entry) < 0.01   # T1 has been hit, stop at entry
+            if strategy == "swing_trade" and at_breakeven:
+                t2_hit = (is_long and price >= t2) or (not is_long and price <= t2)
+                if not t2_hit:
+                    # Update peak
+                    sig_id = sig["id"]
+                    if sig_id not in _SWING_PEAK:
+                        _SWING_PEAK[sig_id] = price
+                    elif is_long:
+                        _SWING_PEAK[sig_id] = max(_SWING_PEAK[sig_id], price)
                     else:
-                        logger.debug(f"[monitor] {ticker} early book skipped — pnl {pnl_pct:.1f}% < 1.0% minimum")
+                        _SWING_PEAK[sig_id] = min(_SWING_PEAK[sig_id], price)
+
+                    peak = _SWING_PEAK[sig_id]
+
+                    # Move from T1 toward T2 (positive = in trader's direction)
+                    move_from_t1 = (peak - t1) if is_long else (t1 - peak)
+                    # Retrace from that peak (positive = against trader)
+                    retrace      = (peak - price) if is_long else (price - peak)
+
+                    if move_from_t1 > 0 and move_from_t1 / entry >= 0.01:
+                        retrace_pct = retrace / move_from_t1
+                        if retrace_pct >= 0.40:
+                            locked_pnl = ((price - entry) / entry * 100) if is_long \
+                                         else ((entry - price) / entry * 100)
+                            logger.info(
+                                f"[monitor] {ticker} swing trail close "
+                                f"peak={peak:.2f} retrace={retrace_pct:.0%} "
+                                f"pnl={locked_pnl:.1f}%"
+                            )
+                            _close_signal(sb, sig_id, "target_hit",
+                                          current_price=price, entry_price=entry,
+                                          direction=direction)
+                            _log_event(sb, sig_id, "closed_win", price=price,
+                                       note=(
+                                           f"🎯 Swing trail close @ ${price:.2f} "
+                                           f"(+{locked_pnl:.1f}%) — "
+                                           f"{retrace_pct:.0%} retrace from peak ${peak:.2f}"
+                                       ))
+                            _SWING_PEAK.pop(sig_id, None)
+                            _STATUS_CACHE.pop(sig_id, None)
+                            reason = (
+                                f"Swing trailing stop — {retrace_pct:.0%} retrace "
+                                f"from peak ${peak:.2f}"
+                            )
+                            try:
+                                _push_early_book(ticker, direction, locked_pnl,
+                                                 reason, signal_id=sig_id_str)
+                            except Exception:
+                                pass
+                            continue
         except Exception as e:
-            logger.debug(f"[monitor] Early booking check error for {ticker}: {e}")
+            logger.debug(f"[monitor] Swing trail check error for {ticker}: {e}")
+
+        # ── 5. Intelligent early booking (scalp + day_trade only) ─────────────
+        #
+        # SWING TRADES ARE INTENTIONALLY EXCLUDED from this block.
+        #
+        # Why: RSI/MACD readings are intraday noise for multi-day swing positions.
+        # A SHORT swing will naturally show RSI oversold (momentum IN your favour)
+        # and MACD patterns that look like reversals on the 5-min chart while the
+        # daily/4h trend continues. Applying these diagnostics to swing trades
+        # causes premature exits — exactly what happened with VLO SHORT:
+        #   Engine closed at +1.79% citing "RSI oversold"
+        #   Stock continued to +4–5% in the predicted direction.
+        #
+        # Swing exits are handled by:
+        #   • T1/T2 RT level checker (stream.py — millisecond precision)
+        #   • Swing trailing stop above (step 4b — protects gains after T1)
+        #   • Structure reversal detection (step 6 below — CHoCH on 15m bars)
+        #   • Smart EOD close is already exempt (swing not in INTRADAY_STRATEGIES)
+        if strategy != "swing_trade":
+            try:
+                current_status = _STATUS_CACHE.get(sig["id"], "")
+                should_assess  = current_status in ("building_profit", "strong_profit") and pnl_pct > 0.5
+
+                if should_assess:
+                    book_now, reason = _momentum_check(ticker, direction)
+
+                    # Book early if signal has been stalling for >3h with no progress
+                    if not book_now and age_mins > 180 and current_status == "building_profit":
+                        book_now = True
+                        reason   = f"Signal stalling after {age_mins:.0f} min — booking profit to protect gains"
+
+                    if book_now:
+                        # Only auto-close if profit is meaningful (≥1.0%)
+                        if pnl_pct >= 1.0:
+                            logger.info(f"[monitor] {ticker} EARLY BOOK — {reason} pnl={pnl_pct:.1f}%")
+                            _close_signal(sb, sig["id"], "target_hit",
+                                          current_price=price, entry_price=entry, direction=direction)
+                            _log_event(sb, sig["id"], "closed_win", price=price,
+                                       note=f"💡 Profit booked @ ${price:.2f} (+{pnl_pct:.1f}%) — {reason}")
+                            _STATUS_CACHE.pop(sig["id"], None)
+                            try:
+                                _push_early_book(ticker, direction, pnl_pct, reason, signal_id=sig_id_str)
+                            except Exception:
+                                pass
+                            continue   # signal is now closed
+                        else:
+                            logger.debug(f"[monitor] {ticker} early book skipped — pnl {pnl_pct:.1f}% < 1.0% minimum")
+            except Exception as e:
+                logger.debug(f"[monitor] Early booking check error for {ticker}: {e}")
 
         # ── 6. Structure reversal detection ───────────────────────────────────
         try:
@@ -734,6 +814,7 @@ def _monitor_stocks(sb: Client) -> None:
                 _log_event(sb, sig["id"], "reversal", price=price,
                            note=f"⚠️ {opposite.capitalize()} CHoCH detected — {direction} closed early @ ${price:.2f} ({'+' if pnl_pct >= 0 else ''}{pnl_pct:.1f}%)")
                 _STATUS_CACHE.pop(sig["id"], None)
+                _SWING_PEAK.pop(sig["id"], None)
                 try:
                     _push_reversal(ticker, direction, signal_id=sig_id_str)
                 except Exception:
