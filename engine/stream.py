@@ -54,6 +54,19 @@ _scan_executor = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix="sb_scan",
 )
 
+# ── RT level executor ──────────────────────────────────────────
+# Dedicated pool for T1/T2/SL level checks ONLY — completely separate
+# from _scan_executor so a full strategy scan (which can take 2-10 s)
+# never delays a level check by even a single tick.
+#
+# max_workers=2: one thread handles the current check while the second
+# absorbs the next tick that arrives during it. More than 2 would be
+# wasteful — level checks are fast (<100 ms) and we throttle to 1/s.
+_rt_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="sb_rt",
+)
+
 # ── Bar boundary deduplication ────────────────────────────────
 # Multiple tickers deliver bars at the same minute. We only want to fire
 # each strategy scan ONCE per boundary, not once per ticker.
@@ -714,7 +727,8 @@ async def run_stream() -> None:
                 # ── EVERY bar: check scalp T1/SL in real-time ─────────────────
                 # Uses bar high/low (wicks) so we catch levels touched intra-bar.
                 # Runs before any boundary logic so closes fire as fast as possible.
-                _scan_executor.submit(_check_scalp_levels, symbol, bar_high, bar_low)
+                # Uses _rt_executor (dedicated) so strategy scans never delay this.
+                _rt_executor.submit(_check_scalp_levels, symbol, bar_high, bar_low)
 
                 # ── Scalping: every 5-min bar close, per ticker ───────────────
                 # Fires for each SCALP ticker individually as its bar arrives.
@@ -766,7 +780,8 @@ async def run_stream() -> None:
                 now = time.monotonic()
                 if now - _rt_last_check.get(ticker, 0.0) >= _RT_THROTTLE_S:
                     _rt_last_check[ticker] = now
-                    _scan_executor.submit(_check_rt_levels, ticker, price)
+                    # _rt_executor: dedicated pool — never queued behind a scan
+                    _rt_executor.submit(_check_rt_levels, ticker, price)
 
                 # 3. Tick-triggered scalp scan — fire the full SMC pipeline NOW
                 #    instead of waiting for the next 5-min bar close.
@@ -838,6 +853,7 @@ async def run_stream() -> None:
             _on_trade_ref = None
             logger.info("[stream] Stream task cancelled — shutting down")
             _scan_executor.shutdown(wait=False)
+            _rt_executor.shutdown(wait=False)
             return
 
         except Exception as e:
