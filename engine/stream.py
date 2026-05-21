@@ -85,6 +85,16 @@ _RT_CACHE_TTL:      float = 60.0  # full refresh every 60 s
 _RT_THROTTLE_S:     float = 1.0   # max one level-check per second per ticker
 _rt_last_check: dict[str, float] = {}   # ticker → last monotonic check time
 
+# ── Tick-triggered scalp scanner ────────────────────────────────────────────
+# Instead of waiting for a 5-min bar close, run a full SMC scalp scan the
+# moment a trade tick arrives (throttled per ticker so we don't stack scans).
+# This lets signals fire within ~1 second of a setup forming — not 0-5 min later.
+#
+# _TICK_SCALP_THROTTLE_S = 300 s  (5 min) — same cadence as bar-close scans but
+# unlocked from the bar clock, so they can fire mid-bar when the move starts.
+_TICK_SCALP_THROTTLE_S: float = 300.0
+_tick_scalp_last: dict[str, float] = {}   # ticker → last tick-scan monotonic time
+
 # ── Dynamic ticker subscription ────────────────────────────────────────────
 # App WS clients may subscribe to tickers beyond ALL_TICKERS (custom watchlists).
 # These are dynamically added to the live Alpaca trade stream so every ticker
@@ -757,6 +767,17 @@ async def run_stream() -> None:
                 if now - _rt_last_check.get(ticker, 0.0) >= _RT_THROTTLE_S:
                     _rt_last_check[ticker] = now
                     _scan_executor.submit(_check_rt_levels, ticker, price)
+
+                # 3. Tick-triggered scalp scan — fire the full SMC pipeline NOW
+                #    instead of waiting for the next 5-min bar close.
+                #    If a setup forms at minute 0:30 of a bar, this fires within
+                #    1 second; the bar-close path would wait up to 4.5 more min.
+                #    Throttled to _TICK_SCALP_THROTTLE_S (5 min) per ticker so
+                #    a single scalp scan can't be queued multiple times.
+                if ticker in scalp_set:
+                    if now - _tick_scalp_last.get(ticker, 0.0) >= _TICK_SCALP_THROTTLE_S:
+                        _tick_scalp_last[ticker] = now
+                        _scan_executor.submit(_process_bar_sync, ticker, price, 0)
 
             wss.subscribe_bars(on_bar, *all_subscribe)
             wss.subscribe_trades(on_trade, *all_subscribe)
