@@ -573,7 +573,11 @@ async def ws_prices(websocket: WebSocket):
     from engine import price_store
 
     await websocket.accept()
-    queue: _asyncio.Queue = _asyncio.Queue(maxsize=200)
+    # maxsize=50 = 5 seconds of buffering at 10 Hz.
+    # broadcast_snapshot() puts ONE batched message per cycle (not one per ticker),
+    # so 50 slots is far more than enough. Old 200 was for the per-ticker design
+    # where 20+ entries arrived every 100 ms and starvation caused burst/drop cycles.
+    queue: _asyncio.Queue = _asyncio.Queue(maxsize=50)
     tickers: set[str] = set()
 
     try:

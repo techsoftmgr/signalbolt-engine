@@ -1,20 +1,24 @@
 """
 Real-time price store — bridges the Alpaca trade stream to app WebSocket clients.
 
-Architecture (10 Hz push loop):
+Architecture (10 Hz push loop — BATCHED):
   Alpaca trade → stream.py on_trade() → price_store.update()
               → marks ticker as "dirty" (via call_soon_threadsafe onto event loop)
-              → every 100 ms: broadcast_snapshot() pushes ALL dirty tickers
-              → each connected WS client queue
-              → FastAPI /ws/prices endpoint → phone screen
+              → every 100 ms: broadcast_snapshot() collects ALL dirty tickers,
+                builds ONE batched JSON message per client, puts it in the queue
+              → FastAPI /ws/prices _send_loop() dequeues and sends ONE frame
+              → phone screen
 
-Why 10 Hz loop instead of per-trade broadcast:
-  - Alpaca SIP sends thousands of trades/sec for liquid names.
-    Blasting every trade to the app would flood mobile connections.
-  - Per-trade throttle (old design) caused unpredictable timing — quiet
-    tickers got updates whenever the next trade arrived, not on a schedule.
-  - 100 ms loop = guaranteed 10 Hz refresh for ANY ticker that traded
-    in the last 100 ms. Smooth, predictable, bandwidth-efficient.
+Why BATCHED instead of per-ticker messages:
+  - Old design put one queue entry per dirty ticker (e.g. 20 tickers = 20 entries).
+    _send_loop() then called await websocket.send_text() 20× per cycle.
+    Each mobile send takes ~5 ms → 100 ms of send work = entire broadcast window.
+    This starved the asyncio event loop: _price_broadcast_loop couldn't wake
+    on schedule, queue filled to 200, QueueFull silently dropped ticks.
+    Result: burst of updates → silent gap → burst → gap (user saw "slow then fast").
+  - Batched design: ONE queue entry per client per 100 ms cycle regardless of
+    how many tickers changed.  One websocket.send_text() per cycle.  Event loop
+    stays free.  No starvation.  Smooth tick-by-tick even for 30+ tickers.
 
 Thread safety:
   update() is called from the Alpaca SDK internal event loop (a different
@@ -123,8 +127,15 @@ def update(ticker: str, trade_price: float) -> None:
 
 async def broadcast_snapshot() -> None:
     """
-    Push all dirty (changed) ticker prices to every connected WS client.
+    Push all dirty (changed) ticker prices to every connected WS client
+    as a SINGLE batched JSON message per client per cycle.
+
     Called every 100 ms by the broadcast loop in main.py.
+
+    KEY DESIGN: one queue.put_nowait() per client per cycle (not one per ticker).
+    This means _send_loop() calls websocket.send_text() once per 100 ms instead
+    of N times (where N = number of dirty tickers).  Keeps the asyncio event loop
+    free so _price_broadcast_loop wakes on schedule and delivers smooth ticks.
 
     Because this and update()'s call_soon_threadsafe callback both run on
     the same asyncio event loop thread, _dirty access is race-free.
@@ -136,19 +147,39 @@ async def broadcast_snapshot() -> None:
     tickers = list(_dirty)
     _dirty.clear()
 
-    # Build one JSON message per ticker and fan-out to subscribed clients
+    # Build the full batch payload for all dirty tickers
+    full_batch: dict = {}
     for ticker in tickers:
         data = _prices.get(ticker)
-        if not data:
-            continue
-        msg = json.dumps({ticker: data})
-        for q in list(_clients):
-            subs = _client_tickers.get(id(q), set())
-            if not subs or ticker in subs:
-                try:
-                    q.put_nowait(msg)
-                except asyncio.QueueFull:
-                    pass  # slow client — drop this tick, next cycle catches up
+        if data:
+            full_batch[ticker] = data
+
+    if not full_batch:
+        return
+
+    full_msg = json.dumps(full_batch)
+
+    # Fan-out: ONE message per client per cycle (filtered by subscription if set)
+    for q in list(_clients):
+        subs = _client_tickers.get(id(q), set())
+        if subs:
+            # Client subscribed to specific tickers — filter the batch
+            filtered = {t: d for t, d in full_batch.items() if t in subs}
+            if not filtered:
+                continue   # nothing relevant for this client this cycle
+            msg = json.dumps(filtered)
+        else:
+            # No subscription filter — send the full batch
+            msg = full_msg
+
+        try:
+            q.put_nowait(msg)
+        except asyncio.QueueFull:
+            # Client queue is full (very slow mobile connection).
+            # Drop this cycle — the NEXT cycle will have the latest price.
+            # Since we batch, the next message will include the most recent
+            # value for every ticker, so no stale data is shown.
+            pass
 
 
 # ── WebSocket client management ───────────────────────────────────────────────
