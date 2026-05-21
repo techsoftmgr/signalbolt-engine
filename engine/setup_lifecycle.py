@@ -306,9 +306,13 @@ class SetupLifecycleManager:
             try:
                 from supabase import create_client
                 url = os.environ.get("SUPABASE_URL", "")
-                key = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_KEY", "")
+                key = (
+                    os.environ.get("SUPABASE_SERVICE_KEY")
+                    or os.environ.get("SUPABASE_SECRET_KEY")
+                    or os.environ.get("SUPABASE_KEY", "")
+                )
                 if not url or not key:
-                    raise ValueError("SUPABASE_URL / SUPABASE_SERVICE_KEY not set")
+                    raise ValueError("SUPABASE_URL / SUPABASE_SECRET_KEY not set")
                 self._sb_lazy = create_client(url, key)
             except Exception as exc:
                 raise RuntimeError(f"SetupLifecycleManager: cannot connect to Supabase: {exc}") from exc

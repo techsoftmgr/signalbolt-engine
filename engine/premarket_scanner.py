@@ -470,7 +470,11 @@ def persist_to_supabase(results: list[PremarketResult]) -> None:
     try:
         from supabase import create_client
         url = os.environ.get("SUPABASE_URL", "")
-        key = os.environ.get("SUPABASE_KEY", "")
+        key = (
+            os.environ.get("SUPABASE_SERVICE_KEY")
+            or os.environ.get("SUPABASE_SECRET_KEY")
+            or os.environ.get("SUPABASE_KEY", "")
+        )
         if not url or not key:
             logger.warning("[premarket] Supabase keys not set — skipping persist")
             return
