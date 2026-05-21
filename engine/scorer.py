@@ -3,17 +3,23 @@ Confluence scorer — nine independent layers → normalised 0-100 composite sco
 
   L1  SMC structure      25 pts  (BOS, CHoCH, FVG, Order Block)
   L2  Technical          25 pts  (RSI divergence, MACD, VWAP, EMA alignment)
-  L3  Sentiment          20 pts  (yfinance news keyword sentiment)
+  L3  Sentiment          20 pts  (Alpaca news sentiment, yfinance fallback)
   L4  Risk               15 pts  (ATR regime, session timing, earnings proximity)
   L5  Multi-timeframe    15 pts  (15m + 4h direction alignment)
-  ── Quant layers (bonus — up to +12 pts each, capped at 100 total) ──
+  ── Quant layers (bonus — max ±10 pts total) ──────────────────────────────
   L6  Market Regime       bonus  (VIX, ADX, SPY/200MA classification)
   L7  Session Quality     bonus  (time-of-day, OpEx, FOMC)
   L8  Gamma Exposure      bonus  (SpotGamma walls, pin risk, vanna/charm)
   L9  Manipulation Check  bonus  (stop raid, momentum ignition detection)
-  ──────────────────────────────
-  composite_score = round(weighted_L1_L5 + quant_bonus)  → 0-100
-  Fire threshold  >= session threshold (70 standard / 80 ORB / 85 catalyst)
+  ──────────────────────────────────────────────────────────────────────────
+  Score architecture (anti-inflation):
+    base_score  = min(85, weighted_L1_L5 + l5_bonus)   ← hard cap
+    quant_bonus = clamp(L6+L7+L8+L9, -10, +10)         ← hard cap
+    chop_penalty= chop_detector.as_penalty()            ← 0 to -15
+    final       = clamp(base + quant - chop, 0, 100)
+
+  Confidence grades: A+(≥90) A(≥82) B+(≥74) B(≥66) C(<66)
+  Fire threshold  >= session threshold (78 standard / 80 ORB / 85 catalyst)
 """
 
 import logging
@@ -503,6 +509,7 @@ def score(
     session: Optional[dict] = None,
     gamma: Optional[dict] = None,
     manipulation: Optional[dict] = None,
+    chop: Optional[object] = None,   # ChopResult from chop_detector.detect()
 ) -> dict:
     """
     Score a signal candidate across all 9 layers.
@@ -514,6 +521,7 @@ def score(
         session:       output of session_classifier.classify()  (optional — adds L7)
         gamma:         output of gamma_engine.fetch()  (optional — adds L8)
         manipulation:  output of manipulation_detector.detect()  (optional — adds L9)
+        chop:          ChopResult from chop_detector.detect()  (optional — subtracts penalty)
     """
     direction = analysis.get("direction")
     if not direction:
@@ -566,10 +574,14 @@ def score(
     )
     l5_bonus_max = w.get("l5_bonus", 5.0)
     l5_bonus = (l5 / 15.0) * l5_bonus_max
-    base_score = weighted + l5_bonus
+    # ── Anti-inflation cap: base cannot exceed 85 ─────────────
+    # Prevents the engine from auto-scoring near 100 just by stacking
+    # L1-L5. Real A+ signals earn the last 5-15 pts via quant layers.
+    base_score = min(85.0, weighted + l5_bonus)
 
-    # ── L6–L9 (quant bonus layers) ────────────────────────────
-    # Each quant layer contributes up to ±10 pts as a weighted bonus
+    # ── L6–L9 (quant bonus layers, hard-capped at ±10 total) ──
+    # Combined quant bonus kept tight: +10 → confirmed institutional,
+    # -10 → hostile environment. No layer can dominate.
     quant_bonus = 0.0
     l6_regime    = 0.0
     l7_session   = 0.0
@@ -602,7 +614,15 @@ def score(
         l9_manip = manip_score(manipulation)
         quant_bonus += (l9_manip - 50) / 50 * l9_pts
 
-    normalised = round(min(max(base_score + quant_bonus, 0), 100))
+    # Hard cap: quant bonus is ±10 max — prevents any single layer from dominating
+    quant_bonus = max(-10.0, min(10.0, quant_bonus))
+
+    # ── Chop penalty (0 to -15 pts) ───────────────────────────
+    # Applied AFTER quant layers so chop can't be masked by bonus pts
+    chop_penalty = chop.as_penalty() if chop is not None else 0.0
+    chop_score_val = chop.chop_score if chop is not None else 0.0
+
+    normalised = round(min(max(base_score + quant_bonus - chop_penalty, 0), 100))
 
     # ── Determine threshold ───────────────────────────────────
     if session is not None:
@@ -621,6 +641,8 @@ def score(
         "l8_gamma":        round(l8_gamma),
         "l9_manipulation": round(l9_manip),
         "quant_bonus":     round(quant_bonus, 1),
+        "chop_penalty":    round(chop_penalty, 1),
+        "base_score":      round(base_score, 1),
         "sweep_confirmed": bool(sweep and sweep.get("swept")),
         "regime_type":     regime.get("regime_type", "") if regime else "",
         "session_mode":    session.get("mode", "") if session else "",
@@ -628,9 +650,10 @@ def score(
 
     logger.info(
         f"[scorer] {ticker} [{strategy_type}] total={normalised} threshold={threshold} "
+        f"base={base_score:.1f} quant={quant_bonus:+.1f} chop_pen={chop_penalty:.1f} "
         f"(L1={round(l1)} L2={round(l2)} L3={round(l3)} L4={round(l4)} L5={round(l5)} "
         f"L6={round(l6_regime)} L7={round(l7_session)} L8={round(l8_gamma)} "
-        f"L9={round(l9_manip)} bonus={quant_bonus:+.1f})"
+        f"L9={round(l9_manip)})"
     )
 
     factors = _factors_from_breakdown(breakdown, direction)
@@ -643,15 +666,56 @@ def score(
         factors.append("Clean Price Action")
     factors = factors[:4]
 
+    # ── Confidence and Risk grades ──────────────────────────────
+    try:
+        from engine.setup_lifecycle import (
+            classify_confidence_grade,
+            classify_risk_grade,
+            get_missing_confirmations,
+        )
+        risk_reward = None
+        try:
+            entry_p  = analysis.get("entry") or price
+            stop_p   = analysis.get("stop_loss") or entry_p
+            target_p = analysis.get("target_one") or entry_p
+            if entry_p != stop_p:
+                risk_reward = abs(target_p - entry_p) / abs(entry_p - stop_p)
+        except Exception:
+            pass
+
+        regime_type_str = (regime or {}).get("regime_type", "UNKNOWN")
+        confidence_grade    = classify_confidence_grade(normalised).value
+        risk_grade          = classify_risk_grade(
+            normalised,
+            risk_reward or 0.0,
+            chop_score_val,
+            regime_type_str,
+        ).value
+
+        # Build a partial score_result proxy for missing-confirmation check
+        _score_proxy = {"total": normalised, "breakdown": breakdown, "passes": normalised >= threshold}
+        missing_confirmations = get_missing_confirmations(
+            analysis, _score_proxy, regime or {}, chop
+        )
+    except Exception as exc:
+        logger.debug(f"[scorer] grade/missing step skipped: {exc}")
+        confidence_grade      = "B"
+        risk_grade            = "MEDIUM"
+        missing_confirmations = []
+
     return {
-        "total":              normalised,
-        "passes":             normalised >= threshold,
-        "breakdown":          breakdown,
-        "confidence_factors": factors,
-        "direction":          direction,
-        "entry":              analysis.get("entry"),
-        "stop_loss":          analysis.get("stop_loss"),
-        "target_one":         analysis.get("target_one"),
-        "target_two":         analysis.get("target_two"),
-        "threshold":          threshold,
+        "total":                normalised,
+        "passes":               normalised >= threshold,
+        "breakdown":            breakdown,
+        "confidence_factors":   factors,
+        "confidence_grade":     confidence_grade,
+        "risk_grade":           risk_grade,
+        "missing_confirmations": missing_confirmations,
+        "chop_score":           round(chop_score_val, 1),
+        "direction":            direction,
+        "entry":                analysis.get("entry"),
+        "stop_loss":            analysis.get("stop_loss"),
+        "target_one":           analysis.get("target_one"),
+        "target_two":           analysis.get("target_two"),
+        "threshold":            threshold,
     }

@@ -33,6 +33,15 @@ from engine import regime_detector, session_classifier, gamma_engine, manipulati
 from engine import weight_optimizer, signal_monitor
 from engine import unusual_whales as uw
 from engine import prescreener
+from engine import chop_detector
+from engine import mean_reversion
+from engine import analytics as signal_analytics
+from engine.setup_lifecycle import (
+    SetupLifecycleManager,
+    classify_setup_type,
+    annotate_score,
+)
+_lifecycle = SetupLifecycleManager()
 
 load_dotenv()
 
@@ -538,6 +547,75 @@ def _analyze_options_flow(ticker: str) -> Optional[dict]:
 # Per-ticker pipelines
 # ---------------------------------------------------------------------------
 
+def _process_mr_ticker(sb: Client, ticker: str, config: dict,
+                       regime: dict = None, session: dict = None) -> bool:
+    """
+    Mean-reversion pipeline — only runs in RANGING / LOW_VOL regimes.
+    Returns True if a signal fired (so caller can skip the SMC pipeline).
+    """
+    regime  = regime  or {}
+    session = session or {}
+
+    if _has_active_signal(sb, ticker, config["type"]):
+        return False
+
+    if _in_stop_cooldown(ticker, config["type"]):
+        return False
+
+    try:
+        from engine import alpaca_client as _alpaca
+        df    = _alpaca.get_bars(ticker, timeframe=config.get("interval", "15m"), days=5)
+        price = _alpaca.get_latest_price(ticker)
+        if df is None or df.empty or not price:
+            return False
+
+        mr = mean_reversion.analyze(
+            ticker, df, price,
+            regime=regime,
+            interval=config.get("interval", "15m"),
+        )
+        if mr is None or not mr.passes:
+            return False
+
+        # ── Portfolio risk check ──────────────────────────────────
+        risk = risk_manager.check(sb, ticker, mr.score)
+        if not risk["allowed"]:
+            logger.info(f"[runner] {ticker} [MR] BLOCKED — portfolio: {risk['block_reason']}")
+            return False
+
+        # ── Build signal row ──────────────────────────────────────
+        signal_row = mean_reversion.to_signal_dict(mr, session)
+        signal_row.update({
+            "strategy_type":      config["type"],
+            "timeframe":          config.get("interval", "15m"),
+            "regime_type":        regime.get("regime_type", ""),
+            "session_mode":       session.get("mode", ""),
+            "confidence_tier":    risk["confidence_tier"],
+            "position_multiplier": risk["position_mult"],
+            "setup_type":         "VWAP_MEAN_REVERSION",
+            "confidence_grade":   "B+" if mr.score >= 74 else "B",
+            "chop_score":         0.0,   # MR signals trade IN chop — no chop penalty
+            "score_breakdown":    {"mr_score": mr.score, "mr_passes": list(mr.passes)},
+        })
+        signal_row["ai_explanation"] = explainer.generate(signal_row, signal_row["score_breakdown"])
+        _write_signal(sb, signal_row)
+
+        try:
+            push.send_signal_alert(ticker, mr.direction, mr.score, "stock")
+        except Exception as e:
+            logger.warning(f"[runner] Push failed for MR {ticker}: {e}")
+
+        logger.info(
+            f"[runner] {ticker} [MR] FIRED — score={mr.score} dir={mr.direction} "
+            f"entry={mr.entry:.2f} sl={mr.stop_loss:.2f} t1={mr.target_one:.2f}"
+        )
+        return True
+
+    except Exception as e:
+        logger.warning(f"[runner] MR pipeline failed for {ticker}: {e}")
+        return False
+
+
 def _process_smc_ticker(sb: Client, ticker: str, config: dict,
                         regime: dict = None, session: dict = None) -> None:
     """Standard SMC pipeline for scalping / day_trade / swing_trade — quant-upgraded."""
@@ -566,6 +644,23 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
     df        = analysis.get("candles")
     price     = analysis["current_price"]
 
+    # ── QUANT GATE 2b: Chop detection ────────────────────────
+    # Run BEFORE manipulation/gamma to avoid wasting those calls on choppy bars.
+    regime_type_str = regime.get("regime_type", "UNKNOWN")
+    chop = chop_detector.detect(
+        df,
+        regime_type=regime_type_str,
+        interval=config.get("interval", "15m"),
+        strategy_type=strategy_type,
+    )
+    if chop.is_choppy:
+        logger.info(
+            f"[runner] {ticker} [{strategy_type}] SKIPPED — chop "
+            f"score={chop.chop_score:.0f} > {chop.threshold_used:.0f} "
+            f"({', '.join(chop.reasons[:2])})"
+        )
+        return
+
     # ── QUANT GATE 3: Manipulation check ─────────────────────
     is_crypto = ticker in ("COIN", "MSTR", "MARA", "RIOT", "CLSK")
     has_news  = _has_recent_news(ticker)
@@ -581,26 +676,54 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
     # ── QUANT GATE 4: Gamma exposure ──────────────────────────
     gamma = gamma_engine.fetch(ticker, price)
 
-    # Score with quant layers
+    # Score with quant layers + chop penalty
     scored = scorer.score(
         analysis, strategy_type,
         regime=regime,
         session=session,
         gamma=gamma,
         manipulation=manipulation,
+        chop=chop,
     )
     sweep = analysis.get("liquidity_sweep", {})
+    breakdown = scored["breakdown"]
     logger.info(
         f"[runner] {ticker} [{strategy_type}] score={scored['total']}/{scored['threshold']} "
-        f"(L1={scored['breakdown']['l1_smc']} L2={scored['breakdown']['l2_technical']} "
-        f"L3={scored['breakdown']['l3_sentiment']} L4={scored['breakdown']['l4_risk']} "
-        f"L5={scored['breakdown'].get('l5_mtf', 0)} "
-        f"L6={scored['breakdown'].get('l6_regime', 0)} "
-        f"L7={scored['breakdown'].get('l7_session', 0)} "
-        f"L8={scored['breakdown'].get('l8_gamma', 0)} "
-        f"bonus={scored['breakdown'].get('quant_bonus', 0):+.1f})"
+        f"grade={scored.get('confidence_grade','?')} "
+        f"(L1={breakdown['l1_smc']} L2={breakdown['l2_technical']} "
+        f"L3={breakdown['l3_sentiment']} L4={breakdown['l4_risk']} "
+        f"L5={breakdown.get('l5_mtf', 0)} "
+        f"L6={breakdown.get('l6_regime', 0)} "
+        f"L7={breakdown.get('l7_session', 0)} "
+        f"L8={breakdown.get('l8_gamma', 0)} "
+        f"bonus={breakdown.get('quant_bonus', 0):+.1f} "
+        f"chop_pen={breakdown.get('chop_penalty', 0):.1f})"
         + (f" SWEEP={sweep['candles_ago']}bars_ago" if sweep.get("swept") else "")
     )
+
+    # ── Lifecycle stage gate ──────────────────────────────────
+    # Scores below CONFIRMED_MIN (78) feed the WATCHLIST/DEVELOPING stages.
+    # Only CONFIRMED scores proceed to SL/TP and signal write.
+    try:
+        sltp_preview = sl_tp_engine.calculate(
+            direction=direction, entry=price, df=df,
+            regime=regime, session=session, gamma=gamma,
+            strategy_type=strategy_type,
+            interval=config.get("interval", "15m"),
+        )
+        setup_type_str = classify_setup_type(analysis, session)
+        _lifecycle.upsert_setup(
+            analysis=analysis,
+            score_result=scored,
+            regime=regime,
+            session=session,
+            chop_result=chop,
+            setup_type=setup_type_str,
+            sltp=sltp_preview,
+        )
+    except Exception as _lc_err:
+        logger.debug(f"[runner] lifecycle upsert skipped: {_lc_err}")
+        setup_type_str = "UNKNOWN"
 
     if not scored["passes"]:
         return
@@ -672,9 +795,21 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
         "risk_reward":        sltp["risk_reward_1"],
         # Score breakdown stored for optimizer feedback loop
         "score_breakdown":    scored.get("breakdown", {}),
+        # New lifecycle / quality metadata
+        "confidence_grade":   scored.get("confidence_grade", "B"),
+        "risk_grade":         scored.get("risk_grade", "MEDIUM"),
+        "chop_score":         scored.get("chop_score", 0.0),
+        "setup_type":         setup_type_str,
+        "missing_confirmations": scored.get("missing_confirmations", []),
     }
     signal_row["ai_explanation"] = explainer.generate(signal_row, scored["breakdown"])
     _write_signal(sb, signal_row)
+
+    # ── Mark setup as promoted to CONFIRMED in lifecycle tracker ─
+    try:
+        _lifecycle.mark_promoted(ticker, direction, strategy_type, signal_id=None)
+    except Exception:
+        pass
 
     try:
         push.send_signal_alert(ticker, direction, scored["total"], "stock")
@@ -900,11 +1035,23 @@ def _process_ticker(sb: Client, ticker: str, config: dict,
                     regime: dict = None, session: dict = None) -> None:
     strategy_type = config["type"]
     ctx = {"regime": regime or {}, "session": session or {}}
+
     if strategy_type == "dark_pool":
         _process_dark_pool_ticker(sb, ticker, config, **ctx)
     elif strategy_type == "options_flow":
         _process_options_flow_ticker(sb, ticker, config, **ctx)
     else:
+        # ── Regime-first routing ─────────────────────────────────
+        # RANGING or LOW_VOL regimes: try mean-reversion pipeline first.
+        # If MR fires we're done; if it doesn't fire, fall through to SMC.
+        regime_type = (regime or {}).get("regime_type", "")
+        mr_tried = False
+        if strategy_type in ("day_trade", "scalping") and regime_type in ("RANGING", "LOW_VOL"):
+            fired = _process_mr_ticker(sb, ticker, config, **ctx)
+            mr_tried = True
+            if fired:
+                return
+
         _process_smc_ticker(sb, ticker, config, **ctx)
 
 
@@ -1170,7 +1317,7 @@ def _run_strategy_scan(config: dict) -> None:
 
 
 def _run_maintenance() -> None:
-    """Track open signal results and auto-close hits. Runs every 15 min."""
+    """Track open signal results, auto-close hits, expire stale setups. Runs every 15 min."""
     logger.info("[runner] Maintenance started")
     try:
         track_signals()
@@ -1187,7 +1334,52 @@ def _run_maintenance() -> None:
     except Exception as e:
         sentry_sdk.capture_exception(e)
         logger.error(f"[runner] signal_monitor failed: {e}")
+    # ── Expire stale WATCHLIST / DEVELOPING setups ────────────
+    try:
+        expired = _lifecycle.expire_stale_setups()
+        if expired:
+            logger.info(f"[runner] Lifecycle: expired {expired} stale setups")
+    except Exception as e:
+        logger.debug(f"[runner] lifecycle expire skipped: {e}")
     logger.info("[runner] Maintenance complete")
+
+
+def _run_analytics_report() -> None:
+    """
+    Generate daily analytics report (5:30 PM ET, after market close).
+    Computes win rate, R-multiples, expectancy, false-positive stats.
+    Stores results back to Supabase for the Analytics tab.
+    """
+    logger.info("[runner] ═══ Daily analytics report started ═══")
+    try:
+        sb = _supabase()
+        report = signal_analytics.generate_report(sb, days=30)
+        quality_flags = report.get("quality_flags", [])
+        critical = [f for f in quality_flags if f.startswith("CRITICAL")]
+        warnings = [f for f in quality_flags if f.startswith("WARNING")]
+        logger.info(
+            f"[runner] Analytics: win_rate={report['overall'].get('win_rate', 0):.1%} "
+            f"expectancy={report['overall'].get('expectancy', 0):.2f}R "
+            f"signals={report['overall'].get('total_signals', 0)} "
+            f"({len(critical)} CRITICAL, {len(warnings)} WARNINGS)"
+        )
+        if critical:
+            for flag in critical:
+                logger.warning(f"[runner] Analytics flag: {flag}")
+        # Persist summary to analytics_reports table (graceful skip if table missing)
+        try:
+            sb.table("analytics_reports").insert({
+                "report_date":    datetime.now(timezone.utc).date().isoformat(),
+                "overall":        report["overall"],
+                "by_strategy":    report.get("by_strategy", {}),
+                "quality_flags":  quality_flags,
+            }).execute()
+        except Exception as _db_err:
+            logger.debug(f"[runner] analytics_reports insert skipped: {_db_err}")
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        logger.error(f"[runner] Analytics report failed: {e}", exc_info=True)
+    logger.info("[runner] ═══ Daily analytics report complete ═══")
 
 
 def _run_weight_optimization() -> None:
@@ -1269,8 +1461,20 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled market-hours signal monitor every 5 min (9:30 AM–4:05 PM ET)")
 
-    # ── Weekly self-learning optimization (Sunday 2 AM UTC) ──────────────
+    # ── Daily analytics report — 5:30 PM ET (21:30 UTC) Mon-Fri ─────────
     from apscheduler.triggers.cron import CronTrigger
+    scheduler.add_job(
+        _run_analytics_report,
+        trigger=CronTrigger(
+            day_of_week="mon-fri", hour=21, minute=30, timezone="UTC"
+        ),
+        id="analytics_report",
+        name="SignalBolt daily analytics report",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled daily analytics report (5:30 PM ET, Mon-Fri)")
+
+    # ── Weekly self-learning optimization (Sunday 2 AM UTC) ──────────────
     scheduler.add_job(
         _run_weight_optimization,
         trigger=CronTrigger(day_of_week="sun", hour=2, minute=0, timezone="UTC"),
