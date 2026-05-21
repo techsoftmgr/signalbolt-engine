@@ -126,9 +126,9 @@ _tick_daytrade_last: dict[str, float] = {}   # ticker → last tick-scan monoton
 #
 # Structure: { ticker: [(price, monotonic_ts), ...] }
 # Pruned on every write so memory stays bounded.
-_PRICE_BUFFER_WINDOW_S: float = 60.0    # look-back window
-_MOMENTUM_THRESHOLD:    float = 0.004   # 0.4% move in 60 s → scan fires
-_price_buffer: dict[str, list] = {}     # ticker → [(price, ts), ...]
+_PRICE_BUFFER_WINDOW_S: float = 600.0   # 10-min rolling window — enough for structural analysis
+_MOMENTUM_THRESHOLD:    float = 0.004   # 0.4% move in 60 s → day_trade scan fires
+_price_buffer: dict[str, list] = {}     # ticker → [(price, monotonic_ts), ...]
 
 # ── Dynamic ticker subscription ────────────────────────────────────────────
 # App WS clients may subscribe to tickers beyond ALL_TICKERS (custom watchlists).
@@ -655,17 +655,21 @@ def _update_price_buffer(ticker: str, price: float) -> None:
 
 def _has_tick_momentum(ticker: str) -> bool:
     """
-    Return True if the price moved ≥ _MOMENTUM_THRESHOLD (0.4%) within the
-    last 60 seconds according to the buffer.
+    Return True if price moved ≥ _MOMENTUM_THRESHOLD (0.4%) in the last 60 s.
 
-    Uses max-min range rather than open-close so it catches both up and down
-    moves regardless of direction.
+    The buffer stores 10 minutes of history, but the trigger window for
+    day_trade scans is always just the last 60 seconds so we don't fire
+    on slow drifts that accumulated over many minutes.
     """
     buf = _price_buffer.get(ticker)
     if not buf or len(buf) < 2:
         return False
-    prices = [p for (p, _) in buf]
-    lo, hi = min(prices), max(prices)
+    now    = time.monotonic()
+    cutoff = now - 60.0
+    recent = [p for (p, t) in buf if t >= cutoff]
+    if len(recent) < 2:
+        return False
+    lo, hi = min(recent), max(recent)
     if lo <= 0:
         return False
     return (hi - lo) / lo >= _MOMENTUM_THRESHOLD
@@ -864,12 +868,156 @@ def _check_rt_levels(ticker: str, price: float) -> None:
             if sig_still_active:
                 try:
                     from engine import signal_advisor as _advisor
-                    _advisor.check(sig, price, _get_regime(), _get_session())
+                    # Snapshot the full 10-min price history for this ticker.
+                    # list() copy is GIL-safe — we don't hold a reference into
+                    # the live buffer, so background pruning won't corrupt it.
+                    price_hist = list(_price_buffer.get(ticker, []))
+                    _advisor.check(sig, price, _get_regime(), _get_session(), price_hist)
                 except Exception:
                     pass
 
         except Exception as e:
             logger.debug(f"[stream] RT level check error for {ticker}/{sig.get('id')}: {e}")
+
+
+# ── Per-bar signal health checker ────────────────────────────────────────────
+# Runs RSI/MACD (every 5-min bar close) and SMC structure reversal (every
+# 15-min bar close) for any ticker that has active non-scalp signals.
+# This moves the signal_monitor's analysis from a 15-min schedule to being
+# event-driven — latency drops from up to 15 min to 1–5 min.
+#
+# Throttle: _bar_health_last prevents the same check running twice if multiple
+# tickers happen to deliver bars at the same minute.
+_bar_health_rsi_last:       dict[str, float] = {}   # ticker → monotonic
+_bar_health_structure_last: dict[str, float] = {}   # ticker → monotonic
+_BAR_HEALTH_RSI_THROTTLE_S       = 270.0   # 4.5 min — fires on 5-min bars
+_BAR_HEALTH_STRUCTURE_THROTTLE_S = 870.0   # 14.5 min — fires on 15-min bars
+
+
+def _check_signal_health_rsi(symbol: str, close: float) -> None:
+    """
+    RSI + MACD momentum check for all active signals on this ticker.
+    Called every 5-min bar close. Writes a signal_events entry + push if
+    momentum is failing. Throttled so it never duplicates within 4.5 min.
+    """
+    sigs = _rt_cache.get(symbol)
+    if not sigs:
+        return
+
+    try:
+        from engine.signal_monitor import _momentum_check, _log_event, _push_early_book
+        import os
+        from supabase import create_client as _sc
+
+        key = os.environ.get("SUPABASE_KEY") or os.environ["SUPABASE_SECRET_KEY"]
+        sb  = _sc(os.environ["SUPABASE_URL"], key)
+
+        for sig in list(sigs):
+            try:
+                direction = sig["direction"]
+                entry     = float(sig["entry_price"])
+                is_long   = direction == "LONG"
+                pnl_pct   = (
+                    (close - entry) / entry * 100
+                    if is_long
+                    else (entry - close) / entry * 100
+                )
+
+                # Only check when signal is meaningfully in profit — RSI/MACD
+                # advice is only relevant when you have something to protect.
+                if pnl_pct < 0.3:
+                    continue
+
+                book_now, reason = _momentum_check(symbol, direction)
+                if book_now:
+                    note = (
+                        f"📊 {reason} — P&L: {pnl_pct:+.1f}% @ ${close:.2f}. "
+                        f"Consider booking profit."
+                    )
+                    _log_event(sb, sig["id"], "advisor_momentum", price=close, note=note)
+                    try:
+                        from engine import push as _push
+                        _push._send_raw(
+                            title=f"📊 Momentum Signal — {symbol}  {pnl_pct:+.1f}%",
+                            body=reason,
+                            data={"type": "advisor_momentum", "ticker": symbol,
+                                  "signal_id": str(sig["id"])},
+                        )
+                    except Exception:
+                        pass
+                    logger.info(
+                        f"[stream] 📊 RSI/MACD health: {symbol} {direction} "
+                        f"pnl={pnl_pct:+.1f}% — {reason}"
+                    )
+
+            except Exception as _se:
+                logger.debug(f"[stream] RSI health inner error {symbol}: {_se}")
+
+    except Exception as e:
+        logger.debug(f"[stream] RSI health check error for {symbol}: {e}")
+
+
+def _check_signal_health_structure(symbol: str, close: float) -> None:
+    """
+    SMC structure reversal (CHoCH) check for all active signals on this ticker.
+    Called every 15-min bar close. Fires a push + event if the structure has
+    flipped against the signal direction. Does NOT auto-close — advice only.
+    """
+    sigs = _rt_cache.get(symbol)
+    if not sigs:
+        return
+
+    try:
+        from engine.signal_monitor import _detect_structure_reversal, _log_event
+        import os
+        from supabase import create_client as _sc
+
+        key = os.environ.get("SUPABASE_KEY") or os.environ["SUPABASE_SECRET_KEY"]
+        sb  = _sc(os.environ["SUPABASE_URL"], key)
+
+        for sig in list(sigs):
+            try:
+                direction = sig["direction"]
+                entry     = float(sig["entry_price"])
+                is_long   = direction == "LONG"
+                pnl_pct   = (
+                    (close - entry) / entry * 100
+                    if is_long
+                    else (entry - close) / entry * 100
+                )
+
+                if _detect_structure_reversal(symbol, direction):
+                    opposite = "bearish" if direction == "LONG" else "bullish"
+                    note = (
+                        f"⚠️ {opposite.capitalize()} CHoCH on 15m chart — "
+                        f"structure reversed against {direction}. "
+                        f"P&L: {pnl_pct:+.1f}% @ ${close:.2f}. Consider exiting."
+                    )
+                    _log_event(sb, sig["id"], "advisor_reversal",
+                               price=close, note=note)
+                    try:
+                        from engine import push as _push
+                        _push._send_raw(
+                            title=f"🔄 Structure Reversed — {symbol}  {pnl_pct:+.1f}%",
+                            body=(
+                                f"{opposite.capitalize()} CHoCH detected on 15m. "
+                                f"{direction} thesis may be invalidated — review position."
+                            ),
+                            data={"type": "advisor_reversal", "ticker": symbol,
+                                  "signal_id": str(sig["id"])},
+                        )
+                    except Exception:
+                        pass
+                    logger.info(
+                        f"[stream] 🔄 Structure reversal: {symbol} {direction} "
+                        f"— {opposite} CHoCH @ ${close:.2f}"
+                    )
+
+            except Exception as _se:
+                logger.debug(f"[stream] Structure health inner error {symbol}: {_se}")
+
+    except Exception as e:
+        logger.debug(f"[stream] Structure health check error for {symbol}: {e}")
 
 
 # ── Per-ticker scalp processor (unchanged) ────────────────────
@@ -1052,6 +1200,29 @@ async def run_stream() -> None:
                         f"{ts_et.strftime('%H:%M ET')} — firing swing_trade"
                     )
                     _scan_executor.submit(_run_strategy_at_boundary, "swing_trade")
+
+                # ── Per-bar signal health: RSI/MACD every 5-min bar ───────────
+                # Only for tickers that currently have active signals in the RT
+                # cache — no point running for tickers nobody is holding.
+                # Throttle prevents duplicate runs if bar events arrive in burst.
+                if symbol in _rt_cache and minute % 5 == 0:
+                    now_mono = time.monotonic()
+                    if (now_mono - _bar_health_rsi_last.get(symbol, 0.0)
+                            >= _BAR_HEALTH_RSI_THROTTLE_S):
+                        _bar_health_rsi_last[symbol] = now_mono
+                        _scan_executor.submit(_check_signal_health_rsi, symbol, close)
+
+                # ── Per-bar signal health: structure reversal every 15-min bar ─
+                # CHoCH detection runs SMC on 15m bars — heavier than RSI but
+                # gives the clearest reversal signal. Rate-matched to bar frequency.
+                if symbol in _rt_cache and minute % 15 == 0:
+                    now_mono = time.monotonic()
+                    if (now_mono - _bar_health_structure_last.get(symbol, 0.0)
+                            >= _BAR_HEALTH_STRUCTURE_THROTTLE_S):
+                        _bar_health_structure_last[symbol] = now_mono
+                        _scan_executor.submit(
+                            _check_signal_health_structure, symbol, close
+                        )
 
             # ── Trade handler: price broadcast + real-time level checks ──────
             async def on_trade(trade) -> None:
