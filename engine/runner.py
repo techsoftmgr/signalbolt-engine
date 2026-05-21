@@ -35,6 +35,7 @@ from engine import unusual_whales as uw
 from engine import prescreener
 from engine import chop_detector
 from engine import mean_reversion
+from engine import gap_engine
 from engine import analytics as signal_analytics
 from engine import premarket_scanner
 from engine.setup_lifecycle import (
@@ -637,8 +638,36 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
         period=config["period"],
         strategy_type=strategy_type,
     )
+
+    # ── Gap-ORB fallback when SMC finds no structure ──────────────────────────
+    # On earnings gap days, the stock trades in "fresh air" — price levels with
+    # no historical candles, so SMC has no OBs, FVGs, or BOS/CHoCH to work with.
+    # The Opening Range (first 30 min) is the structural anchor on gap days.
+    # Only attempt this for day_trade (15m bars) — not scalping or swing.
+    if (not analysis or not analysis.get("direction")) and strategy_type == "day_trade":
+        try:
+            from engine import alpaca_client as _alpaca
+            _price = _alpaca.get_latest_price(ticker) or 0.0
+            _df    = analysis.get("candles") if analysis else None
+            if _df is None or _df.empty:
+                _df = _alpaca.get_bars(ticker, timeframe="15m", days=5)
+            if _df is not None and not _df.empty and _price > 0:
+                gap_analysis = gap_engine.analyze(
+                    ticker, _df, _price, strategy_type=strategy_type
+                )
+                if gap_analysis and gap_analysis.get("direction"):
+                    analysis = gap_analysis
+                    logger.info(
+                        f"[runner] {ticker} [gap_engine] SMC no-direction → "
+                        f"GAP-ORB {gap_analysis['direction']} setup found "
+                        f"(gap={gap_analysis.get('gap_pct', 0):+.1f}% "
+                        f"score={gap_analysis.get('confidence_score', 0)})"
+                    )
+        except Exception as _ge:
+            logger.debug(f"[runner] gap_engine fallback error for {ticker}: {_ge}")
+
     if not analysis or not analysis.get("direction"):
-        logger.debug(f"[runner] {ticker} [{strategy_type}]: no clear SMC direction")
+        logger.debug(f"[runner] {ticker} [{strategy_type}]: no clear direction (SMC+gap)")
         return
 
     direction = analysis["direction"]
@@ -654,13 +683,22 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
         interval=config.get("interval", "15m"),
         strategy_type=strategy_type,
     )
+    is_gap_orb = analysis.get("setup_type") == "GAP_ORB"
     if chop.is_choppy:
-        logger.info(
-            f"[runner] {ticker} [{strategy_type}] SKIPPED — chop "
-            f"score={chop.chop_score:.0f} > {chop.threshold_used:.0f} "
-            f"({', '.join(chop.reasons[:2])})"
-        )
-        return
+        if is_gap_orb:
+            # GAP_ORB setups are EXEMPT from chop blocking.
+            # The tight ORB consolidation IS the setup — the market is
+            # digesting the gap, not actually choppy.  Override is_choppy
+            # so the scorer doesn't penalise it.
+            chop.is_choppy = False
+            logger.debug(f"[runner] {ticker} GAP_ORB chop gate bypassed — tight ORB expected")
+        else:
+            logger.info(
+                f"[runner] {ticker} [{strategy_type}] SKIPPED — chop "
+                f"score={chop.chop_score:.0f} > {chop.threshold_used:.0f} "
+                f"({', '.join(chop.reasons[:2])})"
+            )
+            return
 
     # ── QUANT GATE 3: Manipulation check ─────────────────────
     is_crypto = ticker in ("COIN", "MSTR", "MARA", "RIOT", "CLSK")
