@@ -1,22 +1,31 @@
 """
 Real-time price store — bridges the Alpaca trade stream to app WebSocket clients.
 
-Flow:
+Architecture (10 Hz push loop):
   Alpaca trade → stream.py on_trade() → price_store.update()
-              → throttled broadcast → each connected WS client queue
+              → marks ticker as "dirty" (via call_soon_threadsafe onto event loop)
+              → every 100 ms: broadcast_snapshot() pushes ALL dirty tickers
+              → each connected WS client queue
               → FastAPI /ws/prices endpoint → phone screen
 
+Why 10 Hz loop instead of per-trade broadcast:
+  - Alpaca SIP sends thousands of trades/sec for liquid names.
+    Blasting every trade to the app would flood mobile connections.
+  - Per-trade throttle (old design) caused unpredictable timing — quiet
+    tickers got updates whenever the next trade arrived, not on a schedule.
+  - 100 ms loop = guaranteed 10 Hz refresh for ANY ticker that traded
+    in the last 100 ms. Smooth, predictable, bandwidth-efficient.
+
 Thread safety:
-  update() is called from the Alpaca SDK thread (sync).
-  Broadcasts are scheduled onto the FastAPI asyncio event loop via
-  loop.call_soon_threadsafe so no asyncio primitives are touched from
-  the wrong thread.
+  update() is called from the Alpaca SDK internal event loop (a different
+  thread from FastAPI).  The dirty-set mutation is pushed onto the FastAPI
+  event loop via call_soon_threadsafe — both the dirty-set add and
+  broadcast_snapshot run on the same asyncio thread, so no locks needed.
 """
 
 import asyncio
 import json
 import logging
-import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -30,19 +39,19 @@ ET = ZoneInfo("America/New_York")
 _prices: dict[str, dict] = {}
 
 # Previous-day close per ticker — used to compute live changePercent from trades.
-# Seeded from the Alpaca REST snapshot at startup.
+# Seeded from Alpaca REST snapshot at startup AND when WS clients subscribe.
 _prev_close: dict[str, float] = {}
+
+# ── Dirty set — tickers with new prices since the last broadcast cycle ────────
+# Written from event loop (via call_soon_threadsafe). Read + cleared every 100ms
+# by broadcast_snapshot() which also runs on the event loop — no lock needed.
+_dirty: set[str] = set()
 
 # ── WebSocket client registry ─────────────────────────────────────────────────
 
-# Each connected client gets an asyncio.Queue.  Messages are JSON strings.
+# Each connected WS client gets an asyncio.Queue. Messages are JSON strings.
 _clients: list[asyncio.Queue] = []
-_client_tickers: dict[int, set[str]] = {}   # id(queue) → subscribed tickers
-
-# ── Broadcast throttle ────────────────────────────────────────────────────────
-
-_last_sent: dict[str, float] = {}
-_THROTTLE_S: float = 0.15  # at most ~6 price pushes per second per ticker (SIP is real-time)
+_client_tickers: dict[int, set[str]] = {}   # id(queue) → subscribed ticker set
 
 # ── Event loop reference ──────────────────────────────────────────────────────
 
@@ -55,19 +64,18 @@ def init(loop: asyncio.AbstractEventLoop) -> None:
     """Call once at FastAPI startup with the running event loop."""
     global _loop
     _loop = loop
-    logger.info("[price_store] Initialised on event loop")
+    logger.info("[price_store] Initialised — 10 Hz broadcast loop ready")
 
 
 def set_prev_close(ticker: str, close: float) -> None:
-    """Store previous-day close so changePercent can be computed from raw trades."""
+    """Store previous-day close so changePercent is accurate for live trades."""
     _prev_close[ticker] = close
 
 
 def seed(ticker: str, price: float, change_pct: float, session: str) -> None:
     """
-    Seed the store from a REST snapshot at startup.
-    Ensures WebSocket clients that connect before the first trade
-    still receive an immediate price response.
+    Seed from a REST snapshot (startup or first WS subscribe).
+    Gives clients an immediate price before the first Alpaca trade arrives.
     """
     _prices[ticker] = {
         "price":         round(price, 2),
@@ -76,65 +84,71 @@ def seed(ticker: str, price: float, change_pct: float, session: str) -> None:
     }
 
 
-# ── Called from Alpaca trade stream (sync thread) ────────────────────────────
+# ── Session helper ────────────────────────────────────────────────────────────
 
 def _market_session_now() -> str:
-    """Simple time-based session tag — does not call Alpaca REST."""
     now = datetime.now(ET)
-    h, m = now.hour, now.minute
-    minutes = h * 60 + m
-    if   minutes < 4 * 60:           return "closed"
-    elif minutes < 9 * 60 + 30:      return "pre"
-    elif minutes < 16 * 60:          return "market"
-    elif minutes < 20 * 60:          return "post"
-    else:                             return "closed"
+    m   = now.hour * 60 + now.minute
+    if   m < 240:   return "closed"   # before 4:00 AM ET
+    elif m < 570:   return "pre"      # 4:00–9:29 AM ET
+    elif m < 960:   return "market"   # 9:30 AM–3:59 PM ET
+    elif m < 1200:  return "post"     # 4:00–7:59 PM ET
+    else:            return "closed"
 
+
+# ── Called from Alpaca trade stream ──────────────────────────────────────────
 
 def update(ticker: str, trade_price: float) -> None:
     """
-    Update price from a live Alpaca trade.
-    Called from the Alpaca SDK thread — must be thread-safe.
+    Record a live trade price and mark the ticker dirty for the next
+    broadcast cycle.  Called from the Alpaca SDK thread — must not touch
+    asyncio primitives directly.  Uses call_soon_threadsafe to queue the
+    dirty-set mutation onto the FastAPI event loop.
     """
     prev    = _prev_close.get(ticker)
     chg_pct = ((trade_price - prev) / prev * 100) if prev else 0.0
-    session = _market_session_now()
 
     _prices[ticker] = {
         "price":         round(trade_price, 2),
         "changePercent": round(chg_pct, 3),
-        "session":       session,
+        "session":       _market_session_now(),
     }
 
-    # Throttle: don't broadcast more than once per _THROTTLE_S per ticker
-    now = time.monotonic()
-    if now - _last_sent.get(ticker, 0) < _THROTTLE_S:
+    # Queue the dirty mark onto the event loop (thread-safe)
+    if _loop and not _loop.is_closed():
+        _loop.call_soon_threadsafe(_dirty.add, ticker)
+
+
+# ── 10 Hz broadcast snapshot (runs on FastAPI event loop) ────────────────────
+
+async def broadcast_snapshot() -> None:
+    """
+    Push all dirty (changed) ticker prices to every connected WS client.
+    Called every 100 ms by the broadcast loop in main.py.
+
+    Because this and update()'s call_soon_threadsafe callback both run on
+    the same asyncio event loop thread, _dirty access is race-free.
+    """
+    if not _clients or not _dirty:
         return
-    _last_sent[ticker] = now
 
-    # Schedule async broadcast on the FastAPI event loop.
-    # Use _loop.create_task() inside call_soon_threadsafe — this is the
-    # correct Python 3.10+ pattern.  asyncio.ensure_future() works but emits
-    # DeprecationWarning when the running loop isn't the default loop.
-    if _loop and not _loop.is_closed() and _clients:
-        _loop.call_soon_threadsafe(
-            lambda t=ticker, d=dict(_prices[ticker]):
-                _loop.create_task(_broadcast(t, d))
-        )
+    # Snapshot and clear the dirty set atomically (single event-loop thread)
+    tickers = list(_dirty)
+    _dirty.clear()
 
-
-# ── Async broadcast (runs on FastAPI event loop) ──────────────────────────────
-
-async def _broadcast(ticker: str, data: dict) -> None:
-    if not _clients:
-        return
-    msg = json.dumps({ticker: data})
-    for q in list(_clients):
-        subs = _client_tickers.get(id(q), set())
-        if not subs or ticker in subs:
-            try:
-                q.put_nowait(msg)
-            except asyncio.QueueFull:
-                pass   # slow client — skip this tick, they'll catch up
+    # Build one JSON message per ticker and fan-out to subscribed clients
+    for ticker in tickers:
+        data = _prices.get(ticker)
+        if not data:
+            continue
+        msg = json.dumps({ticker: data})
+        for q in list(_clients):
+            subs = _client_tickers.get(id(q), set())
+            if not subs or ticker in subs:
+                try:
+                    q.put_nowait(msg)
+                except asyncio.QueueFull:
+                    pass  # slow client — drop this tick, next cycle catches up
 
 
 # ── WebSocket client management ───────────────────────────────────────────────
@@ -142,7 +156,10 @@ async def _broadcast(ticker: str, data: dict) -> None:
 def add_client(q: asyncio.Queue, tickers: set[str]) -> None:
     _clients.append(q)
     _client_tickers[id(q)] = tickers
-    logger.debug(f"[price_store] WS client added — {len(_clients)} connected, tickers={tickers}")
+    logger.info(
+        f"[price_store] WS client connected — "
+        f"{len(_clients)} total | tickers={sorted(tickers)}"
+    )
 
 
 def remove_client(q: asyncio.Queue) -> None:
@@ -151,9 +168,13 @@ def remove_client(q: asyncio.Queue) -> None:
     except ValueError:
         pass
     _client_tickers.pop(id(q), None)
-    logger.debug(f"[price_store] WS client removed — {len(_clients)} remaining")
+    logger.info(f"[price_store] WS client disconnected — {len(_clients)} remaining")
 
 
 def snapshot(tickers: list[str]) -> dict:
-    """Current prices for given tickers — for immediate send on WS connect."""
+    """Return current prices for given tickers (immediate WS connect response)."""
     return {t: _prices[t] for t in tickers if t in _prices}
+
+
+def connected_client_count() -> int:
+    return len(_clients)

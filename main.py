@@ -355,10 +355,27 @@ async def lifespan(app: FastAPI):
     # ── Alpaca WebSocket: bars (signal scanning) + trades (price broadcast) ──
     stream_task = asyncio.create_task(run_stream(), name="alpaca_stream")
 
+    # ── 10 Hz price broadcast loop ────────────────────────────────────────────
+    # Every 100 ms: push all tickers that received a new trade since the last
+    # cycle to every connected app WebSocket client.  This replaces the old
+    # per-trade throttled broadcast and gives smooth, predictable 10 Hz updates
+    # regardless of how many trades Alpaca sends per second.
+    async def _price_broadcast_loop():
+        while True:
+            await asyncio.sleep(0.1)   # 100 ms = 10 Hz
+            try:
+                await price_store.broadcast_snapshot()
+            except Exception as _be:
+                logger.debug(f"[price_broadcast] error: {_be}")
+
+    broadcast_task = asyncio.create_task(
+        _price_broadcast_loop(), name="price_broadcast"
+    )
+
     logger.info(
         "SignalBolt engine started — "
         "scalping=WebSocket real-time | day_trade/swing=APScheduler | "
-        "prices=WebSocket push to app"
+        "prices=10 Hz WebSocket push to app"
     )
     yield
 
@@ -379,13 +396,18 @@ async def lifespan(app: FastAPI):
     except Exception as _se:
         logger.debug(f"[lifespan] stream stop error (non-fatal): {_se}")
 
+    broadcast_task.cancel()
     stream_task.cancel()
     try:
         await stream_task
     except asyncio.CancelledError:
         pass
+    try:
+        await broadcast_task
+    except asyncio.CancelledError:
+        pass
     scheduler.shutdown(wait=False)
-    logger.info("Engine stopped — scheduler and stream shut down")
+    logger.info("Engine stopped — scheduler, stream, and broadcast loop shut down")
 
 
 app = FastAPI(title="SignalBolt Engine", version="3.1.0", lifespan=lifespan)
