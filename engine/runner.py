@@ -149,7 +149,7 @@ STRATEGY_CONFIGS = [
         "tickers":           ALL_TICKERS,
         "interval":          "15m",
         "period":            "5d",
-        "run_every_minutes": 15,
+        "run_every_minutes": 10,   # APScheduler job fires every 10 min during market hours
     },
     {
         "type":              "swing_trade",
@@ -1516,6 +1516,35 @@ def start_scheduler() -> BackgroundScheduler:
         replace_existing=True,
     )
     logger.info("[runner] Scheduled market-hours signal monitor every 5 min (9:30 AM–4:05 PM ET)")
+
+    # ── Day trade scan every 10 min during market hours ─────────────────────
+    # Stream.py fires scans at 15-min bar-close events but a stock that starts
+    # moving at minute 7 won't be picked up until minute 15. Running a full
+    # day_trade scan every 10 min with a freshly-screened ticker list catches
+    # new movers up to 5 min sooner. The 15m bar data is unchanged between closes
+    # but the prescreener will surface newly-active tickers for SMC analysis.
+    day_trade_config = next(c for c in STRATEGY_CONFIGS if c["type"] == "day_trade")
+
+    def _intraday_scan_job():
+        from zoneinfo import ZoneInfo as _ZI
+        from datetime import datetime as _dt
+        _now = _dt.now(_ZI("America/New_York"))
+        _mins = _now.hour * 60 + _now.minute
+        # 9:30 AM = 570, 3:55 PM = 955 — stop 5 min before EOD force-close
+        if 570 <= _mins <= 955 and _now.weekday() < 5:
+            try:
+                _run_strategy_scan(day_trade_config)
+            except Exception as _e:
+                logger.error(f"[runner] 10-min day_trade scan failed: {_e}")
+
+    scheduler.add_job(
+        _intraday_scan_job,
+        trigger=IntervalTrigger(minutes=10),
+        id="day_trade_10min",
+        name="Day trade scan (10-min, 9:30 AM–3:55 PM ET)",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled day_trade scan every 10 min (9:30 AM–3:55 PM ET)")
 
     # ── Pre-market scans — 8:00 AM ET (12:00 UTC) and 9:00 AM ET (13:00 UTC) ──
     from apscheduler.triggers.cron import CronTrigger

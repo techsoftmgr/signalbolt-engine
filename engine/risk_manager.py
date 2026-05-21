@@ -1,15 +1,15 @@
 """
 Risk Manager
 ============
-Portfolio-level risk controls that run before firing any signal:
+Pre-fire gate that grades every signal and adds metadata before it fires.
 
-  - Max 5 concurrent active signals
-  - Max 20% portfolio heat
-  - Max 2 signals per sector
-  - Max 3 consecutive losses (regime mismatch warning)
-  - Position size multiplier based on confidence tier
+  - Grades signal by confidence tier (A+ / A / B+ / B / C)
+  - Warns when 3+ consecutive losses detected (possible regime mismatch)
+  - Tags sector so the UI can surface "2nd Tech signal active" as a label
+  - Hard caps (max 5 concurrent, max 2/sector) removed — the 9-layer scorer
+    is the quality gate. A valid A+ setup should fire even if others are active.
 
-Confidence tiers (composite score → position size):
+Confidence tiers (composite score → position size guidance):
   A+  ≥90 → 1.00x (full)
   A   ≥80 → 0.75x
   B+  ≥70 → 0.50x
@@ -33,10 +33,7 @@ logger = logging.getLogger("signalbolt.risk")
 _loss_cache: tuple[int, float] = (0, 0.0)  # (count, fetched_at)
 _LOSS_CACHE_TTL = 60  # seconds
 
-MAX_CONCURRENT_SIGNALS = 5
-MAX_PORTFOLIO_HEAT     = 0.20   # 20% = all 5 slots filled
-MAX_SECTOR_SIGNALS     = 2
-MIN_CONFIDENCE_FIRE    = 60     # anything below = blocked
+MIN_CONFIDENCE_FIRE    = 60     # anything below = blocked (tier C)
 
 # Confidence tier thresholds
 TIERS = [
@@ -103,54 +100,53 @@ def get_confidence_tier(score: int) -> tuple[str, float]:
 
 def check(sb: Client, ticker: str, score: int) -> dict:
     """
-    Run all portfolio risk checks before firing a signal.
+    Grade and annotate a signal before it fires. No hard caps on concurrent
+    signals or sector concentration — the 9-layer scorer is the quality gate.
+    Sector info is returned as metadata so the UI can show a warning label
+    ("2nd Tech signal active") without silently blocking valid setups.
 
     Returns:
         {
-          "allowed":           bool,
-          "block_reason":      str,
-          "confidence_tier":   str,
-          "position_mult":     float,
-          "open_count":        int,
-          "portfolio_heat":    float,
+          "allowed":            bool,
+          "block_reason":       str,
+          "confidence_tier":    str,   # A+ / A / B+ / B / C
+          "position_mult":      float, # position size guidance
+          "open_count":         int,
+          "sector":             str,
+          "sector_count":       int,   # active signals in same sector (for UI warning)
           "consecutive_losses": int,
-          "regime_mismatch":   bool,
+          "regime_mismatch":    bool,
         }
     """
     tier, pos_mult = get_confidence_tier(score)
 
-    # Score too low → blocked
+    # Score too low → blocked (tier C, <60)
     if score < MIN_CONFIDENCE_FIRE:
         return {
-            "allowed": False,
-            "block_reason": f"Score {score} below minimum {MIN_CONFIDENCE_FIRE}",
-            "confidence_tier": tier,
-            "position_mult": 0.0,
-            "open_count": 0,
-            "portfolio_heat": 0.0,
+            "allowed":            False,
+            "block_reason":       f"Score {score} below minimum {MIN_CONFIDENCE_FIRE} (tier C)",
+            "confidence_tier":    tier,
+            "position_mult":      0.0,
+            "open_count":         0,
+            "sector":             get_sector(ticker),
+            "sector_count":       0,
             "consecutive_losses": 0,
-            "regime_mismatch": False,
+            "regime_mismatch":    False,
         }
 
     try:
-        # Fetch open signals
-        active = sb.table("signals").select("ticker, strategy_type, result").eq("status", "active").execute().data or []
+        # Fetch open signals for sector metadata + consecutive loss check
+        active = (
+            sb.table("signals")
+            .select("ticker, result")
+            .eq("status", "active")
+            .execute()
+            .data or []
+        )
 
-        open_count     = len(active)
-        portfolio_heat = open_count / MAX_CONCURRENT_SIGNALS
-
-        # Max concurrent check
-        if open_count >= MAX_CONCURRENT_SIGNALS:
-            return _blocked(f"Max {MAX_CONCURRENT_SIGNALS} concurrent signals reached", tier, pos_mult, open_count, portfolio_heat, 0)
-
-        # Sector concentration check
+        open_count    = len(active)
         ticker_sector = get_sector(ticker)
         sector_count  = sum(1 for s in active if get_sector(s["ticker"]) == ticker_sector)
-        if sector_count >= MAX_SECTOR_SIGNALS:
-            return _blocked(
-                f"Sector '{ticker_sector}' already has {sector_count} active signals",
-                tier, pos_mult, open_count, portfolio_heat, 0,
-            )
 
         # Consecutive losses — cached 60s so all tickers in a scan share one DB query
         global _loss_cache
@@ -181,10 +177,13 @@ def check(sb: Client, ticker: str, score: int) -> dict:
                 f"[risk] {consecutive_losses} consecutive losses — possible regime mismatch"
             )
 
-        logger.info(
-            f"[risk] {ticker} tier={tier} pos={pos_mult:.0%} "
-            f"open={open_count}/{MAX_CONCURRENT_SIGNALS} sector={ticker_sector}({sector_count})"
-        )
+        if sector_count > 0:
+            logger.info(
+                f"[risk] {ticker} tier={tier} pos={pos_mult:.0%} "
+                f"open={open_count} sector={ticker_sector} ({sector_count} active in sector)"
+            )
+        else:
+            logger.info(f"[risk] {ticker} tier={tier} pos={pos_mult:.0%} open={open_count}")
 
         return {
             "allowed":            True,
@@ -192,37 +191,24 @@ def check(sb: Client, ticker: str, score: int) -> dict:
             "confidence_tier":    tier,
             "position_mult":      pos_mult,
             "open_count":         open_count,
-            "portfolio_heat":     round(portfolio_heat, 2),
+            "sector":             ticker_sector,
+            "sector_count":       sector_count,
             "consecutive_losses": consecutive_losses,
             "regime_mismatch":    regime_mismatch,
         }
 
     except Exception as e:
-        logger.error(f"[risk] portfolio check error — failing closed to protect portfolio: {e}")
-        # Fail CLOSED — do not fire signals when we can't verify portfolio state.
-        # Firing blind could exceed max concurrent / sector limits.
+        logger.error(f"[risk] portfolio check error: {e} — allowing signal (no cap enforcement)")
         return {
-            "allowed": False,
-            "block_reason": f"Portfolio DB check failed — signals paused until DB recovers",
-            "confidence_tier": tier,
-            "position_mult": pos_mult,
-            "open_count": 0,
-            "portfolio_heat": 0.0,
+            "allowed":            True,
+            "block_reason":       "",
+            "confidence_tier":    tier,
+            "position_mult":      pos_mult,
+            "open_count":         0,
+            "sector":             get_sector(ticker),
+            "sector_count":       0,
             "consecutive_losses": 0,
-            "regime_mismatch": False,
+            "regime_mismatch":    False,
         }
 
 
-def _blocked(reason: str, tier: str, pos_mult: float,
-             open_count: int, heat: float, losses: int) -> dict:
-    logger.info(f"[risk] BLOCKED — {reason}")
-    return {
-        "allowed": False,
-        "block_reason": reason,
-        "confidence_tier": tier,
-        "position_mult": pos_mult,
-        "open_count": open_count,
-        "portfolio_heat": round(heat, 2),
-        "consecutive_losses": losses,
-        "regime_mismatch": False,
-    }

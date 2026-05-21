@@ -22,9 +22,9 @@ from typing import Optional
 
 logger = logging.getLogger("signalbolt.prescreener")
 
-# ── Cache: avoid re-screening within 5 min ───────────────────────────────────
+# ── Cache: re-screen every 2 min so new momentum movers are picked up quickly ─
 _screen_cache: tuple[Optional[list[str]], float] = (None, 0.0)
-_SCREEN_CACHE_TTL = 300   # 5 minutes
+_SCREEN_CACHE_TTL = 120   # 2 minutes
 
 # ── Always include these regardless of pre-screen results ────────────────────
 # Core liquid tickers that generate the most reliable SMC setups.

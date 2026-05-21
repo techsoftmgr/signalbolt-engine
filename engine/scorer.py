@@ -44,14 +44,19 @@ _L3_CACHE_TTL = 1800  # 30 minutes
 _earnings_cache: dict[str, tuple[Optional[int], float]] = {}  # ticker → (days, fetched_at)
 _EARNINGS_CACHE_TTL = 86400  # 24 hours
 
-FIRE_THRESHOLD = 78  # legacy default — use STRATEGY_THRESHOLDS per strategy
+FIRE_THRESHOLD = 60  # anything below = tier C (no structural edge)
 
+# All strategies use 60 as the hard floor — the 9-layer structural gates
+# (SMC, chop, manipulation, regime) are the real quality filter.
+# A score of 60-69 = B grade, fires with 0.25x size guidance.
+# Blocking at 78 was silently missing valid setups (e.g. 73% VLO +1.79%,
+# 74% QCOM that hit T1 before EOD).
 STRATEGY_THRESHOLDS: dict[str, int] = {
-    'scalping':     78,   # quality bar: stricter SMC filters do the heavy lifting
-    'day_trade':    78,   # 78 with stricter filters >> 75 with loose filters
-    'swing_trade':  76,   # swing needs room — structure filters are already tight
-    'options_flow': 78,
-    'dark_pool':    76,
+    'scalping':     60,
+    'day_trade':    60,
+    'swing_trade':  60,
+    'options_flow': 60,
+    'dark_pool':    60,
 }
 
 # Weights for each scoring layer (must sum to 100 per strategy)
