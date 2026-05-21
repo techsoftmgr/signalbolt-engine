@@ -629,14 +629,65 @@ async def ws_prices(websocket: WebSocket):
         if snap:
             await websocket.send_text(json.dumps(snap))
 
-        # ── Step 3: stream live updates ───────────────────────────────────
-        while True:
-            try:
-                update = await _asyncio.wait_for(queue.get(), timeout=25)
-                await websocket.send_text(update)
-            except _asyncio.TimeoutError:
-                # Keepalive ping so the connection stays open
-                await websocket.send_text(json.dumps({"ping": True}))
+        # ── Step 3: stream live updates + handle re-subscribes ───────────────
+        # Two concurrent tasks run in parallel:
+        #   • dequeue price updates from broadcast_snapshot and forward them
+        #   • receive incoming WS messages from the app (re-subscribe requests)
+        #
+        # Why re-subscribe matters: the app sends a second {"subscribe":[...]}
+        # when signals finish loading (visibleTickers changes after the initial
+        # empty-set connect). Without this loop the server silently drops it.
+        async def _recv_loop():
+            """Handle incoming messages from the app (re-subscribe, etc.)."""
+            while True:
+                try:
+                    raw_in = await websocket.receive_text()
+                    msg_in = json.loads(raw_in)
+                    new_subs = {
+                        t.strip().upper()
+                        for t in msg_in.get("subscribe", [])
+                        if t.strip()
+                    }
+                    if new_subs:
+                        # Merge with existing subscription set
+                        tickers.update(new_subs)
+                        price_store.add_client(queue, tickers)   # updates registry
+                        # Subscribe new tickers on Alpaca if not already streaming
+                        try:
+                            from engine.runner import ALL_TICKERS as _ALL2
+                            from engine.stream import subscribe_extra_tickers as _sub2
+                            extra2 = [t for t in new_subs if t not in set(_ALL2)]
+                            if extra2:
+                                _asyncio.create_task(_sub2(extra2))
+                        except Exception:
+                            pass
+                        # Send immediate snapshot for newly subscribed tickers
+                        new_snap = price_store.snapshot(list(new_subs))
+                        if new_snap:
+                            await websocket.send_text(json.dumps(new_snap))
+                except Exception:
+                    break   # disconnect or parse error — let outer handler clean up
+
+        async def _send_loop():
+            """Forward price updates from broadcast_snapshot to the client."""
+            while True:
+                try:
+                    update = await _asyncio.wait_for(queue.get(), timeout=25)
+                    await websocket.send_text(update)
+                except _asyncio.TimeoutError:
+                    # Keepalive ping so the connection stays alive
+                    await websocket.send_text(json.dumps({"ping": True}))
+
+        # Run both loops concurrently — cancel both when either exits
+        done, pending = await _asyncio.wait(
+            [
+                _asyncio.create_task(_recv_loop()),
+                _asyncio.create_task(_send_loop()),
+            ],
+            return_when=_asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
 
     except (WebSocketDisconnect, _asyncio.CancelledError):
         pass
