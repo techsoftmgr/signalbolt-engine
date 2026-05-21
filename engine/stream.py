@@ -108,6 +108,28 @@ _rt_last_check: dict[str, float] = {}   # ticker → last monotonic check time
 _TICK_SCALP_THROTTLE_S: float = 300.0
 _tick_scalp_last: dict[str, float] = {}   # ticker → last tick-scan monotonic time
 
+# ── Tick-triggered day_trade scanner ─────────────────────────────────────────
+# Fire a full day_trade SMC scan the moment a ticker shows ≥0.4% momentum in
+# the last 60 seconds — without waiting for the next 15-min bar boundary.
+# This means new day_trade signals can appear within seconds of a setup forming,
+# not at the next fixed 15-min clock tick.
+#
+# Throttle: 900 s (15 min) per ticker — same cadence as bar-close day_trade scans.
+# Gate: only fires when _has_tick_momentum() confirms the move is real.
+_TICK_DAYTRADE_THROTTLE_S: float = 900.0
+_tick_daytrade_last: dict[str, float] = {}   # ticker → last tick-scan monotonic time
+
+# ── Price momentum buffer ─────────────────────────────────────────────────────
+# A rolling 60-second window of trade prices per ticker.
+# Used by _has_tick_momentum() to detect fast directional moves before the next
+# bar close — the trigger gate for tick-triggered day_trade scans.
+#
+# Structure: { ticker: [(price, monotonic_ts), ...] }
+# Pruned on every write so memory stays bounded.
+_PRICE_BUFFER_WINDOW_S: float = 60.0    # look-back window
+_MOMENTUM_THRESHOLD:    float = 0.004   # 0.4% move in 60 s → scan fires
+_price_buffer: dict[str, list] = {}     # ticker → [(price, ts), ...]
+
 # ── Dynamic ticker subscription ────────────────────────────────────────────
 # App WS clients may subscribe to tickers beyond ALL_TICKERS (custom watchlists).
 # These are dynamically added to the live Alpaca trade stream so every ticker
@@ -383,7 +405,7 @@ def _refresh_rt_cache() -> None:
         sb = _sc(os.environ["SUPABASE_URL"], key)
         rows = (
             sb.table("signals")
-            .select("id, ticker, direction, entry_price, stop_loss, target_one, target_two, strategy_type")
+            .select("id, ticker, direction, entry_price, stop_loss, target_one, target_two, strategy_type, created_at")
             .eq("status", "active")
             .neq("strategy_type", "scalping")   # scalping handled by bar checker
             .execute()
@@ -470,6 +492,13 @@ def _close_rt_signal(sig: dict, hit: str, price: float) -> None:
         # Evict from cache immediately — prevents duplicate close
         sigs = _rt_cache.get(ticker, [])
         _rt_cache[ticker] = [s for s in sigs if s["id"] != sig["id"]]
+
+        # Clear advisor state — signal is closed, no more advice needed
+        try:
+            from engine import signal_advisor as _advisor
+            _advisor.evict(sig["id"])
+        except Exception:
+            pass
 
         logger.info(
             f"[stream] ⚡ RT CLOSE {ticker} {sig['direction']} "
@@ -592,6 +621,13 @@ def _handle_t1_rt(sig: dict, price: float) -> None:
             sigs = _rt_cache.get(ticker, [])
             _rt_cache[ticker] = [s for s in sigs if s["id"] != sig["id"]]
 
+            # Clear advisor state — signal is closed, no more advice needed
+            try:
+                from engine import signal_advisor as _advisor
+                _advisor.evict(sig["id"])
+            except Exception:
+                pass
+
             logger.info(
                 f"[stream] ✅ T1 BOOKED {ticker} {sig['direction']} "
                 f"price={price:.2f} pnl=+{pnl_pct:.2f}% strategy={strategy}"
@@ -599,6 +635,88 @@ def _handle_t1_rt(sig: dict, price: float) -> None:
 
     except Exception as e:
         logger.debug(f"[stream] RT T1 handler failed for {sig.get('id')}: {e}")
+
+
+# ── Price momentum buffer helpers ─────────────────────────────────────────────
+
+def _update_price_buffer(ticker: str, price: float) -> None:
+    """
+    Append the latest trade price to the rolling 60-second buffer for this ticker.
+    Old entries (beyond _PRICE_BUFFER_WINDOW_S) are pruned on each write so the
+    buffer stays memory-bounded even for high-frequency tickers.
+    """
+    now     = time.monotonic()
+    buf     = _price_buffer.setdefault(ticker, [])
+    buf.append((price, now))
+    cutoff  = now - _PRICE_BUFFER_WINDOW_S
+    # Prune in-place — keep only entries inside the look-back window
+    _price_buffer[ticker] = [(p, t) for (p, t) in buf if t >= cutoff]
+
+
+def _has_tick_momentum(ticker: str) -> bool:
+    """
+    Return True if the price moved ≥ _MOMENTUM_THRESHOLD (0.4%) within the
+    last 60 seconds according to the buffer.
+
+    Uses max-min range rather than open-close so it catches both up and down
+    moves regardless of direction.
+    """
+    buf = _price_buffer.get(ticker)
+    if not buf or len(buf) < 2:
+        return False
+    prices = [p for (p, _) in buf]
+    lo, hi = min(prices), max(prices)
+    if lo <= 0:
+        return False
+    return (hi - lo) / lo >= _MOMENTUM_THRESHOLD
+
+
+# ── Tick-triggered day_trade processor ────────────────────────────────────────
+
+def _process_daytrade_ticker_sync(symbol: str, price: float) -> None:
+    """
+    Run the full day_trade SMC pipeline for a single ticker, triggered by a
+    live momentum event rather than a 15-min bar boundary.
+
+    This is the mechanism that makes new day_trade signals fire within seconds
+    of a setup forming instead of waiting up to 15 minutes for the next bar close.
+
+    Called from _scan_executor — identical footprint to _process_bar_sync.
+    Throttled to _TICK_DAYTRADE_THROTTLE_S (15 min) per ticker in on_trade.
+    """
+    try:
+        session = _get_session()
+        if session.get("blocked") or not session.get("market_open"):
+            logger.debug(
+                f"[stream] {symbol} tick day_trade skipped — "
+                f"{session.get('block_reason', 'market closed')}"
+            )
+            return
+
+        regime = _get_regime()
+        if regime.get("blocked"):
+            logger.debug(
+                f"[stream] {symbol} tick day_trade skipped — "
+                f"{regime.get('block_reason', 'regime blocked')}"
+            )
+            return
+
+        logger.info(
+            f"[stream] ⚡ Tick day_trade: {symbol} @ {price:.2f} "
+            f"(momentum ≥{_MOMENTUM_THRESHOLD*100:.1f}% in 60s) | "
+            f"{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
+        )
+
+        from engine.runner import _process_smc_ticker, _supabase
+        sb     = _supabase()
+        config = {"type": "day_trade", "interval": "15m", "period": "5d"}
+        _process_smc_ticker(sb, symbol, config, regime=regime, session=session)
+
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        logger.error(
+            f"[stream] Tick day_trade error for {symbol}: {e}", exc_info=True
+        )
 
 
 # ── Near-stop real-time warning ───────────────────────────────────────────────
@@ -732,6 +850,23 @@ def _check_rt_levels(ticker: str, price: float) -> None:
                         if time.monotonic() - last_warn >= _NEAR_STOP_THROTTLE_S:
                             _near_stop_warned[sig["id"]] = time.monotonic()
                             _rt_executor.submit(_warn_near_stop, sig.copy(), price)
+
+            # ── Contextual hold/exit advisory ────────────────────────────────
+            # Guard: only run if the signal wasn't evicted by a close above.
+            # _close_rt_signal() removes the signal from _rt_cache immediately;
+            # checking the cache here prevents advisor from running on a signal
+            # that was just closed at T2 or SL this same tick.
+            # (T1 trail path keeps the signal in cache — advisor still runs there,
+            # which is desirable: momentum-toward-T2 advice is most relevant then.)
+            sig_still_active = any(
+                s["id"] == sig["id"] for s in _rt_cache.get(ticker, [])
+            )
+            if sig_still_active:
+                try:
+                    from engine import signal_advisor as _advisor
+                    _advisor.check(sig, price, _get_regime(), _get_session())
+                except Exception:
+                    pass
 
         except Exception as e:
             logger.debug(f"[stream] RT level check error for {ticker}/{sig.get('id')}: {e}")
@@ -949,6 +1084,23 @@ async def run_stream() -> None:
                     if now - _tick_scalp_last.get(ticker, 0.0) >= _TICK_SCALP_THROTTLE_S:
                         _tick_scalp_last[ticker] = now
                         _scan_executor.submit(_process_bar_sync, ticker, price, 0)
+
+                # 4. Price momentum buffer — rolling 60-second window per ticker.
+                #    Updated on every tick so _has_tick_momentum() has fresh data.
+                #    Runs for ALL tickers (scalp and non-scalp alike) so the buffer
+                #    is always populated regardless of strategy.
+                _update_price_buffer(ticker, price)
+
+                # 5. Tick-triggered day_trade scan — fires when price moves ≥0.4%
+                #    in the last 60 seconds, bypassing the 15-min bar-close boundary.
+                #    New day_trade signals can now appear within seconds of a setup
+                #    forming rather than waiting up to 15 minutes.
+                #    Throttle: 900 s (15 min) per ticker — same cadence as bar-close
+                #    scans so we never flood the pipeline with redundant work.
+                if _has_tick_momentum(ticker):
+                    if now - _tick_daytrade_last.get(ticker, 0.0) >= _TICK_DAYTRADE_THROTTLE_S:
+                        _tick_daytrade_last[ticker] = now
+                        _scan_executor.submit(_process_daytrade_ticker_sync, ticker, price)
 
             wss.subscribe_bars(on_bar, *all_subscribe)
             wss.subscribe_trades(on_trade, *all_subscribe)
