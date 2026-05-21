@@ -685,6 +685,46 @@ def get_indices():
     return result
 
 
+@app.get("/premarket")
+def get_premarket(min_score: int = 0, limit: int = 50):
+    """
+    Return today's pre-market watchlist sorted by watch_score descending.
+
+    Query params:
+      min_score  — only return tickers with watch_score >= this (default 0)
+      limit      — max rows (default 50)
+
+    Falls back to live in-memory cache when Supabase is slow; returns []
+    when neither the cache nor DB is populated yet (before 8 AM ET).
+    """
+    try:
+        from engine import premarket_scanner as _pm
+        cached = _pm._cache
+        if cached is not None:
+            rows = [
+                vars(r) for r in cached.results
+                if r.watch_score >= min_score
+            ][:limit]
+            return {"premarket": rows, "count": len(rows), "source": "cache"}
+
+        # Fall back to Supabase DB
+        sb        = _make_supabase()
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        query = (
+            sb.table("premarket_watchlist")
+            .select("*")
+            .eq("scan_date", today_str)
+            .gte("watch_score", min_score)
+            .order("watch_score", desc=True)
+            .limit(limit)
+        )
+        result = query.execute()
+        return {"premarket": result.data, "count": len(result.data), "source": "db"}
+    except Exception as e:
+        logger.error(f"GET /premarket error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/signals")
 def get_signals(user_id: str = "", strategy_type: str = ""):
     """

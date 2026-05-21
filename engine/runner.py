@@ -36,6 +36,7 @@ from engine import prescreener
 from engine import chop_detector
 from engine import mean_reversion
 from engine import analytics as signal_analytics
+from engine import premarket_scanner
 from engine.setup_lifecycle import (
     SetupLifecycleManager,
     classify_setup_type,
@@ -1240,6 +1241,14 @@ def _run_strategy_scan(config: dict) -> None:
             logger.warning(f"[runner] Pre-screener failed: {e} — using core tickers")
             tickers = prescreener.CORE_TICKERS
 
+        # Apply pre-market priority ordering (no-op outside 9:30–10:30 AM ET window
+        # or when cache is empty).  High-watch-score tickers bubble to the front
+        # so SMC gets the most interesting setups first each morning.
+        try:
+            tickers = premarket_scanner.get_priority_tickers(tickers)
+        except Exception as _pm_err:
+            logger.debug(f"[runner] Pre-market prioritisation skipped: {_pm_err}")
+
     logger.info(
         f"[runner] {strategy_type.upper()} scan started — "
         f"{len(tickers)} tickers @ {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
@@ -1461,8 +1470,31 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled market-hours signal monitor every 5 min (9:30 AM–4:05 PM ET)")
 
-    # ── Daily analytics report — 5:30 PM ET (21:30 UTC) Mon-Fri ─────────
+    # ── Pre-market scans — 8:00 AM ET (12:00 UTC) and 9:00 AM ET (13:00 UTC) ──
     from apscheduler.triggers.cron import CronTrigger
+    scheduler.add_job(
+        premarket_scanner.run_8am_scan,
+        trigger=CronTrigger(
+            day_of_week="mon-fri", hour=12, minute=0, timezone="UTC"
+        ),
+        id="premarket_8am",
+        name="Pre-market scan 8:00 AM ET",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled pre-market scan at 8:00 AM ET (Mon-Fri)")
+
+    scheduler.add_job(
+        premarket_scanner.run_9am_scan,
+        trigger=CronTrigger(
+            day_of_week="mon-fri", hour=13, minute=0, timezone="UTC"
+        ),
+        id="premarket_9am",
+        name="Pre-market scan 9:00 AM ET",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled pre-market scan at 9:00 AM ET (Mon-Fri)")
+
+    # ── Daily analytics report — 5:30 PM ET (21:30 UTC) Mon-Fri ─────────
     scheduler.add_job(
         _run_analytics_report,
         trigger=CronTrigger(
