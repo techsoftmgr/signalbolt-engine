@@ -45,6 +45,12 @@ EXTENDED_UNIVERSE = [
     "CRM", "NOW", "SNOW", "PLTR", "DDOG", "NET", "CRWD", "ZS", "OKTA",
     "FTNT", "PANW", "TEAM", "SHOP", "MELI", "SE", "GRAB", "U", "RBLX",
     "COIN", "HOOD", "SOFI", "AFRM", "UPST", "LC",
+    "TWLO", "BILL", "ZM", "ROKU", "TTD", "GTLB", "MNDY", "DBX",
+    # ── High-growth / momentum names ──────────────────────────
+    # These are frequently the biggest intraday/earnings movers — must be in universe
+    "SPOT", "RDDT", "APP", "CELH", "DUOL", "ONON", "DECK", "ELF",
+    "HIMS", "SNAP", "PINS", "DOCS", "WOLF", "TTWO", "EA", "RIVN",
+    "HOOD", "AFRM", "UPST", "OPEN", "COUR", "BMBL", "JOBY",
     # ── Indices / ETFs ─────────────────────────────────────────
     "SPY", "QQQ", "IWM", "DIA", "TQQQ", "SQQQ", "UVXY", "VXX",
     "XLK", "XLF", "XLE", "XLV", "XLI", "XLC", "XLRE",
@@ -74,7 +80,7 @@ EXTENDED_UNIVERSE = [
     "COIN", "MSTR", "MARA", "RIOT", "CLSK", "CIFR", "HUT", "BTBT",
     # ── Small/mid-cap momentum ─────────────────────────────────
     "MSTR", "PLTR", "HOOD", "DKNG", "PENN", "SFIX", "RKT", "UWMC",
-    "OPEN", "CVNA", "CARVANA", "BYND", "OUST", "LIDR",
+    "OPEN", "CVNA", "BYND", "OUST", "LIDR",
     # ── Travel / leisure ───────────────────────────────────────
     "UBER", "LYFT", "ABNB", "BKNG", "EXPE", "MAR", "HLT", "CCL",
     "RCL", "NCLH", "DAL", "UAL", "AAL", "LUV",
@@ -95,18 +101,27 @@ EXTENDED_UNIVERSE = _deduped
 def screen(
     max_results: int = 150,
     min_move_pct: float = 0.008,   # 0.8% intraday move qualifies
+    min_gap_pct:  float = 0.015,   # 1.5% overnight gap qualifies (earnings, news)
     min_vol_ratio: float = 1.5,    # 1.5× average volume qualifies
 ) -> list[str]:
     """
-    Return tickers showing momentum or unusual volume today (up to max_results).
+    Return tickers showing momentum, overnight gap, or unusual volume today.
+
+    THREE ways to qualify (any one is enough):
+      1. Intraday move ≥ 0.8%    (open → close of today's bar)
+      2. Overnight gap  ≥ 1.5%   (prev close → today's open) — catches EARNINGS
+      3. Volume ≥ 1.5× prior day
+
+    WHY gap detection matters:
+      An earnings gap stock opens at a new level and often CONSOLIDATES intraday.
+      open→close move may be only 0.2% but the overnight gap is +12%.
+      Without gap detection these stocks are invisible to the screener — exactly
+      why ARM (gap up) and WMT (gap down) were missed on earnings days.
 
     The pre-screener covers the full EXTENDED_UNIVERSE in ONE Alpaca batch
     snapshot call (~3 seconds). Full SMC only runs on tickers that pass.
     max_results=150 is safe on shared-cpu-1x Fly.io — completes in ~5 min,
     well within the 15-min scan cycle.
-
-    On a quiet market day, fewer tickers qualify so the list is naturally
-    shorter. On high-volatility days more pass, up to the cap.
 
     Falls back to CORE_TICKERS if Alpaca is unavailable.
     """
@@ -149,21 +164,48 @@ def screen(
                 open_price  = float(daily.open)
                 close_price = float(daily.close)
                 today_vol   = float(daily.volume)
+                prev_close  = float(prev.close)
                 prev_vol    = float(prev.volume)
 
-                if open_price <= 0 or prev_vol <= 0:
+                if open_price <= 0 or prev_vol <= 0 or prev_close <= 0:
                     continue
 
-                move_pct  = abs(close_price - open_price) / open_price
+                # ── Intraday move: open → close of today's bar ──────────
+                move_pct = abs(close_price - open_price) / open_price
+
+                # ── Overnight gap: prev close → today's open ────────────
+                # This is the key fix: earnings gaps open at a new level and
+                # may consolidate intraday (tiny open→close move) but the
+                # overnight gap is the actual signal.  Both ARM (+gap up) and
+                # WMT (-gap down) show here while the intraday move is small.
+                gap_pct = abs(open_price - prev_close) / prev_close
+
                 vol_ratio = today_vol / prev_vol if prev_vol > 0 else 1.0
 
-                # Only include tickers above EITHER threshold
-                if move_pct < min_move_pct and vol_ratio < min_vol_ratio:
+                # Qualify on ANY of: intraday move, overnight gap, or volume
+                has_move = move_pct >= min_move_pct
+                has_gap  = gap_pct  >= min_gap_pct
+                has_vol  = vol_ratio >= min_vol_ratio
+                if not has_move and not has_gap and not has_vol:
                     continue
 
-                # Combined score: weighted sum of normalised move + vol
-                # Move contributes 60%, volume 40% — momentum is the primary signal
-                interest_score = (move_pct / min_move_pct) * 0.6 + (vol_ratio / min_vol_ratio) * 0.4
+                # Use the stronger of the two move signals for scoring.
+                # Gap stocks get an extra 0.5× bonus so they bubble to the
+                # front of the list — fresh gap setups are higher-priority.
+                best_move = max(move_pct, gap_pct)
+                gap_bonus = 0.5 if has_gap else 0.0
+
+                # Combined score: move 55%, volume 35%, gap bonus 10%
+                interest_score = (
+                    (best_move / min_move_pct) * 0.55
+                    + (vol_ratio / min_vol_ratio) * 0.35
+                    + gap_bonus
+                )
+                if has_gap and not has_move:
+                    logger.debug(
+                        f"[screener] {ticker} gap-qualified — "
+                        f"gap={gap_pct*100:.1f}% intraday={move_pct*100:.1f}%"
+                    )
                 scored.append((ticker, interest_score))
 
             except Exception:
@@ -185,7 +227,8 @@ def screen(
 
         logger.info(
             f"[screener] {len(EXTENDED_UNIVERSE)} tickers scanned → "
-            f"{len(scored)} qualify (move≥{min_move_pct*100:.1f}% or vol≥{min_vol_ratio}×) → "
+            f"{len(scored)} qualify "
+            f"(move≥{min_move_pct*100:.1f}% OR gap≥{min_gap_pct*100:.1f}% OR vol≥{min_vol_ratio}×) → "
             f"{len(result)} sent to SMC (cap={max_results})"
         )
 
