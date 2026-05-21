@@ -1699,6 +1699,144 @@ async def inject_test_signal(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/admin/close-signal")
+async def admin_close_signal(request: Request):
+    """
+    Force-close any signal by ID. Useful for bad-data signals (wrong entry
+    price, erroneous Alpaca tick) that should never have fired.
+
+    Requires ENGINE_API_KEY header (X-Engine-Key).
+
+    Body:
+      { "id": "<signal-uuid>",
+        "reason": "bad_data" | "manual" | "bad_entry" | "regime_change" | ...
+        "result": "void" | "loss" | "win"   (optional, default "void") }
+
+    Example curl:
+      curl -X POST https://signalbolt-engine.fly.dev/admin/close-signal \\
+           -H "X-Engine-Key: YOUR_KEY" \\
+           -H "Content-Type: application/json" \\
+           -d '{"id":"abc-123","reason":"bad_data"}'
+    """
+    _check_engine_key(request)
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="JSON body required")
+
+    signal_id = (body.get("id") or "").strip()
+    if not signal_id:
+        raise HTTPException(status_code=400, detail="'id' is required")
+
+    reason = (body.get("reason") or "manual").strip()
+    result = (body.get("result") or "void").strip()
+
+    try:
+        sb = _make_supabase()
+
+        # Fetch signal first so we can log what we're closing
+        existing = sb.table("signals").select(
+            "id, ticker, direction, strategy_type, entry_price, status"
+        ).eq("id", signal_id).single().execute()
+
+        if not existing.data:
+            raise HTTPException(status_code=404, detail=f"Signal {signal_id} not found")
+
+        sig = existing.data
+        if sig["status"] == "closed":
+            return {
+                "status":  "already_closed",
+                "signal":  sig,
+                "message": "Signal was already closed — no change made",
+            }
+
+        # Close the signal
+        update = {
+            "status":        "closed",
+            "result":        result,
+            "closed_reason": reason,
+            "closed_at":     datetime.now(timezone.utc).isoformat(),
+        }
+        sb.table("signals").update(update).eq("id", signal_id).execute()
+
+        # Write a timeline event so there's a clear audit trail
+        sb.table("signal_events").insert({
+            "signal_id":  signal_id,
+            "event_type": "admin_closed",
+            "price":      sig["entry_price"],
+            "note":       f"Admin force-closed — reason: {reason} | result: {result}",
+        }).execute()
+
+        logger.info(
+            f"[admin] Force-closed signal {signal_id} "
+            f"{sig['ticker']} {sig['direction']} — reason={reason} result={result}"
+        )
+
+        return {
+            "status":  "closed",
+            "reason":  reason,
+            "result":  result,
+            "signal":  {**sig, **update},
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"POST /admin/close-signal error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/active-signals")
+async def admin_active_signals(request: Request):
+    """
+    List all currently active signals with their entry prices and current
+    prices so bad-data signals are easy to spot at a glance.
+
+    Requires ENGINE_API_KEY header (X-Engine-Key).
+    """
+    _check_engine_key(request)
+
+    try:
+        sb = _make_supabase()
+        rows = (
+            sb.table("signals")
+            .select("id, ticker, direction, strategy_type, entry_price, target_one, target_two, stop_loss, confidence_score, created_at")
+            .eq("status", "active")
+            .order("created_at", desc=True)
+            .execute()
+            .data
+        ) or []
+
+        # Enrich with current price from price_store (no extra API call)
+        from engine import price_store
+        enriched = []
+        for r in rows:
+            current = price_store.snapshot([r["ticker"]]).get(r["ticker"], {})
+            current_price = current.get("price")
+            entry         = float(r["entry_price"])
+            deviation_pct = (
+                round(abs(current_price - entry) / entry * 100, 1)
+                if current_price else None
+            )
+            enriched.append({
+                **r,
+                "current_price":   current_price,
+                "deviation_pct":   deviation_pct,
+                "likely_bad_data": deviation_pct is not None and deviation_pct > 20,
+            })
+
+        return {
+            "count":   len(enriched),
+            "signals": enriched,
+        }
+
+    except Exception as e:
+        logger.error(f"GET /admin/active-signals error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 if __name__ == "__main__":
     import uvicorn
     from engine.config import PORT
