@@ -601,15 +601,82 @@ def _handle_t1_rt(sig: dict, price: float) -> None:
         logger.debug(f"[stream] RT T1 handler failed for {sig.get('id')}: {e}")
 
 
+# ── Near-stop real-time warning ───────────────────────────────────────────────
+# Fires a push notification + signal_events entry when price enters the danger
+# zone (within 25% of stop distance from the SL level) on a live tick.
+# This is the SAME threshold deriveStatus() uses on the app to show 🚨 "Near Stop".
+# Throttled: at most once per 10 minutes per signal to avoid notification spam.
+#
+# Timeline:
+#   Old behaviour: signal_monitor runs every 5-15 min → "Near Stop" up to 14 min late
+#   New behaviour: _check_rt_levels runs every 1 second → warning fires within 1 second
+_near_stop_warned: dict[str, float] = {}   # signal_id → last warned (monotonic)
+_NEAR_STOP_THROTTLE_S = 600.0              # warn at most once per 10 minutes per signal
+
+
+def _warn_near_stop(sig: dict, price: float) -> None:
+    """
+    Send a near-stop push notification and write a signal_events entry.
+    Called at most once per _NEAR_STOP_THROTTLE_S seconds per signal.
+    """
+    try:
+        sig_id  = sig["id"]
+        ticker  = sig["ticker"]
+        entry   = float(sig["entry_price"])
+        sl      = float(sig["stop_loss"])
+        is_long = sig["direction"] == "LONG"
+
+        pnl_pct   = ((price - entry) / entry * 100) if is_long else ((entry - price) / entry * 100)
+        stop_dist = abs(entry - sl)
+        dist_to_sl = abs(price - sl)
+        pct_of_stop = (dist_to_sl / stop_dist * 100) if stop_dist > 0 else 100
+
+        note = (
+            f"⚠️ Near Stop — ${price:.2f} is {pct_of_stop:.0f}% away from "
+            f"stop ${sl:.2f} — P&L: {'+' if pnl_pct >= 0 else ''}{pnl_pct:.1f}% — Act fast"
+        )
+
+        key = os.environ.get("SUPABASE_KEY") or os.environ["SUPABASE_SECRET_KEY"]
+        from supabase import create_client as _sc
+        from engine import push as _push
+
+        sb = _sc(os.environ["SUPABASE_URL"], key)
+        sb.table("signal_events").insert({
+            "signal_id":  sig_id,
+            "event_type": "near_stop",
+            "price":      price,
+            "note":       note,
+        }).execute()
+
+        try:
+            direction = sig["direction"]
+            _push._send_raw(
+                title=f"⚠️ Near Stop — {ticker}  {pnl_pct:+.1f}%",
+                body=f"{direction} position: ${price:.2f} approaching stop ${sl:.2f}. Review now.",
+                data={"type": "near_stop", "ticker": ticker, "signal_id": str(sig_id)},
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            f"[stream] ⚠️ NEAR-STOP {ticker} {sig['direction']} "
+            f"price={price:.2f} sl={sl:.2f} pnl={pnl_pct:+.1f}% "
+            f"({pct_of_stop:.0f}% from stop)"
+        )
+    except Exception as e:
+        logger.debug(f"[stream] Near-stop warn failed for {sig.get('id')}: {e}")
+
+
 def _check_rt_levels(ticker: str, price: float) -> None:
     """
     Check a live trade price against all cached active signals for this ticker.
     Called at most once per second per ticker (throttled in on_trade).
 
     Decision tree per signal:
-      T2 crossed  → close as win  (full target)
-      T1 crossed  → move SL to breakeven, ride to T2 (don't close)
-      SL crossed  → close as loss
+      T2 crossed       → close as win  (full target)
+      T1 crossed       → move SL to breakeven, ride to T2 (don't close)
+      SL crossed       → close as loss
+      Near SL (≤25%)   → push warning (does NOT close) — throttled 1/10 min
       SL already at breakeven (T1 already hit) → only T2 / SL(=entry) matter
     """
     global _rt_cache, _rt_cache_ts
@@ -640,6 +707,16 @@ def _check_rt_levels(ticker: str, price: float) -> None:
                     _handle_t1_rt(sig, price)
                 elif price <= sl:
                     _close_rt_signal(sig, "sl", price)
+                else:
+                    # Price hasn't crossed any level — check near-stop danger zone.
+                    # Same 25% threshold as deriveStatus() in the app so the push
+                    # fires the exact moment the card pill turns 🚨 Near Stop.
+                    stop_dist = abs(entry - sl)
+                    if stop_dist > 0 and (price - sl) <= stop_dist * 0.25:
+                        last_warn = _near_stop_warned.get(sig["id"], 0.0)
+                        if time.monotonic() - last_warn >= _NEAR_STOP_THROTTLE_S:
+                            _near_stop_warned[sig["id"]] = time.monotonic()
+                            _rt_executor.submit(_warn_near_stop, sig.copy(), price)
             else:   # SHORT
                 if price <= t2:
                     _close_rt_signal(sig, "t2", price)
@@ -647,6 +724,14 @@ def _check_rt_levels(ticker: str, price: float) -> None:
                     _handle_t1_rt(sig, price)
                 elif price >= sl:
                     _close_rt_signal(sig, "sl", price)
+                else:
+                    # SHORT near-stop: price is within 25% of stop distance above SL
+                    stop_dist = abs(entry - sl)
+                    if stop_dist > 0 and (sl - price) <= stop_dist * 0.25:
+                        last_warn = _near_stop_warned.get(sig["id"], 0.0)
+                        if time.monotonic() - last_warn >= _NEAR_STOP_THROTTLE_S:
+                            _near_stop_warned[sig["id"]] = time.monotonic()
+                            _rt_executor.submit(_warn_near_stop, sig.copy(), price)
 
         except Exception as e:
             logger.debug(f"[stream] RT level check error for {ticker}/{sig.get('id')}: {e}")
