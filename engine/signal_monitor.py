@@ -582,14 +582,18 @@ def _monitor_stocks(sb: Client) -> None:
                 should_close = True
                 logger.info(f"[monitor] {ticker} [{strategy}] 3:55 PM absolute force-close")
 
-            elif eod_min >= 15 * 60 + 50:        # 3:50–3:54 PM — close non-breakeven
+            elif eod_min >= 15 * 60 + 50:        # 3:50–3:54 PM — close losers not at breakeven
+                # Only trim if the signal is BOTH (a) hasn't hit T1 yet (stop not at breakeven)
+                # AND (b) is currently losing. A signal that's profitable but hasn't hit T1
+                # yet (e.g. QCOM heading toward target) should ride to the 3:55 force-close
+                # rather than be cut prematurely — it would have been a winner.
                 at_breakeven = abs(float(sig.get("stop_loss") or 0) - entry) < 0.01
-                still_profit = pnl_pct is not None and pnl_pct > 0
-                if not at_breakeven or not still_profit:
+                in_profit    = pnl_pct is not None and pnl_pct > 0
+                if not at_breakeven and not in_profit:
                     should_close = True
                     logger.info(
                         f"[monitor] {ticker} [{strategy}] 3:50 PM trim "
-                        f"pnl={pnl_pct:.1f}% at_be={at_breakeven}"
+                        f"pnl={pnl_pct:.1f}% at_be={at_breakeven} — loss, no T1"
                     )
 
             elif eod_min >= 15 * 60 + 30:        # 3:30–3:49 PM — cut losers only

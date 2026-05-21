@@ -198,26 +198,47 @@ def _supabase() -> Client:
 
 
 def _has_active_signal(sb: Client, ticker: str, strategy_type: str) -> bool:
-    """Return True if an active signal already exists for this ticker+strategy combo."""
+    """
+    Return True if an active signal already exists for this ticker.
+
+    Checks ALL strategies, not just the requested one — prevents the engine
+    from piling multiple strategies (e.g. scalp + day_trade) onto the same
+    ticker simultaneously when market conditions are bad for that ticker.
+    Swing trades are exempt: they run on a different timeframe and can
+    co-exist with an intraday signal on the same ticker.
+    """
     try:
-        result = (
+        query = (
             sb.table("signals")
-            .select("id")
+            .select("id, strategy_type")
             .eq("ticker", ticker)
             .eq("status", "active")
-            .eq("strategy_type", strategy_type)
-            .execute()
         )
-        return len(result.data) > 0
+        # Swing co-exists with intraday (different timeframe/thesis).
+        # But two intraday strategies (scalp + day_trade) on the same ticker
+        # at the same moment is double-exposure on the same move — block it.
+        if strategy_type != "swing_trade":
+            query = query.neq("strategy_type", "swing_trade")
+
+        result = query.execute()
+        if result.data:
+            existing = result.data[0].get("strategy_type", "?")
+            logger.debug(
+                f"[runner] {ticker} [{strategy_type}]: active {existing} signal exists — skipping"
+            )
+            return True
+        return False
     except Exception as e:
         logger.error(f"[runner] Active-signal check failed for {ticker}/{strategy_type}: {e}")
         return False
 
 
-def _in_stop_cooldown(ticker: str, strategy_type: str) -> bool:
+def _in_stop_cooldown(ticker: str, strategy_type: str, sb: Client = None) -> bool:
     """
     Return True if this ticker+strategy recently stopped out and is in cooldown.
-    Prevents rapid re-entry in the same bad market conditions immediately after a loss.
+    Checks both the in-memory dict (runner-closed signals) and the DB (signal_monitor-closed
+    signals) — because signal_monitor.py closes signals directly without calling
+    _record_stop_hit(), so the in-memory dict alone misses those closures.
     """
     key = (ticker, strategy_type)
     stopped_at = _stop_cooldown.get(key)
@@ -225,6 +246,33 @@ def _in_stop_cooldown(ticker: str, strategy_type: str) -> bool:
         remaining = int((_STOP_COOLDOWN_SECS - (time.monotonic() - stopped_at)) / 60)
         logger.debug(f"[runner] {ticker} [{strategy_type}] in stop cooldown ({remaining} min left)")
         return True
+
+    # Fallback: check DB for a recent stop_hit closure that signal_monitor wrote directly.
+    # This catches re-entries after monitor-closed stops (which never call _record_stop_hit).
+    if sb is not None:
+        try:
+            cutoff = (datetime.now(timezone.utc) - timedelta(seconds=_STOP_COOLDOWN_SECS)).isoformat()
+            rows = (
+                sb.table("signals")
+                .select("id, closed_at")
+                .eq("ticker", ticker)
+                .eq("strategy_type", strategy_type)
+                .eq("closed_reason", "stop_hit")
+                .gte("closed_at", cutoff)
+                .limit(1)
+                .execute()
+            )
+            if rows.data:
+                # Sync the in-memory dict so future checks are free
+                _stop_cooldown[key] = time.monotonic()
+                logger.info(
+                    f"[runner] {ticker} [{strategy_type}] stop cooldown active "
+                    f"(DB stop_hit at {rows.data[0]['closed_at']})"
+                )
+                return True
+        except Exception as _e:
+            logger.debug(f"[runner] DB stop cooldown check failed for {ticker}: {_e}")
+
     return False
 
 
@@ -568,7 +616,7 @@ def _process_mr_ticker(sb: Client, ticker: str, config: dict,
     if _has_active_signal(sb, ticker, config["type"]):
         return False
 
-    if _in_stop_cooldown(ticker, config["type"]):
+    if _in_stop_cooldown(ticker, config["type"], sb=sb):
         return False
 
     try:
@@ -636,7 +684,7 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
         logger.debug(f"[runner] {ticker} [{strategy_type}]: active signal exists — skipping")
         return
 
-    if _in_stop_cooldown(ticker, strategy_type):
+    if _in_stop_cooldown(ticker, strategy_type, sb=sb):
         return
 
     analysis = smc.analyze(
