@@ -211,21 +211,45 @@ def _momentum_check(ticker: str, direction: str) -> tuple[bool, str]:
 
 
 # ── Status event helpers ──────────────────────────────────────────────────────
+#
+# Status labels are DIRECTION-AWARE.
+# "below_entry" means "price moved the wrong way from entry" for both directions:
+#   LONG:  price dropped below entry  → "Below Entry — Waiting for recovery"
+#   SHORT: price rose above entry     → "Above Entry — Waiting for reversal"
+# "in_profit" also uses direction-specific wording so the insight line reads
+# naturally for SHORT traders (dropping = profit, not a negative move).
 
-_STATUS_LABELS = {
+_STATUS_LABELS_LONG = {
     "near_stop":       ("⚠️", "Near Stop — Watch closely"),
     "below_entry":     ("↩",  "Below Entry — Waiting for recovery"),
     "in_profit":       ("💹", "In Profit — Hold, target not reached"),
-    "building_profit": ("📈", "Building Profit — Approaching target"),
+    "building_profit": ("📈", "Building Profit — Rising toward target"),
     "strong_profit":   ("🔥", "Strong Profit — Consider booking partial"),
     "at_target":       ("🎯", "At Target — Book profit"),
 }
 
+_STATUS_LABELS_SHORT = {
+    "near_stop":       ("⚠️", "Near Stop — Watch closely"),
+    "below_entry":     ("↩",  "Above Entry — Waiting for reversal"),   # price above entry = against SHORT
+    "in_profit":       ("💹", "In Profit — Hold, target not reached"),
+    "building_profit": ("📈", "Building Profit — Dropping toward target"),
+    "strong_profit":   ("🔥", "Strong Profit — Consider booking partial"),
+    "at_target":       ("🎯", "At Target — Book profit"),
+}
+
+# Legacy alias used by _push_status_change (direction-neutral fallback)
+_STATUS_LABELS = _STATUS_LABELS_LONG
+
+
+def _get_labels(direction: str) -> dict:
+    return _STATUS_LABELS_SHORT if direction == "SHORT" else _STATUS_LABELS_LONG
+
 
 def _log_status_event(sb: Client, sig_id: str, status: str,
-                      price: float | None, extra: str = "") -> None:
+                      price: float | None, direction: str = "LONG",
+                      extra: str = "") -> None:
     """Log a status-change event to signal_events timeline."""
-    emoji, base_label = _STATUS_LABELS.get(status, ("•", status))
+    emoji, base_label = _get_labels(direction).get(status, ("•", status))
     note = f"{emoji} {base_label}"
     if extra:
         note += f" — {extra}"
@@ -373,8 +397,9 @@ def _push_early_book(ticker: str, direction: str, pnl_pct: float, reason: str) -
     )
 
 
-def _push_status_change(ticker: str, status: str, pnl_pct: float | None) -> None:
-    emoji, label = _STATUS_LABELS.get(status, ("•", status))
+def _push_status_change(ticker: str, status: str, pnl_pct: float | None,
+                        direction: str = "LONG") -> None:
+    emoji, label = _get_labels(direction).get(status, ("•", status))
     pnl_str = f" ({'+' if pnl_pct and pnl_pct > 0 else ''}{pnl_pct:.1f}%)" if pnl_pct is not None else ""
     push._send_raw(
         title=f"{emoji} {ticker}{pnl_str} — {label.split(' — ')[0]}",
@@ -548,12 +573,13 @@ def _monitor_stocks(sb: Client) -> None:
             if new_status != old_status:
                 _STATUS_CACHE[sig["id"]] = new_status
                 _log_status_event(sb, sig["id"], new_status, price,
+                                  direction=direction,
                                   extra=f"{'+' if pnl_pct >= 0 else ''}{pnl_pct:.1f}%")
                 # Push notification for important transitions only
                 push_statuses = {"near_stop", "strong_profit", "at_target"}
                 if new_status in push_statuses:
                     try:
-                        _push_status_change(ticker, new_status, pnl_pct)
+                        _push_status_change(ticker, new_status, pnl_pct, direction=direction)
                     except Exception:
                         pass
                 logger.info(
