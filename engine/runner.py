@@ -176,11 +176,17 @@ STRATEGY_CONFIGS = [
 
 # Max hold time per strategy before auto-expiry
 STRATEGY_MAX_HOLD_HOURS = {
-    "scalping":     0.5,    # 30 minutes
-    "day_trade":    8.0,    # ↓ from 24 — day trades close within one session
-    "swing_trade":  240.0,  # 10 days
-    "options_flow": 8.0,
-    "dark_pool":    8.0,
+    "scalping":       0.5,    # 30 minutes
+    "day_trade":      8.0,    # intraday — closes within one session
+    "vwap_reclaim":   8.0,    # mean-reversion intraday — same session
+    "gap_fill":       8.0,    # gap/ORB play — resolves same session
+    "pre_market":     8.0,    # pre-market breakout — resolves at/after open
+    "swing_trade":    240.0,  # 10 days
+    "earnings":       48.0,   # 2 days — pre/post earnings move
+    "short_squeeze":  24.0,   # 1 day — squeeze resolves quickly
+    "position_trade": 720.0,  # 30 days — macro position
+    "options_flow":   8.0,
+    "dark_pool":      8.0,
 }
 
 
@@ -592,16 +598,16 @@ def _process_mr_ticker(sb: Client, ticker: str, config: dict,
         # ── Build signal row ──────────────────────────────────────
         signal_row = mean_reversion.to_signal_dict(mr, session)
         signal_row.update({
-            "strategy_type":      config["type"],
-            "timeframe":          config.get("interval", "15m"),
-            "regime_type":        regime.get("regime_type", ""),
-            "session_mode":       session.get("mode", ""),
-            "confidence_tier":    risk["confidence_tier"],
+            "strategy_type":       "vwap_reclaim",   # always tagged as VWAP reclaim strategy
+            "timeframe":           config.get("interval", "15m"),
+            "regime_type":         regime.get("regime_type", ""),
+            "session_mode":        session.get("mode", ""),
+            "confidence_tier":     risk["confidence_tier"],
             "position_multiplier": risk["position_mult"],
-            "setup_type":         "VWAP_MEAN_REVERSION",
-            "confidence_grade":   "B+" if mr.score >= 74 else "B",
-            "chop_score":         0.0,   # MR signals trade IN chop — no chop penalty
-            "score_breakdown":    {"mr_score": mr.score, "mr_passes": list(mr.passes)},
+            "setup_type":          "VWAP_MEAN_REVERSION",
+            "confidence_grade":    "B+" if mr.score >= 74 else "B",
+            "chop_score":          0.0,   # MR signals trade IN chop — no chop penalty
+            "score_breakdown":     {"mr_score": mr.score, "mr_passes": list(mr.passes)},
         })
         signal_row["ai_explanation"] = explainer.generate(signal_row, signal_row["score_breakdown"])
         _write_signal(sb, signal_row)
@@ -645,6 +651,9 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
     # no historical candles, so SMC has no OBs, FVGs, or BOS/CHoCH to work with.
     # The Opening Range (first 30 min) is the structural anchor on gap days.
     # Only attempt this for day_trade (15m bars) — not scalping or swing.
+    # Signals from gap_engine are tagged "gap_fill" so they appear separately
+    # in the analytics tab and get the correct max-hold window (same session).
+    _from_gap_engine = False
     if (not analysis or not analysis.get("direction")) and strategy_type == "day_trade":
         try:
             from engine import alpaca_client as _alpaca
@@ -658,6 +667,7 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
                 )
                 if gap_analysis and gap_analysis.get("direction"):
                     analysis = gap_analysis
+                    _from_gap_engine = True
                     logger.info(
                         f"[runner] {ticker} [gap_engine] SMC no-direction → "
                         f"GAP-ORB {gap_analysis['direction']} setup found "
@@ -819,7 +829,9 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
         "confidence_score":   scored["total"],
         "confidence_factors": confidence_factors,
         "timeframe":          config["interval"],
-        "strategy_type":      strategy_type,
+        # gap_engine signals get their own strategy tag so they appear separately
+        # in analytics and use the correct hold window (STRATEGY_MAX_HOLD_HOURS)
+        "strategy_type":      "gap_fill" if _from_gap_engine else strategy_type,
         "status":             "active",
         "ai_explanation":     None,
         # Quant metadata
