@@ -20,11 +20,18 @@ import os
 import time
 from typing import Optional
 
+import requests
+
 logger = logging.getLogger("signalbolt.prescreener")
 
 # ── Cache: re-screen every 2 min so new momentum movers are picked up quickly ─
 _screen_cache: tuple[Optional[list[str]], float] = (None, 0.0)
 _SCREEN_CACHE_TTL = 120   # 2 minutes
+
+# ── Movers cache: top gainers + losers from Alpaca, refreshed every 5 min ────
+# Separate from the snapshot cache so movers can be fetched independently.
+_movers_cache: tuple[Optional[list[str]], float] = (None, 0.0)
+_MOVERS_CACHE_TTL = 300   # 5 minutes
 
 # ── Always include these regardless of pre-screen results ────────────────────
 # Core liquid tickers that generate the most reliable SMC setups.
@@ -98,6 +105,67 @@ for _t in EXTENDED_UNIVERSE:
 EXTENDED_UNIVERSE = _deduped
 
 
+def fetch_movers(top: int = 30) -> list[str]:
+    """
+    Fetch today's top gainers and losers from Alpaca's screener endpoint.
+
+    Returns up to 2×top tickers (30 gainers + 30 losers = 60 max).
+    These are merged into EXTENDED_UNIVERSE before the snapshot screen runs,
+    so stocks having their biggest day ever are never invisible to the engine
+    just because they aren't on the fixed watchlist.
+
+    Results are cached for 5 minutes — calling this every scan cycle is safe.
+    Falls back to empty list if Alpaca is unavailable (fixed list still runs).
+    """
+    global _movers_cache
+    cached, cached_at = _movers_cache
+    if cached is not None and (time.monotonic() - cached_at) < _MOVERS_CACHE_TTL:
+        return cached
+
+    try:
+        api_key    = os.environ.get("ALPACA_API_KEY", "")
+        api_secret = os.environ.get("ALPACA_SECRET_KEY", "")
+        if not api_key or not api_secret:
+            return []
+
+        resp = requests.get(
+            "https://data.alpaca.markets/v1beta1/screener/stocks/movers",
+            params={"top": top},
+            headers={
+                "APCA-API-KEY-ID":     api_key,
+                "APCA-API-SECRET-KEY": api_secret,
+            },
+            timeout=5,
+        )
+
+        if resp.status_code != 200:
+            logger.warning(f"[screener] Movers endpoint returned {resp.status_code}")
+            _movers_cache = ([], time.monotonic())
+            return []
+
+        data     = resp.json()
+        gainers  = [item["symbol"] for item in data.get("gainers",  []) if item.get("symbol")]
+        losers   = [item["symbol"] for item in data.get("losers",   []) if item.get("symbol")]
+        movers   = gainers + losers
+
+        # Basic quality filter: skip OTC penny stocks (price < $5)
+        # and tickers with non-standard characters (warrants, units etc)
+        clean = [t for t in movers if t.isalpha() and len(t) <= 5]
+
+        logger.info(
+            f"[screener] Movers: {len(gainers)} gainers + {len(losers)} losers "
+            f"→ {len(clean)} after quality filter"
+        )
+
+        _movers_cache = (clean, time.monotonic())
+        return clean
+
+    except Exception as e:
+        logger.warning(f"[screener] Movers fetch failed: {e} — using fixed universe only")
+        _movers_cache = ([], time.monotonic())
+        return []
+
+
 def screen(
     max_results: int = 150,
     min_move_pct: float = 0.008,   # 0.8% intraday move qualifies
@@ -142,11 +210,26 @@ def screen(
         if not api_key or not api_secret:
             raise ValueError("Alpaca keys not set")
 
+        # ── Merge live movers into the fixed universe ─────────────────────────
+        # fetch_movers() returns today's top 30 gainers + 30 losers from Alpaca.
+        # Any mover not already in EXTENDED_UNIVERSE gets appended so stocks
+        # having a breakout day are never invisible to the engine.
+        movers       = fetch_movers(top=30)
+        universe_set = set(EXTENDED_UNIVERSE)
+        new_movers   = [t for t in movers if t not in universe_set]
+        scan_universe = EXTENDED_UNIVERSE + new_movers
+
+        if new_movers:
+            logger.info(
+                f"[screener] Added {len(new_movers)} live mover(s) not in fixed universe: "
+                f"{new_movers[:10]}{'...' if len(new_movers) > 10 else ''}"
+            )
+
         client = StockHistoricalDataClient(api_key, api_secret)
 
-        # Single batch call — returns snapshot for all ~300 symbols at once.
+        # Single batch call — returns snapshot for all symbols at once.
         # Alpaca paid SIP plan handles this easily with no rate-limit issues.
-        req = StockSnapshotRequest(symbol_or_symbols=EXTENDED_UNIVERSE)
+        req = StockSnapshotRequest(symbol_or_symbols=scan_universe)
         snapshots = client.get_stock_snapshot(req)
 
         # Score every ticker: combine move strength + volume ratio into one score
@@ -226,17 +309,38 @@ def screen(
                 seen.add(ticker)
 
         logger.info(
-            f"[screener] {len(EXTENDED_UNIVERSE)} tickers scanned → "
+            f"[screener] {len(scan_universe)} tickers scanned "
+            f"({len(EXTENDED_UNIVERSE)} fixed + {len(new_movers)} live movers) → "
             f"{len(scored)} qualify "
             f"(move≥{min_move_pct*100:.1f}% OR gap≥{min_gap_pct*100:.1f}% OR vol≥{min_vol_ratio}×) → "
             f"{len(result)} sent to SMC (cap={max_results})"
         )
 
+        # ── Subscribe new movers to the live WebSocket stream ────────────────
+        # Any ticker that just appeared from the movers endpoint needs to be
+        # added to the Alpaca trade stream so it gets tick-by-tick level
+        # monitoring immediately — not just when a signal is fired on it.
+        if new_movers:
+            try:
+                import asyncio
+                from engine import stream as _stream
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.ensure_future(
+                        _stream.subscribe_extra_tickers(new_movers)
+                    )
+                else:
+                    loop.run_until_complete(
+                        _stream.subscribe_extra_tickers(new_movers)
+                    )
+            except Exception as _sub_err:
+                logger.debug(f"[screener] Mover WebSocket subscribe skipped: {_sub_err}")
+
         _screen_cache = (result, time.monotonic())
         return result
 
     except Exception as e:
-        logger.warning(f"[screener] Alpaca snapshot failed: {e} — using core tickers")
+        logger.warning(f"[screener] Alpaca snapshot failed: {e} — falling back to core tickers")
         fallback = list(CORE_TICKERS)
         _screen_cache = (fallback, time.monotonic())
         return fallback
