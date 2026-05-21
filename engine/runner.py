@@ -75,12 +75,11 @@ _RUNNER_REGIME_TTL = 240  # 4 minutes
 _news_cache: dict[str, tuple[bool, float]] = {}
 _NEWS_CACHE_TTL = 900  # 15 minutes
 
-# ── Post-loss cooldown: {(ticker, strategy): stopped_at_monotonic} ─────────
-# After a signal stops out, block that ticker+strategy combo for 45 minutes.
-# Rapid re-entry in the same direction after a stop hit = same bad market
-# conditions; waiting 45 min gives the setup time to fully resolve.
-_stop_cooldown: dict[tuple[str, str], float] = {}
-_STOP_COOLDOWN_SECS = 45 * 60  # 45 minutes
+# Stop cooldown removed — the 9-layer scorer, chop detector, regime gate,
+# and manipulation check are the re-entry filter. If structure has genuinely
+# recovered after a stop hit the engine should take the trade. If it hasn't,
+# the score won't pass threshold. Time-based lockouts override the engine's
+# own intelligence and silently miss valid setups.
 
 
 def _has_recent_news(ticker: str, lookback_minutes: int = 60) -> bool:
@@ -233,53 +232,6 @@ def _has_active_signal(sb: Client, ticker: str, strategy_type: str) -> bool:
         return False
 
 
-def _in_stop_cooldown(ticker: str, strategy_type: str, sb: Client = None) -> bool:
-    """
-    Return True if this ticker+strategy recently stopped out and is in cooldown.
-    Checks both the in-memory dict (runner-closed signals) and the DB (signal_monitor-closed
-    signals) — because signal_monitor.py closes signals directly without calling
-    _record_stop_hit(), so the in-memory dict alone misses those closures.
-    """
-    key = (ticker, strategy_type)
-    stopped_at = _stop_cooldown.get(key)
-    if stopped_at and (time.monotonic() - stopped_at) < _STOP_COOLDOWN_SECS:
-        remaining = int((_STOP_COOLDOWN_SECS - (time.monotonic() - stopped_at)) / 60)
-        logger.debug(f"[runner] {ticker} [{strategy_type}] in stop cooldown ({remaining} min left)")
-        return True
-
-    # Fallback: check DB for a recent stop_hit closure that signal_monitor wrote directly.
-    # This catches re-entries after monitor-closed stops (which never call _record_stop_hit).
-    if sb is not None:
-        try:
-            cutoff = (datetime.now(timezone.utc) - timedelta(seconds=_STOP_COOLDOWN_SECS)).isoformat()
-            rows = (
-                sb.table("signals")
-                .select("id, closed_at")
-                .eq("ticker", ticker)
-                .eq("strategy_type", strategy_type)
-                .eq("closed_reason", "stop_hit")
-                .gte("closed_at", cutoff)
-                .limit(1)
-                .execute()
-            )
-            if rows.data:
-                # Sync the in-memory dict so future checks are free
-                _stop_cooldown[key] = time.monotonic()
-                logger.info(
-                    f"[runner] {ticker} [{strategy_type}] stop cooldown active "
-                    f"(DB stop_hit at {rows.data[0]['closed_at']})"
-                )
-                return True
-        except Exception as _e:
-            logger.debug(f"[runner] DB stop cooldown check failed for {ticker}: {_e}")
-
-    return False
-
-
-def _record_stop_hit(ticker: str, strategy_type: str) -> None:
-    """Record that this ticker+strategy just stopped out, starting the cooldown clock."""
-    _stop_cooldown[(ticker, strategy_type)] = time.monotonic()
-    logger.info(f"[runner] {ticker} [{strategy_type}] stop cooldown started (45 min)")
 
 
 def _write_signal(sb: Client, row: dict) -> str | None:
@@ -616,9 +568,6 @@ def _process_mr_ticker(sb: Client, ticker: str, config: dict,
     if _has_active_signal(sb, ticker, config["type"]):
         return False
 
-    if _in_stop_cooldown(ticker, config["type"], sb=sb):
-        return False
-
     try:
         from engine import alpaca_client as _alpaca
         df    = _alpaca.get_bars(ticker, timeframe=config.get("interval", "15m"), days=5)
@@ -682,9 +631,6 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
 
     if _has_active_signal(sb, ticker, strategy_type):
         logger.debug(f"[runner] {ticker} [{strategy_type}]: active signal exists — skipping")
-        return
-
-    if _in_stop_cooldown(ticker, strategy_type, sb=sb):
         return
 
     analysis = smc.analyze(
@@ -1231,10 +1177,6 @@ def _close_signals(sb: Client) -> None:
                     elif close_price >= sig["stop_loss"]: reason = "stop_hit"
 
         if reason:
-            # Start cooldown if this was a stop hit — prevents re-entry in same bad conditions
-            if reason == "stop_hit":
-                _record_stop_hit(sig["ticker"], sig.get("strategy_type") or "day_trade")
-
             update: dict = {
                 "status":        "closed",
                 "closed_reason": reason,
