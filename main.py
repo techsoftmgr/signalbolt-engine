@@ -542,7 +542,7 @@ async def ws_prices(websocket: WebSocket):
       1. Client connects → sends {"subscribe": ["SPY", "AAPL", ...]}
       2. Server replies immediately with current snapshot for those tickers
       3. Server pushes {"TICKER": {price, changePercent, session}} on every
-         trade from Alpaca (throttled to max 2/sec per ticker)
+         trade from Alpaca (throttled to max ~6/sec per ticker)
       4. Server sends {"ping": true} every 25 s to keep the connection alive
 
     The app replaces polling with this endpoint for real-time price display.
@@ -587,7 +587,8 @@ async def ws_prices(websocket: WebSocket):
                     None, get_prices, ",".join(missing)
                 )
                 snap.update(rest_prices)
-                # Also seed the price store so future WS connects get it instantly
+                # Seed the price store AND prev_close so future WS trade ticks
+                # compute changePercent correctly for custom watchlist tickers.
                 for sym, data in rest_prices.items():
                     price_store.seed(
                         sym,
@@ -595,6 +596,11 @@ async def ws_prices(websocket: WebSocket):
                         data["changePercent"],
                         data.get("session", "closed"),
                     )
+                    # Derive prev_close: price / (1 + changePercent/100)
+                    chg = data.get("changePercent", 0.0)
+                    if chg != -100 and data["price"] > 0:
+                        prev = data["price"] / (1 + chg / 100)
+                        price_store.set_prev_close(sym, prev)
             except Exception as _fe:
                 logger.debug(f"[ws/prices] REST fallback error: {_fe}")
 

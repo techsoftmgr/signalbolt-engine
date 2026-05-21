@@ -42,7 +42,7 @@ _client_tickers: dict[int, set[str]] = {}   # id(queue) → subscribed tickers
 # ── Broadcast throttle ────────────────────────────────────────────────────────
 
 _last_sent: dict[str, float] = {}
-_THROTTLE_S: float = 0.5   # at most 2 price pushes per second per ticker
+_THROTTLE_S: float = 0.15  # at most ~6 price pushes per second per ticker (SIP is real-time)
 
 # ── Event loop reference ──────────────────────────────────────────────────────
 
@@ -111,11 +111,14 @@ def update(ticker: str, trade_price: float) -> None:
         return
     _last_sent[ticker] = now
 
-    # Schedule async broadcast on the FastAPI event loop
+    # Schedule async broadcast on the FastAPI event loop.
+    # Use _loop.create_task() inside call_soon_threadsafe — this is the
+    # correct Python 3.10+ pattern.  asyncio.ensure_future() works but emits
+    # DeprecationWarning when the running loop isn't the default loop.
     if _loop and not _loop.is_closed() and _clients:
         _loop.call_soon_threadsafe(
             lambda t=ticker, d=dict(_prices[ticker]):
-                asyncio.ensure_future(_broadcast(t, d))
+                _loop.create_task(_broadcast(t, d))
         )
 
 
