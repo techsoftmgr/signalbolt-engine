@@ -912,6 +912,95 @@ def get_history(ticker: str, from_ts: str = "", to_ts: str = "", interval: str =
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/chart-data/{ticker}")
+def get_chart_data(ticker: str, timeframe: str = "15Min", bars: int = 60):
+    """
+    Return OHLCV candlestick bars for the signal chart modal.
+    Uses Alpaca for accurate intraday data; falls back to yfinance.
+
+    timeframe: "5Min" | "15Min" | "1Hour" | "1Day"
+    bars: number of candles to return (default 60)
+    """
+
+    ticker = ticker.upper()
+
+    # ── Alpaca path ────────────────────────────────────────────────────────────
+    try:
+        from engine.alpaca_client import get_bars as alpaca_get_bars
+
+        tf_to_days = {"5Min": 2, "15Min": 3, "1Hour": 7, "1Day": 60}
+        days = tf_to_days.get(timeframe, 3)
+
+        df = alpaca_get_bars(ticker, timeframe=timeframe, days=days)
+
+        if df is not None and not df.empty:
+            # Keep last N bars only
+            df = df.tail(bars).reset_index()
+
+            ts_col = "timestamp" if "timestamp" in df.columns else df.columns[0]
+
+            candles = []
+            for _, row in df.iterrows():
+                ts = row[ts_col]
+                # Convert to ISO string
+                if hasattr(ts, "isoformat"):
+                    ts_str = ts.isoformat()
+                else:
+                    ts_str = str(ts)
+                candles.append({
+                    "t": ts_str,
+                    "o": round(float(row["open"]),  2),
+                    "h": round(float(row["high"]),  2),
+                    "l": round(float(row["low"]),   2),
+                    "c": round(float(row["close"]), 2),
+                    "v": int(row["volume"]) if "volume" in row else 0,
+                })
+
+            return {"candles": candles, "ticker": ticker, "timeframe": timeframe, "source": "alpaca"}
+    except Exception as e:
+        logger.warning(f"[chart-data] Alpaca path failed for {ticker}: {e} — trying yfinance")
+
+    # ── yfinance fallback ──────────────────────────────────────────────────────
+    try:
+        import yfinance as yf
+        from datetime import timedelta, date
+
+        tf_yf_map   = {"5Min": "5m",  "15Min": "15m", "1Hour": "1h",  "1Day": "1d"}
+        tf_days_map  = {"5Min": 2,    "15Min": 5,     "1Hour": 20,    "1Day": 90}
+        yf_interval  = tf_yf_map.get(timeframe, "15m")
+        yf_days      = tf_days_map.get(timeframe, 5)
+
+        end   = date.today().isoformat()
+        start = (date.today() - timedelta(days=yf_days)).isoformat()
+
+        df = yf.download(ticker, start=start, end=end, interval=yf_interval,
+                         progress=False, auto_adjust=True)
+        if df.empty:
+            return {"candles": [], "ticker": ticker, "timeframe": timeframe, "source": "none"}
+
+        df = df.tail(bars).reset_index()
+        date_col = "Datetime" if "Datetime" in df.columns else "Date"
+
+        candles = []
+        for _, row in df.iterrows():
+            ts = row[date_col]
+            ts_str = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
+            candles.append({
+                "t":  ts_str,
+                "o":  round(float(row["Open"]),   2),
+                "h":  round(float(row["High"]),   2),
+                "l":  round(float(row["Low"]),    2),
+                "c":  round(float(row["Close"]),  2),
+                "v":  int(row["Volume"]) if "Volume" in row else 0,
+            })
+
+        return {"candles": candles, "ticker": ticker, "timeframe": timeframe, "source": "yfinance"}
+
+    except Exception as e:
+        logger.error(f"GET /chart-data/{ticker} fallback error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 class PushTokenRequest(BaseModel):
     user_id: str
     push_token: str
@@ -950,6 +1039,7 @@ def checkout_success(plan: str = "pro", session_id: str = ""):
                     sb = _make_supabase()
                     update_data: dict = {
                         "subscription_status": paid_plan,
+                        "tier":                paid_plan,
                         "free_ends_at":        None,
                     }
                     if session.customer:
@@ -1138,6 +1228,7 @@ async def create_subscription_after_payment(request: Request):
             sb = _make_supabase()
             sb.table("profiles").update({
                 "subscription_status":    plan,
+                "tier":                   plan,
                 "stripe_customer_id":     customer_id,
                 "free_ends_at":           None,
                 "subscription_synced_at": datetime.now(_tz.utc).isoformat(),
@@ -1277,6 +1368,7 @@ async def sync_subscription(request: Request):
         update_payload: dict = {"subscription_synced_at": datetime.now(_tz.utc).isoformat()}
         if new_status != current_status:
             update_payload["subscription_status"] = new_status
+            update_payload["tier"] = new_status
             if new_status in ("pro", "pro_plus"):
                 update_payload["free_ends_at"] = None
             logger.info(f"[stripe] Synced {current_status}→{new_status} user={user_id}")
@@ -1354,6 +1446,7 @@ async def stripe_webhook(request: Request):
         customer_id = session["customer"]
         sb.table("profiles").update({
             "subscription_status": plan,
+            "tier":                plan,
             "stripe_customer_id":  customer_id,
             "free_ends_at":        None,
         }).eq("id", user_id).execute()
@@ -1363,6 +1456,7 @@ async def stripe_webhook(request: Request):
         customer_id = event["data"]["object"]["customer"]
         sb.table("profiles").update({
             "subscription_status": "expired",
+            "tier":                "expired",
         }).eq("stripe_customer_id", customer_id).execute()
         logger.info(f"[stripe] Subscription cancelled customer={customer_id}")
 
@@ -1373,6 +1467,7 @@ async def stripe_webhook(request: Request):
         if obj["cancel_at_period_end"]:
             sb.table("profiles").update({
                 "subscription_status": "expired",
+                "tier":                "expired",
             }).eq("stripe_customer_id", customer_id).execute()
             logger.info(f"[stripe] Subscription set to cancel at period end customer={customer_id}")
         else:
@@ -1382,6 +1477,7 @@ async def stripe_webhook(request: Request):
             if plan in ("pro", "pro_plus"):
                 sb.table("profiles").update({
                     "subscription_status": plan,
+                    "tier":                plan,
                 }).eq("stripe_customer_id", customer_id).execute()
                 logger.info(f"[stripe] Subscription updated customer={customer_id} plan={plan}")
 

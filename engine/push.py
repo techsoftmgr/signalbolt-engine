@@ -17,12 +17,23 @@ logger = logging.getLogger(__name__)
 
 EXPO_PUSH_URL = "https://exp.host/--/api/v2/push/send"
 
-# ── Token cache ───────────────────────────────────────────────
+# ── Token + prefs cache ───────────────────────────────────────
 # A full profiles scan per notification is expensive at scale.
-# Cache for 5 minutes — new tokens are picked up within 1 cycle.
-_token_cache: list[str] = []
-_token_cache_ts: float  = 0.0
-_TOKEN_CACHE_TTL        = 300   # 5 minutes
+# Cache for 5 minutes — new tokens/prefs are picked up within 1 cycle.
+#
+# Each entry: { "token": "ExponentPushToken[...]", "prefs": { "new_signals": True, ... } }
+_profile_cache: list[dict] = []
+_profile_cache_ts: float   = 0.0
+_TOKEN_CACHE_TTL           = 300   # 5 minutes
+
+_DEFAULT_PREFS = {
+    "new_signals":    True,
+    "target_hit":     True,
+    "stop_hit":       True,
+    "t1_breakeven":   True,
+    "market_open":    False,
+    "weekly_summary": True,
+}
 
 # Single Supabase client reused for the lifetime of the process
 _sb_client: Client | None = None
@@ -36,28 +47,45 @@ def _supabase() -> Client:
     return _sb_client
 
 
-def _get_tokens() -> list[str]:
-    global _token_cache, _token_cache_ts
+def _get_profiles() -> list[dict]:
+    """Return cached list of {token, prefs} dicts. Refresh every 5 minutes."""
+    global _profile_cache, _profile_cache_ts
     now = time.monotonic()
-    if now - _token_cache_ts < _TOKEN_CACHE_TTL:
-        return _token_cache        # serve from cache
+    if now - _profile_cache_ts < _TOKEN_CACHE_TTL:
+        return _profile_cache   # serve from cache
 
     try:
         rows = (
             _supabase()
             .table("profiles")
-            .select("push_token")
+            .select("push_token, notification_prefs")
             .neq("push_token", None)
             .execute()
             .data
         )
-        tokens = [r["push_token"] for r in rows if r.get("push_token")]
-        _token_cache    = tokens
-        _token_cache_ts = now
-        return tokens
+        profiles = [
+            {
+                "token": r["push_token"],
+                "prefs": {**_DEFAULT_PREFS, **(r.get("notification_prefs") or {})},
+            }
+            for r in rows
+            if r.get("push_token") and r["push_token"].startswith("ExponentPushToken[")
+        ]
+        _profile_cache    = profiles
+        _profile_cache_ts = now
+        return profiles
     except Exception as e:
-        logger.error(f"[push] Failed to fetch push tokens: {e}")
-        return _token_cache   # return stale cache rather than empty on transient error
+        logger.error(f"[push] Failed to fetch push profiles: {e}")
+        return _profile_cache   # return stale cache on transient error
+
+
+def _tokens_for(pref_key: str) -> list[str]:
+    """Return only tokens where the user has enabled the given notification type."""
+    return [
+        p["token"]
+        for p in _get_profiles()
+        if p["prefs"].get(pref_key, True)   # default True if pref missing
+    ]
 
 
 def send_signal_alert(
@@ -67,16 +95,15 @@ def send_signal_alert(
     signal_type: str = "stock",
     signal_id: str | None = None,
 ) -> None:
-    """Send a push notification to all registered devices when a signal fires."""
-    tokens = _get_tokens()
+    """Send a new-signal push to users who have new_signals pref enabled."""
+    tokens = _tokens_for("new_signals")
     if not tokens:
-        logger.info("[push] No push tokens registered — skipping notification")
+        logger.info("[push] No tokens with new_signals enabled — skipping")
         return
 
     emoji = "📈" if direction == "LONG" else "📉"
     type_label = "Options" if signal_type == "option" else "Stock"
 
-    # Include signal_id so tapping the notification deep-links straight to the signal card
     notif_data: dict = {"ticker": ticker, "direction": direction, "type": signal_type}
     if signal_id:
         notif_data["signal_id"] = signal_id
@@ -91,45 +118,50 @@ def send_signal_alert(
             "badge": 1,
         }
         for token in tokens
-        if token.startswith("ExponentPushToken[")
     ]
 
-    if not messages:
-        logger.info("[push] No valid Expo tokens found")
-        return
-
-    try:
-        resp = requests.post(
-            EXPO_PUSH_URL,
-            json=messages,
-            headers={
-                "Accept":       "application/json",
-                "Content-Type": "application/json",
-            },
-            timeout=10,
-        )
-        data = resp.json()
-        errors = [
-            r.get("details", {}).get("error")
-            for r in data.get("data", [])
-            if r.get("status") == "error"
-        ]
-        if errors:
-            logger.warning(f"[push] Some notifications failed: {errors}")
-        else:
-            logger.info(f"[push] Sent {len(messages)} notification(s) for {ticker} {direction}")
-    except Exception as e:
-        logger.error(f"[push] Failed to send notifications: {e}")
+    _dispatch(messages, f"{ticker} {direction}")
 
 
-def _send_raw(title: str, body: str, data: dict | None = None) -> None:
+# Maps notification data["type"] → notification_prefs key
+# Types not listed here are sent to all users (no pref filter)
+_TYPE_TO_PREF: dict[str, str] = {
+    "signal_closed":  "target_hit",    # win case — also covers target_hit pref
+    "t1_breakeven":   "t1_breakeven",
+    "scalp_expired":  "stop_hit",
+    "market_close":   "stop_hit",
+    "eod_warning":    "target_hit",
+    "book_profit":    "target_hit",
+    "reversal":       "stop_hit",
+}
+
+
+def _send_raw(
+    title: str,
+    body: str,
+    data: dict | None = None,
+    pref_key: str | None = None,
+) -> None:
     """
-    Send a push notification with a custom title/body to all registered devices.
-    Used by signal_monitor.py for close events, reversals, and breakeven moves.
+    Send a push notification with a custom title/body.
+    Automatically respects user notification preferences:
+      • If pref_key is provided explicitly, use it.
+      • Otherwise infer from data["type"] via _TYPE_TO_PREF.
+      • If no mapping, send to all registered tokens.
+    Also handles stop_hit vs target_hit split for signal_closed events.
     """
-    tokens = _get_tokens()
+    payload = data or {}
+    notif_type = payload.get("type", "")
+
+    # Special case: signal_closed result=loss → stop_hit pref
+    if notif_type == "signal_closed" and payload.get("result") == "loss":
+        resolved_pref = "stop_hit"
+    else:
+        resolved_pref = pref_key or _TYPE_TO_PREF.get(notif_type)
+
+    tokens = _tokens_for(resolved_pref) if resolved_pref else [p["token"] for p in _get_profiles()]
     if not tokens:
-        logger.info("[push] No push tokens registered — skipping raw notification")
+        logger.info(f"[push] No eligible tokens for type='{notif_type}' pref='{resolved_pref}' — skipping")
         return
 
     messages = [
@@ -137,26 +169,26 @@ def _send_raw(title: str, body: str, data: dict | None = None) -> None:
             "to":    token,
             "title": title,
             "body":  body,
-            "data":  data or {},
+            "data":  payload,
             "sound": "default",
             "badge": 1,
         }
         for token in tokens
-        if token.startswith("ExponentPushToken[")
     ]
 
-    if not messages:
-        logger.info("[push] No valid Expo tokens for raw notification")
-        return
+    _dispatch(messages, title)
 
+
+def _dispatch(messages: list[dict], label: str) -> None:
+    """Fire messages to Expo Push API and log results."""
+    if not messages:
+        logger.info(f"[push] No messages to dispatch for: {label}")
+        return
     try:
         resp = requests.post(
             EXPO_PUSH_URL,
             json=messages,
-            headers={
-                "Accept":       "application/json",
-                "Content-Type": "application/json",
-            },
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
             timeout=10,
         )
         result = resp.json()
@@ -166,8 +198,8 @@ def _send_raw(title: str, body: str, data: dict | None = None) -> None:
             if r.get("status") == "error"
         ]
         if errors:
-            logger.warning(f"[push] Raw notification errors: {errors}")
+            logger.warning(f"[push] Errors for '{label}': {errors}")
         else:
-            logger.info(f"[push] Raw notification sent to {len(messages)} device(s): {title}")
+            logger.info(f"[push] Sent {len(messages)} notification(s): {label}")
     except Exception as e:
-        logger.error(f"[push] Failed to send raw notification: {e}")
+        logger.error(f"[push] Dispatch failed for '{label}': {e}")
