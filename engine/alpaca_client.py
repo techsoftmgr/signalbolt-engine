@@ -177,3 +177,91 @@ def get_news(ticker: str, limit: int = 6) -> list[dict]:
     except Exception as e:
         logger.debug(f"[alpaca] get_news({ticker}) failed: {e}")
     return []
+
+
+def get_multi_bars(
+    tickers: list[str],
+    timeframe: str = "1Day",
+    days: int = 21,
+) -> dict[str, pd.DataFrame]:
+    """
+    Batch OHLCV bars for multiple tickers in a SINGLE Alpaca API call.
+    Used by heatmap and quant services to avoid per-ticker round-trips.
+
+    Returns {ticker: DataFrame(open,high,low,close,volume)} — missing tickers omitted.
+    Returns {} on failure so callers can degrade gracefully.
+    """
+    _init()
+    if not _ok or _client is None or not tickers:
+        return {}
+    try:
+        from datetime import datetime, timezone, timedelta
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+        tf_map = {
+            "1Min":  TimeFrame(1,  TimeFrameUnit.Minute),
+            "5Min":  TimeFrame(5,  TimeFrameUnit.Minute),
+            "15Min": TimeFrame(15, TimeFrameUnit.Minute),
+            "1Hour": TimeFrame(1,  TimeFrameUnit.Hour),
+            "1Day":  TimeFrame(1,  TimeFrameUnit.Day),
+        }
+        tf    = tf_map.get(timeframe, TimeFrame(1, TimeFrameUnit.Day))
+        start = datetime.now(timezone.utc) - timedelta(days=days)
+
+        req  = StockBarsRequest(
+            symbol_or_symbols=tickers,
+            timeframe=tf,
+            start=start,
+            feed="sip",
+        )
+        bars = _client.get_stock_bars(req)
+        df   = bars.df
+
+        if df is None or df.empty:
+            return {}
+
+        result: dict[str, pd.DataFrame] = {}
+        for ticker in tickers:
+            try:
+                if isinstance(df.index, pd.MultiIndex):
+                    t_df = df.xs(ticker, level=0).copy()
+                else:
+                    t_df = df.copy()
+                t_df.columns = [c.lower() for c in t_df.columns]
+                t_df.index   = pd.to_datetime(t_df.index, utc=True)
+                result[ticker] = t_df
+            except Exception:
+                pass  # ticker not in response — omit silently
+        return result
+
+    except Exception as e:
+        logger.debug(f"[alpaca] get_multi_bars({len(tickers)} tickers, {timeframe}, {days}d) failed: {e}")
+        return {}
+
+
+def get_multi_news(tickers: list[str], limit: int = 10) -> list[dict]:
+    """
+    Batch news for multiple tickers from Alpaca News API.
+    Returns list sorted newest-first, or [] on failure.
+    """
+    try:
+        import requests as _req
+        key    = os.environ.get("ALPACA_API_KEY", "")
+        secret = os.environ.get("ALPACA_SECRET_KEY", "")
+        if not key or not secret:
+            return []
+        resp = _req.get(
+            "https://data.alpaca.markets/v1beta1/news",
+            params={"symbols": ",".join(tickers), "limit": limit, "sort": "desc"},
+            headers={
+                "APCA-API-KEY-ID":     key,
+                "APCA-API-SECRET-KEY": secret,
+            },
+            timeout=8,
+        )
+        if resp.ok:
+            return resp.json().get("news", [])
+    except Exception as e:
+        logger.debug(f"[alpaca] get_multi_news failed: {e}")
+    return []

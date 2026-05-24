@@ -38,3 +38,9 @@ EXPO_ACCESS_TOKEN      = os.getenv("EXPO_ACCESS_TOKEN", "")
 PORT                   = int(os.getenv("PORT", "8000"))
 # Internal engine API key — protects /run and /inject-test-signal from public access
 ENGINE_API_KEY         = os.getenv("ENGINE_API_KEY", "")
+
+# ── Premium feature flags (default on — flip to "false" in .env to disable) ───
+ENABLE_HEATMAP         = os.getenv("ENABLE_HEATMAP",         "true").lower() == "true"
+ENABLE_QUANT_DASHBOARD = os.getenv("ENABLE_QUANT_DASHBOARD", "true").lower() == "true"
+ENABLE_NEWS_REACTION   = os.getenv("ENABLE_NEWS_REACTION",   "true").lower() == "true"
+ENABLE_SOCIAL_SIGNALS  = os.getenv("ENABLE_SOCIAL_SIGNALS",  "true").lower() == "true"

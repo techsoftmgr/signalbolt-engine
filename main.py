@@ -1988,6 +1988,334 @@ async def admin_active_signals(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Premium Feature Endpoints ─────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+
+from engine.config import (
+    ENABLE_HEATMAP, ENABLE_QUANT_DASHBOARD,
+    ENABLE_NEWS_REACTION, ENABLE_SOCIAL_SIGNALS,
+)
+
+
+def _require_jwt(request: Request):
+    """
+    Validate Supabase Bearer token and return (user_id, sb).
+    Raises 401 on missing or invalid token.
+    """
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Authorization header required")
+    sb = _make_supabase()
+    try:
+        user_resp = sb.auth.get_user(token)
+        if not user_resp or not user_resp.user:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return user_resp.user.id, sb
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="Token verification failed")
+
+
+# ── Market Heatmap ────────────────────────────────────────────────────────────
+
+@app.get("/market/heatmap")
+async def market_heatmap(
+    request: Request,
+    sort_by: str = "momentum",
+    filter_by: Optional[str] = None,
+    sector: Optional[str] = None,
+    min_rel_volume: float = 0.0,
+):
+    """
+    Real-time market heatmap — momentum, volume, trend direction per ticker.
+    Available to all authenticated users (free + paid).
+    sort_by: momentum | gainers | losers | volume
+    filter_by: bullish | bearish | high_volume | None
+    """
+    if not ENABLE_HEATMAP:
+        raise HTTPException(status_code=503, detail="Heatmap feature is disabled")
+
+    # Verify JWT (any authenticated user can see heatmap)
+    _require_jwt(request)
+
+    try:
+        from engine.heatmap_service import compute_heatmap
+        sb = _make_supabase()
+
+        # Pull active signals to highlight tickers with live signals
+        sig_rows = (
+            sb.table("signals")
+            .select("ticker, id")
+            .eq("status", "active")
+            .execute()
+            .data or []
+        )
+        active_signals = {r["ticker"]: r["id"] for r in sig_rows}
+
+        data = compute_heatmap(
+            symbols=None,
+            active_signals=active_signals,
+            sort_by=sort_by,
+            filter_by=filter_by,
+            sector=sector,
+            min_rel_volume=min_rel_volume,
+        )
+        return {"tickers": data, "count": len(data)}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GET /market/heatmap error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Quant Dashboard ───────────────────────────────────────────────────────────
+
+@app.get("/quant/dashboard")
+async def quant_dashboard(request: Request):
+    """
+    Retail-friendly quant score dashboard.
+    Returns market regime + 6 stock-screening buckets with setup ratings.
+    Available to Pro and Pro+ users.
+    """
+    if not ENABLE_QUANT_DASHBOARD:
+        raise HTTPException(status_code=503, detail="Quant dashboard is disabled")
+
+    _require_jwt(request)
+
+    try:
+        from engine.quant_score_service import get_quant_dashboard
+        return get_quant_dashboard()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GET /quant/dashboard error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── News Reaction Feed ────────────────────────────────────────────────────────
+
+@app.get("/news/reaction")
+async def news_reaction(request: Request, limit: int = 20):
+    """
+    Real-time news reaction feed — headline sentiment, price reaction, urgency.
+    Links news items to any active signals on the same ticker.
+    Available to all authenticated users.
+    """
+    if not ENABLE_NEWS_REACTION:
+        raise HTTPException(status_code=503, detail="News reaction feature is disabled")
+
+    _require_jwt(request)
+
+    try:
+        from engine.news_reaction_service import get_news_feed
+        from engine.heatmap_service import DEFAULT_TICKERS
+        sb = _make_supabase()
+
+        # Build ticker → signalId map for linkage
+        sig_rows = (
+            sb.table("signals")
+            .select("ticker, id")
+            .eq("status", "active")
+            .execute()
+            .data or []
+        )
+        active_signals = {r["ticker"]: r["id"] for r in sig_rows}
+
+        items = get_news_feed(
+            tickers=DEFAULT_TICKERS,
+            active_signals=active_signals,
+            limit=limit,
+        )
+        return {"items": items, "count": len(items)}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GET /news/reaction error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Community / Social Signal Feed ────────────────────────────────────────────
+
+@app.get("/signals/community")
+async def community_feed(request: Request, limit: int = 20):
+    """
+    Community feed: active signals sorted by community interest score.
+    Returns vote counts, follow counts, comments, communityScore.
+    """
+    if not ENABLE_SOCIAL_SIGNALS:
+        raise HTTPException(status_code=503, detail="Social signals feature is disabled")
+
+    _require_jwt(request)
+
+    try:
+        from engine.community_service import get_community_feed
+        sb = _make_supabase()
+        feed = get_community_feed(sb, limit=limit)
+        return {"feed": feed, "count": len(feed)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GET /signals/community error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/signals/{signal_id}/social-summary")
+async def signal_social_summary(signal_id: str, request: Request):
+    """Social summary (votes, follows, comments, score) for one signal."""
+    if not ENABLE_SOCIAL_SIGNALS:
+        raise HTTPException(status_code=503, detail="Social signals feature is disabled")
+
+    _require_jwt(request)
+
+    try:
+        from engine.community_service import get_social_summary
+        sb = _make_supabase()
+        return get_social_summary(signal_id, sb)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GET /signals/{signal_id}/social-summary error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/signals/{signal_id}/vote")
+async def vote_signal(signal_id: str, request: Request):
+    """
+    Cast or update a vote on a signal.
+    Body: { "vote_type": "bullish" | "bearish" | "watching" }
+    """
+    if not ENABLE_SOCIAL_SIGNALS:
+        raise HTTPException(status_code=503, detail="Social signals feature is disabled")
+
+    user_id, sb = _require_jwt(request)
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="JSON body required")
+
+    vote_type = (body.get("vote_type") or "").strip()
+    if vote_type not in ("bullish", "bearish", "watching"):
+        raise HTTPException(status_code=400, detail="vote_type must be bullish | bearish | watching")
+
+    try:
+        from engine.community_service import add_vote
+        return add_vote(signal_id, user_id, vote_type, sb)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"POST /signals/{signal_id}/vote error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/signals/{signal_id}/comment")
+async def comment_signal(signal_id: str, request: Request):
+    """
+    Add a comment to a signal.
+    Body: { "content": "..." }
+    Max 500 chars, max 5 comments per user per signal.
+    """
+    if not ENABLE_SOCIAL_SIGNALS:
+        raise HTTPException(status_code=503, detail="Social signals feature is disabled")
+
+    user_id, sb = _require_jwt(request)
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="JSON body required")
+
+    content = (body.get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="content is required")
+
+    try:
+        from engine.community_service import add_comment
+        return add_comment(signal_id, user_id, content, sb)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"POST /signals/{signal_id}/comment error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/signals/{signal_id}/comments")
+async def get_signal_comments(signal_id: str, request: Request, limit: int = 20):
+    """Return public (non-flagged) comments for a signal."""
+    if not ENABLE_SOCIAL_SIGNALS:
+        raise HTTPException(status_code=503, detail="Social signals feature is disabled")
+
+    _require_jwt(request)
+
+    try:
+        from engine.community_service import get_comments
+        sb = _make_supabase()
+        return {"comments": get_comments(signal_id, sb, limit=limit)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GET /signals/{signal_id}/comments error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/signals/{signal_id}/follow")
+async def follow_signal(signal_id: str, request: Request):
+    """Toggle follow/unfollow on a signal. Returns { following: bool, followCount: int }."""
+    if not ENABLE_SOCIAL_SIGNALS:
+        raise HTTPException(status_code=503, detail="Social signals feature is disabled")
+
+    user_id, sb = _require_jwt(request)
+
+    try:
+        from engine.community_service import toggle_follow
+        return toggle_follow(signal_id, user_id, sb)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"POST /signals/{signal_id}/follow error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/signals/report-comment")
+async def report_comment_endpoint(request: Request):
+    """Flag a comment for moderation. Body: { 'comment_id': '...' }"""
+    if not ENABLE_SOCIAL_SIGNALS:
+        raise HTTPException(status_code=503, detail="Social signals feature is disabled")
+
+    _require_jwt(request)
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="JSON body required")
+
+    comment_id = (body.get("comment_id") or "").strip()
+    if not comment_id:
+        raise HTTPException(status_code=400, detail="comment_id is required")
+
+    try:
+        from engine.community_service import report_comment
+        sb = _make_supabase()
+        report_comment(comment_id, sb)
+        return {"status": "flagged"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"POST /signals/report-comment error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     import uvicorn
     from engine.config import PORT
