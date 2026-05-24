@@ -434,6 +434,44 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="SignalBolt Engine", version="3.1.0", lifespan=lifespan)
 
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+# slowapi gives us per-IP token-bucket limits without needing Redis. State is
+# per-machine — with 2 app machines, a client gets 2x the limit in the worst
+# case, which is acceptable for protecting Stripe/Supabase from abuse.
+#
+# Only applied to endpoints that hit expensive downstreams or can be used to
+# spam users. Read-only public endpoints (/health, /prices, /indices, /signals)
+# are left alone — they're cheap and cacheable.
+#
+# Disable per-IP limits in tests / dev by setting RATE_LIMIT_ENABLED=false.
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+
+_RATE_LIMIT_ENABLED = os.environ.get("RATE_LIMIT_ENABLED", "true").lower() == "true"
+
+
+def _rate_key(request: Request) -> str:
+    """
+    Prefer the real client IP from Fly's forwarded headers; fall back to
+    the socket address. Avoids treating every request as "the Fly LB" when
+    behind a proxy.
+    """
+    fwd = request.headers.get("fly-client-ip") or request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return get_remote_address(request)
+
+
+limiter = Limiter(
+    key_func=_rate_key,
+    enabled=_RATE_LIMIT_ENABLED,
+    # Default for any endpoint that opts in without specifying its own limit
+    default_limits=["120/minute"],
+)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 # Fix #11: restrict CORS — allow_origins=["*"] is too broad for production.
 # React Native/Expo mobile apps are not browsers so CORS doesn't apply to them,
 # but web preview and development tooling do need explicit origins.
@@ -996,6 +1034,7 @@ def _check_engine_key(request: Request) -> None:
 
 
 @app.post("/run")
+@limiter.limit("3/minute")
 def manual_run(req: RunRequest, background_tasks: BackgroundTasks, request: Request):
     _check_engine_key(request)
     from engine.runner import run_scan
@@ -1274,6 +1313,7 @@ p{{color:#6b7280;font-size:16px;margin:0}}</style></head>
 
 
 @app.post("/create-payment-intent")
+@limiter.limit("5/minute")
 async def create_payment_intent(request: Request):
     """Create a SetupIntent + ephemeral key for the native Stripe payment sheet."""
     body    = await request.json()
@@ -1323,6 +1363,7 @@ async def create_payment_intent(request: Request):
 
 
 @app.post("/create-subscription-after-payment")
+@limiter.limit("5/minute")
 async def create_subscription_after_payment(request: Request):
     """After setup intent confirmed in app, attach the saved card and create subscription."""
     body             = await request.json()
@@ -1394,6 +1435,7 @@ async def create_subscription_after_payment(request: Request):
 
 
 @app.post("/create-checkout")
+@limiter.limit("5/minute")
 async def create_checkout(request: Request):
     """Create a Stripe Checkout session and return the URL."""
     body = await request.json()
@@ -1427,6 +1469,7 @@ async def create_checkout(request: Request):
 
 
 @app.post("/sync-subscription")
+@limiter.limit("10/minute")
 async def sync_subscription(request: Request):
     """Check Stripe for the current subscription status and update the profile."""
     import time as _time
@@ -1531,6 +1574,7 @@ async def sync_subscription(request: Request):
 
 
 @app.post("/create-portal")
+@limiter.limit("5/minute")
 async def create_portal(request: Request):
     """Stripe Customer Portal — accepts return_url from client."""
     body       = await request.json()
@@ -1633,6 +1677,7 @@ async def stripe_webhook(request: Request):
 
 
 @app.post("/cancel-subscription")
+@limiter.limit("5/minute")
 async def cancel_subscription(request: Request):
     """Cancel the user's active Stripe subscription at period end."""
     body       = await request.json()
@@ -1692,6 +1737,7 @@ async def cancel_subscription(request: Request):
 
 
 @app.delete("/delete-account")
+@limiter.limit("3/minute")
 async def delete_account(request: Request):
     """
     Permanently delete the authenticated user's account.
@@ -1763,6 +1809,7 @@ async def get_invoices(user_id: str):
 
 
 @app.post("/update-payment-method")
+@limiter.limit("5/minute")
 async def update_payment_method(request: Request):
     """After new SetupIntent confirmed, set latest payment method as default on subscription."""
     body        = await request.json()
