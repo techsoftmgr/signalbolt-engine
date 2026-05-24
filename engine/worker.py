@@ -147,12 +147,22 @@ HEARTBEAT_SERVICE_NAME = _os.environ.get("WORKER_SERVICE_NAME", "engine_worker")
 
 
 async def _heartbeat_loop(stop_event: asyncio.Event) -> None:
+    """
+    Background loop: upsert engine_heartbeats every HEARTBEAT_INTERVAL seconds.
+
+    Self-healing: if the table is missing (or any other error), we back off
+    to HEARTBEAT_BACKOFF_SEC between attempts but never permanently disable.
+    That way running the migration later, fixing the env, or transient
+    Supabase errors all recover automatically without a worker restart.
+    """
     import socket
     from datetime import datetime, timezone
 
     machine_id = _os.environ.get("FLY_MACHINE_ID", socket.gethostname())
     pid        = _os.getpid()
-    disabled   = False
+    # On consecutive failures, back off to this interval instead of normal cadence
+    backoff_sec = int(_os.environ.get("HEARTBEAT_BACKOFF_SEC", "300"))
+    last_was_failure = False
 
     def _write_heartbeat() -> None:
         # Sync call deliberately kept on its own thread to avoid blocking
@@ -169,23 +179,29 @@ async def _heartbeat_loop(stop_event: asyncio.Event) -> None:
         }).execute()
 
     while not stop_event.is_set():
-        if not disabled:
-            try:
-                await asyncio.to_thread(_write_heartbeat)
+        try:
+            await asyncio.to_thread(_write_heartbeat)
+            if last_was_failure:
+                logger.info(f"[heartbeat] recovered — writing beats for {HEARTBEAT_SERVICE_NAME}")
+            else:
                 logger.debug(f"[heartbeat] wrote beat for {HEARTBEAT_SERVICE_NAME}")
-            except Exception as e:
-                msg = str(e).lower()
-                if "engine_heartbeats" in msg and ("does not exist" in msg or "schema cache" in msg):
-                    logger.warning(
-                        "[heartbeat] engine_heartbeats table missing — run "
-                        "supabase-heartbeat-migration.sql to enable worker liveness alerts"
-                    )
-                    disabled = True
-                else:
-                    logger.warning(f"[heartbeat] write failed (non-fatal): {e}")
+            last_was_failure = False
+            sleep_for = HEARTBEAT_INTERVAL
+        except Exception as e:
+            msg = str(e).lower()
+            if "engine_heartbeats" in msg and ("does not exist" in msg or "schema cache" in msg):
+                logger.warning(
+                    "[heartbeat] engine_heartbeats table missing — run "
+                    "supabase-heartbeat-migration.sql. Will retry in %ss.",
+                    backoff_sec,
+                )
+            else:
+                logger.warning(f"[heartbeat] write failed (non-fatal): {e}. Will retry in {backoff_sec}s.")
+            last_was_failure = True
+            sleep_for = backoff_sec
 
         try:
-            await asyncio.wait_for(stop_event.wait(), timeout=HEARTBEAT_INTERVAL)
+            await asyncio.wait_for(stop_event.wait(), timeout=sleep_for)
         except asyncio.TimeoutError:
             continue
 
