@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from supabase import create_client, Client
+from supabase import create_client, Client, acreate_client, AsyncClient
 
 from engine.config import (
     ANTHROPIC_API_KEY,
@@ -119,6 +119,33 @@ def _make_supabase() -> Client:
     if _sb_singleton is None:
         _sb_singleton = create_client(os.environ["SUPABASE_URL"], _supabase_key())
     return _sb_singleton
+
+
+# ── Async Supabase client (singleton) ─────────────────────────────────────────
+# For endpoints converted to async — they get true non-blocking I/O instead of
+# tying up an anyio threadpool thread for each Supabase call. Migration is
+# gradual; sync endpoints keep using _make_supabase() above.
+#
+# Usage:
+#   sb = await _make_supabase_async()
+#   rows = (await sb.table("foo").select("*").execute()).data
+_sb_async_singleton: Optional[AsyncClient] = None
+_sb_async_lock = None  # asyncio.Lock — created lazily inside event loop
+
+
+async def _make_supabase_async() -> AsyncClient:
+    global _sb_async_singleton, _sb_async_lock
+    if _sb_async_singleton is not None:
+        return _sb_async_singleton
+    import asyncio
+    if _sb_async_lock is None:
+        _sb_async_lock = asyncio.Lock()
+    async with _sb_async_lock:
+        if _sb_async_singleton is None:
+            _sb_async_singleton = await acreate_client(
+                os.environ["SUPABASE_URL"], _supabase_key()
+            )
+    return _sb_async_singleton
 
 
 # ---------------------------------------------------------------------------
@@ -991,18 +1018,20 @@ def get_premarket(min_score: int = 0, limit: int = 50):
 
 
 @app.get("/signals")
-def get_signals(user_id: str = "", strategy_type: str = ""):
+async def get_signals(user_id: str = "", strategy_type: str = ""):
     """
     Return recent active signals.
-    Fix #12: accepts optional user_id (for logging) and strategy_type filter.
-    Signals are broadcast to all subscribers — no personal data here.
+
+    Hit by every app launch and every signals-tab refresh — by far the highest
+    QPS endpoint. Converted to async Supabase so each request doesn't tie up an
+    anyio threadpool thread for the ~50–200ms Supabase round-trip.
     """
     try:
-        sb    = _make_supabase()
+        sb    = await _make_supabase_async()
         query = sb.table("signals").select("*").order("created_at", desc=True)
         if strategy_type:
             query = query.eq("strategy_type", strategy_type)
-        result = query.limit(50).execute()
+        result = await query.limit(50).execute()
         return {"signals": result.data, "count": len(result.data)}
     except Exception as e:
         logger.error(f"GET /signals error: {e}")
@@ -2141,15 +2170,14 @@ async def admin_active_signals(request: Request):
     _check_engine_key(request)
 
     try:
-        sb = _make_supabase()
-        rows = (
+        sb = await _make_supabase_async()
+        rows = (await (
             sb.table("signals")
             .select("id, ticker, direction, strategy_type, entry_price, target_one, target_two, stop_loss, confidence_score, created_at")
             .eq("status", "active")
             .order("created_at", desc=True)
             .execute()
-            .data
-        ) or []
+        )).data or []
 
         # Enrich with current price from price_store (no extra API call)
         from engine import price_store
