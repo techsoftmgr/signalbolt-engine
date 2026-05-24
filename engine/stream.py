@@ -313,10 +313,13 @@ def _close_scalp_signal(sig: dict, hit: str, bar_price: float) -> None:
                 "price":      hit_price,
                 "note":       note,
             }).execute()
-        except Exception:
-            pass
+        except Exception as _ev_e:
+            # signal_events is a timeline log — if insert fails the actual
+            # signal close still happened. Surface as warning so persistent
+            # schema/Supabase issues become visible.
+            logger.warning(f"[stream] signal_events insert failed for {sig['id']}: {_ev_e}")
 
-        # Push notification
+        # Push notification — failure here = user doesn't see their win/loss
         try:
             ticker = sig["ticker"]
             if result == "win":
@@ -331,8 +334,8 @@ def _close_scalp_signal(sig: dict, hit: str, bar_price: float) -> None:
                     body=f"{sig['direction']} scalp stopped out. {pnl_pct:.1f}%",
                     data={"type": "signal_closed", "result": result, "ticker": ticker},
                 )
-        except Exception:
-            pass
+        except Exception as _push_e:
+            logger.warning(f"[stream] scalp close push failed for {sig['id']}: {_push_e}")
 
         # Remove from cache immediately so no duplicate close attempt
         _scalp_cache.pop(sig["ticker"], None)
@@ -488,8 +491,8 @@ def _close_rt_signal(sig: dict, hit: str, price: float) -> None:
                     data={"type": "signal_closed", "result": "loss", "ticker": ticker,
                           "signal_id": str(sig["id"])},
                 )
-        except Exception:
-            pass
+        except Exception as _push_e:
+            logger.warning(f"[stream] RT close push failed for {sig.get('id')}: {_push_e}")
 
         # Evict from cache immediately — prevents duplicate close
         sigs = _rt_cache.get(ticker, [])

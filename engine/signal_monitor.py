@@ -536,8 +536,8 @@ def _monitor_stocks(sb: Client) -> None:
                             "30-min scalp window closed — position exited")
             try:
                 _push_scalp_expired(ticker, direction, signal_id=sig_id_str)
-            except Exception:
-                pass
+            except Exception as _pe:
+                logger.warning(f"[monitor] scalp-expired push failed for {sig_id_str}: {_pe}")
             continue
 
         # ── 2a. EOD early warning (3:00–3:30 PM) — alert if in profit ────────
@@ -619,8 +619,8 @@ def _monitor_stocks(sb: Client) -> None:
                                 if price else f"Market closing — {direction} position force-closed")
                 try:
                     _push_market_close(ticker, direction, strategy, pnl_pct, signal_id=sig_id_str)
-                except Exception:
-                    pass
+                except Exception as _pe:
+                    logger.warning(f"[monitor] market-close push failed for {sig_id_str}: {_pe}")
                 continue
 
         # Only run analysis checks during market hours
@@ -661,8 +661,8 @@ def _monitor_stocks(sb: Client) -> None:
                     try:
                         _push_status_change(ticker, new_status, pnl_pct,
                                             direction=direction, signal_id=sig_id_str)
-                    except Exception:
-                        pass
+                    except Exception as _pe:
+                        logger.warning(f"[monitor] status-change push failed for {sig_id_str}: {_pe}")
                 logger.info(
                     f"[monitor] {ticker} status: {old_status} → {new_status} "
                     f"price={price:.2f} pnl={pnl_pct:+.2f}%"
