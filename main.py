@@ -588,6 +588,47 @@ async def ready():
     checks["anthropic"] = "configured" if os.environ.get("ANTHROPIC_API_KEY") else "missing"
     checks["stripe"]    = "configured" if os.environ.get("STRIPE_SECRET_KEY") else "missing"
 
+    # ── Worker heartbeat ──────────────────────────────────────────────────────
+    # Engine worker writes engine_heartbeats every 60s. If we haven't seen a
+    # beat in WORKER_STALE_AFTER_SEC, the worker is silently dead — no signal
+    # scans, no Alpaca stream, no push notifications. Surfaces here so Sentry /
+    # uptime alerts can fire even though /health stays green.
+    try:
+        stale_after = int(os.environ.get("WORKER_STALE_AFTER_SEC", "300"))
+        service_name = os.environ.get("WORKER_SERVICE_NAME", "engine_worker")
+        sb_url = os.environ.get("SUPABASE_URL")
+        sb_key = os.environ.get("SUPABASE_KEY") or os.environ.get("SUPABASE_SECRET_KEY")
+        if sb_url and sb_key:
+            sb = create_client(sb_url, sb_key)
+            rows = (
+                sb.table("engine_heartbeats")
+                .select("last_beat, machine_id")
+                .eq("service", service_name)
+                .limit(1)
+                .execute()
+                .data
+            )
+            if not rows:
+                checks["worker"] = "unknown: no heartbeat yet"
+            else:
+                last_iso = rows[0]["last_beat"]
+                # Supabase returns ISO with offset; parse robustly
+                last = datetime.fromisoformat(last_iso.replace("Z", "+00:00"))
+                age = (datetime.now(timezone.utc) - last).total_seconds()
+                if age <= stale_after:
+                    checks["worker"] = f"healthy (last_beat {int(age)}s ago)"
+                else:
+                    checks["worker"] = f"stale ({int(age)}s ago, threshold {stale_after}s)"
+                    overall = "degraded"
+    except Exception as e:
+        # Missing table is the common case before the migration runs — report
+        # as "skipped" instead of "error" so it doesn't trigger alerts.
+        msg = str(e).lower()
+        if "engine_heartbeats" in msg and ("does not exist" in msg or "schema cache" in msg):
+            checks["worker"] = "skipped: engine_heartbeats table missing (run migration)"
+        else:
+            checks["worker"] = f"error: {e}"
+
     return {
         "status":    overall,
         "service":   "signalbolt-engine",

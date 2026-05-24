@@ -95,8 +95,9 @@ async def main() -> None:
 
     scheduler   = start_scheduler()
     stream_task = asyncio.create_task(run_stream(), name="alpaca_stream")
+    heartbeat_task = asyncio.create_task(_heartbeat_loop(stop_event), name="heartbeat")
 
-    logger.info("SignalBolt worker started — scheduler + Alpaca stream active")
+    logger.info("SignalBolt worker started — scheduler + Alpaca stream + heartbeat active")
 
     try:
         await stop_event.wait()
@@ -116,12 +117,77 @@ async def main() -> None:
         with suppress(asyncio.CancelledError):
             await stream_task
 
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
+
         try:
             scheduler.shutdown(wait=False)
         except Exception as e:
             logger.warning(f"[worker] Scheduler shutdown error: {e}")
 
         logger.info("SignalBolt worker stopped cleanly")
+
+
+# ── Heartbeat loop ────────────────────────────────────────────────────────────
+# Worker writes a row to engine_heartbeats every HEARTBEAT_INTERVAL seconds.
+# /ready on the app process reads that row; if last_beat is older than
+# HEARTBEAT_STALE_AFTER seconds, /ready reports degraded so Sentry/uptime
+# tooling can alert that the worker silently died (no Alpaca stream =
+# no signals fire, no push notifications).
+#
+# The table is created by supabase-heartbeat-migration.sql. If the table
+# doesn't exist yet the heartbeat is a no-op — it logs once and stops trying,
+# so missing migrations don't crash the worker.
+
+import os as _os
+
+HEARTBEAT_INTERVAL     = int(_os.environ.get("WORKER_HEARTBEAT_INTERVAL_SEC", "60"))
+HEARTBEAT_SERVICE_NAME = _os.environ.get("WORKER_SERVICE_NAME", "engine_worker")
+
+
+async def _heartbeat_loop(stop_event: asyncio.Event) -> None:
+    import socket
+    from datetime import datetime, timezone
+
+    machine_id = _os.environ.get("FLY_MACHINE_ID", socket.gethostname())
+    pid        = _os.getpid()
+    disabled   = False
+
+    def _write_heartbeat() -> None:
+        # Sync call deliberately kept on its own thread to avoid blocking
+        # the event loop. Runs every HEARTBEAT_INTERVAL seconds at most.
+        from supabase import create_client
+        sb_url = _os.environ["SUPABASE_URL"]
+        sb_key = _os.environ.get("SUPABASE_KEY") or _os.environ["SUPABASE_SECRET_KEY"]
+        sb     = create_client(sb_url, sb_key)
+        sb.table("engine_heartbeats").upsert({
+            "service":    HEARTBEAT_SERVICE_NAME,
+            "last_beat":  datetime.now(timezone.utc).isoformat(),
+            "pid":        pid,
+            "machine_id": machine_id,
+        }).execute()
+
+    while not stop_event.is_set():
+        if not disabled:
+            try:
+                await asyncio.to_thread(_write_heartbeat)
+                logger.debug(f"[heartbeat] wrote beat for {HEARTBEAT_SERVICE_NAME}")
+            except Exception as e:
+                msg = str(e).lower()
+                if "engine_heartbeats" in msg and ("does not exist" in msg or "schema cache" in msg):
+                    logger.warning(
+                        "[heartbeat] engine_heartbeats table missing — run "
+                        "supabase-heartbeat-migration.sql to enable worker liveness alerts"
+                    )
+                    disabled = True
+                else:
+                    logger.warning(f"[heartbeat] write failed (non-fatal): {e}")
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=HEARTBEAT_INTERVAL)
+        except asyncio.TimeoutError:
+            continue
 
 
 if __name__ == "__main__":
