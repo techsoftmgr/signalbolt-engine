@@ -736,12 +736,12 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
         chop=chop,
     )
     sweep = analysis.get("liquidity_sweep", {})
-    breakdown = scored["breakdown"]
+    breakdown = scored.get("breakdown", {}) or {}
     logger.info(
-        f"[runner] {ticker} [{strategy_type}] score={scored['total']}/{scored['threshold']} "
+        f"[runner] {ticker} [{strategy_type}] score={scored.get('total', 0)}/{scored.get('threshold', 0)} "
         f"grade={scored.get('confidence_grade','?')} "
-        f"(L1={breakdown['l1_smc']} L2={breakdown['l2_technical']} "
-        f"L3={breakdown['l3_sentiment']} L4={breakdown['l4_risk']} "
+        f"(L1={breakdown.get('l1_smc', 0)} L2={breakdown.get('l2_technical', 0)} "
+        f"L3={breakdown.get('l3_sentiment', 0)} L4={breakdown.get('l4_risk', 0)} "
         f"L5={breakdown.get('l5_mtf', 0)} "
         f"L6={breakdown.get('l6_regime', 0)} "
         f"L7={breakdown.get('l7_session', 0)} "
@@ -931,7 +931,7 @@ def _process_dark_pool_ticker(sb: Client, ticker: str, config: dict,
         gamma=gamma, manipulation=manipulation,
     )
     logger.info(
-        f"[runner] {ticker} [dark_pool] score={scored['total']}/{scored['threshold']} "
+        f"[runner] {ticker} [dark_pool] score={scored.get('total', 0)}/{scored.get('threshold', 0)} "
         f"vol_ratio={analysis.get('volume_ratio', 0):.1f}x"
     )
 
@@ -1031,7 +1031,7 @@ def _process_options_flow_ticker(sb: Client, ticker: str, config: dict,
         gamma=gamma, manipulation=manipulation,
     )
     logger.info(
-        f"[runner] {ticker} [options_flow] score={scored['total']}/{scored['threshold']} "
+        f"[runner] {ticker} [options_flow] score={scored.get('total', 0)}/{scored.get('threshold', 0)} "
         f"calls={analysis.get('call_volume', 0)} puts={analysis.get('put_volume', 0)}"
     )
 

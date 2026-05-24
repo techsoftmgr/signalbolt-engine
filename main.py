@@ -107,8 +107,18 @@ def _supabase_key() -> str:
     return os.environ.get("SUPABASE_KEY") or os.environ["SUPABASE_SECRET_KEY"]
 
 
+# Singleton Supabase client — created once on first use, reused across all
+# requests. Previously _make_supabase() built a fresh client per call, which
+# means a TLS handshake on every endpoint hit. Under load that's the difference
+# between 50ms and 500ms per request.
+_sb_singleton: Optional[Client] = None
+
+
 def _make_supabase() -> Client:
-    return create_client(os.environ["SUPABASE_URL"], _supabase_key())
+    global _sb_singleton
+    if _sb_singleton is None:
+        _sb_singleton = create_client(os.environ["SUPABASE_URL"], _supabase_key())
+    return _sb_singleton
 
 
 # ---------------------------------------------------------------------------
@@ -320,16 +330,37 @@ def _alpaca_stock_snapshots(symbols: list[str]) -> dict:
 # Lifespan
 # ---------------------------------------------------------------------------
 
+# ── Process-level toggle ──────────────────────────────────────────────────────
+# The trading engine (scheduler + Alpaca WebSocket + price broadcast) is heavy
+# and was previously started inside the web process. That single VM ended up
+# doing API + scanning + WebSocket + push, which is what triggered Fly's
+# PR04 load-balancer warnings and made /health time out.
+#
+# Default: web process is API-only. Set RUN_ENGINE_IN_WEB=true to revert to the
+# old behaviour. The worker process (engine/worker.py) is where the engine runs
+# in production.
+RUN_ENGINE_IN_WEB = os.getenv("RUN_ENGINE_IN_WEB", "false").lower() == "true"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     import asyncio
+
+    scheduler         = None
+    stream_task       = None
+    broadcast_task    = None
+
+    if not RUN_ENGINE_IN_WEB:
+        logger.info("SignalBolt API started — engine disabled in web process (RUN_ENGINE_IN_WEB=false)")
+        yield
+        logger.info("SignalBolt API stopped")
+        return
+
     from engine.runner import start_scheduler
     from engine.stream import run_stream
     from engine import price_store
 
     # ── Initialise real-time price store with this event loop ────────────────
-    # Use get_running_loop() — get_event_loop() is deprecated in Python 3.10+
-    # and may return the wrong loop inside an async context manager.
     price_store.init(asyncio.get_running_loop())
 
     # ── Seed price store from Alpaca REST snapshot so first WS connect gets
@@ -340,8 +371,6 @@ async def lifespan(app: FastAPI):
         snaps = _alpaca_stock_snapshots(seed_tickers)
         for ticker, data in snaps.items():
             price_store.seed(ticker, data["price"], data["changePercent"], data.get("session", "market"))
-            # Derive prev_close so trade-based Δ% is accurate:
-            #   prev_close = price / (1 + changePercent/100)
             chg = data["changePercent"]
             prev = data["price"] / (1 + chg / 100) if chg != -100 else data["price"]
             price_store.set_prev_close(ticker, prev)
@@ -356,10 +385,6 @@ async def lifespan(app: FastAPI):
     stream_task = asyncio.create_task(run_stream(), name="alpaca_stream")
 
     # ── 10 Hz price broadcast loop ────────────────────────────────────────────
-    # Every 100 ms: push all tickers that received a new trade since the last
-    # cycle to every connected app WebSocket client.  This replaces the old
-    # per-trade throttled broadcast and gives smooth, predictable 10 Hz updates
-    # regardless of how many trades Alpaca sends per second.
     async def _price_broadcast_loop():
         while True:
             await asyncio.sleep(0.1)   # 100 ms = 10 Hz
@@ -373,40 +398,37 @@ async def lifespan(app: FastAPI):
     )
 
     logger.info(
-        "SignalBolt engine started — "
+        "SignalBolt engine started in WEB process — "
         "scalping=WebSocket real-time | day_trade/swing=APScheduler | "
         "prices=10 Hz WebSocket push to app"
     )
     yield
 
     # ── Graceful shutdown ─────────────────────────────────────────────────────
-    # Stop the Alpaca WebSocket FIRST so the SIP connection is released
-    # before we cancel the asyncio task.  Fly.io sends SIGTERM to the old
-    # container during a rolling deploy; if we don't close the socket here
-    # the Alpaca connection stays alive while the new container tries to
-    # connect, causing "connection limit exceeded" storms.
     try:
         from engine.stream import _wss_ref as _stream_wss
         if _stream_wss is not None:
             _stream_wss.stop()
             logger.info("[lifespan] Alpaca WebSocket stopped — connection released")
-            # Brief pause so the SDK's internal thread fully closes the socket
-            # before we raise CancelledError into the stream task.
             await asyncio.sleep(2)
     except Exception as _se:
         logger.debug(f"[lifespan] stream stop error (non-fatal): {_se}")
 
-    broadcast_task.cancel()
-    stream_task.cancel()
-    try:
-        await stream_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await broadcast_task
-    except asyncio.CancelledError:
-        pass
-    scheduler.shutdown(wait=False)
+    if broadcast_task is not None:
+        broadcast_task.cancel()
+    if stream_task is not None:
+        stream_task.cancel()
+        try:
+            await stream_task
+        except asyncio.CancelledError:
+            pass
+    if broadcast_task is not None:
+        try:
+            await broadcast_task
+        except asyncio.CancelledError:
+            pass
+    if scheduler is not None:
+        scheduler.shutdown(wait=False)
     logger.info("Engine stopped — scheduler, stream, and broadcast loop shut down")
 
 
@@ -434,8 +456,58 @@ app.add_middleware(
 )
 
 
+# ── Threadpool sizing ─────────────────────────────────────────────────────────
+# FastAPI runs sync `def` endpoints in anyio's threadpool (default 40 threads).
+# Several endpoints (/prices, /indices, /signals, /history, /chart-data) are
+# sync and make blocking Supabase/Alpaca calls. With the default limit, ~40
+# concurrent slow requests will starve and 41+ will queue behind them.
+# Bump to 100 — keeps memory modest (~100 MB) and absorbs burst load.
+@app.on_event("startup")
+async def _configure_threadpool() -> None:
+    try:
+        import anyio
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        limiter.total_tokens = 100
+        logger.info(f"[startup] anyio threadpool sized to {int(limiter.total_tokens)} threads")
+    except Exception as e:
+        logger.warning(f"[startup] threadpool resize failed (non-fatal): {e}")
+
+
+# ── Hard per-request timeout ──────────────────────────────────────────────────
+# Any individual request that runs longer than REQUEST_TIMEOUT_SECONDS is
+# cancelled and the client gets HTTP 504. Without this, a hung Supabase/Alpaca
+# call holds the worker thread forever — which is what caused our 60s+ /health
+# blocks under load. /health and /ready are exempted so they always answer.
+REQUEST_TIMEOUT_SECONDS = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "30"))
+_TIMEOUT_EXEMPT_PATHS   = {"/health", "/ready", "/ws/prices"}
+
+
+@app.middleware("http")
+async def request_timeout(request: Request, call_next):
+    import asyncio
+    if request.url.path in _TIMEOUT_EXEMPT_PATHS:
+        return await call_next(request)
+    try:
+        return await asyncio.wait_for(call_next(request), timeout=REQUEST_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        from fastapi.responses import JSONResponse
+        logger.warning(
+            f"[timeout] {request.method} {request.url.path} exceeded "
+            f"{REQUEST_TIMEOUT_SECONDS}s — returning 504"
+        )
+        return JSONResponse(
+            status_code=504,
+            content={"error": "request_timeout", "limit_seconds": REQUEST_TIMEOUT_SECONDS},
+        )
+
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
+    # Skip /health entirely — Fly hits it every 15s and logging here adds noise
+    # plus a tiny but real CPU cost on a path that must be fastest possible.
+    if request.url.path == "/health":
+        return await call_next(request)
+
     start    = time.time()
     response = await call_next(request)
     duration = time.time() - start
@@ -452,21 +524,50 @@ async def log_requests(request: Request, call_next):
 
 @app.get("/health")
 async def health():
-    from engine.config import SUPABASE_URL, SUPABASE_SECRET_KEY, ALPACA_API_KEY, ALPACA_SECRET_KEY
+    """
+    Dependency-free liveness probe. MUST stay fast and offline-safe.
 
-    # Database check
+    Fly health checks point at this endpoint. It must never call Supabase,
+    Alpaca, yfinance, Stripe, or Anthropic — any of those can hang for 10s+
+    and previously caused Fly's load balancer to mark the VM unhealthy
+    (PR04 "could not find a good candidate") even though the process was up.
+
+    For deep dependency checks, use /ready.
+    """
+    return {
+        "status":    "ok",
+        "service":   "signalbolt-engine",
+        "version":   "3.1.0",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/ready")
+async def ready():
+    """
+    Deep readiness probe: verifies Supabase + Alpaca + key configuration.
+
+    Uses strict timeouts so a slow downstream cannot block the response.
+    Returns 'ready' when core deps respond, 'degraded' when at least one
+    fails. Never raises — failures are reported in the body.
+    """
+    checks: dict[str, str] = {}
+    overall = "ready"
+
+    # ── Supabase ──────────────────────────────────────────────────────────────
     try:
+        from engine.config import SUPABASE_URL, SUPABASE_SECRET_KEY
         sb = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
         sb.table("signals").select("id").limit(1).execute()
-        db_status = "healthy"
+        checks["database"] = "healthy"
     except Exception as e:
-        db_status = f"error: {e}"
-        if SENTRY_DSN:
-            sentry_sdk.capture_exception(e)
+        checks["database"] = f"error: {e}"
+        overall = "degraded"
 
-    # Alpaca check — use direct HTTP with a short timeout to avoid blocking
+    # ── Alpaca (strict 3s timeout) ────────────────────────────────────────────
     try:
         import httpx
+        from engine.config import ALPACA_API_KEY, ALPACA_SECRET_KEY
         alpaca_base = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
         resp = httpx.get(
             f"{alpaca_base}/v2/account",
@@ -474,23 +575,25 @@ async def health():
                 "APCA-API-KEY-ID":     ALPACA_API_KEY,
                 "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
             },
-            timeout=5.0,
+            timeout=3.0,
         )
-        alpaca_status = "healthy" if resp.status_code == 200 else f"http_{resp.status_code}"
+        checks["alpaca"] = "healthy" if resp.status_code == 200 else f"http_{resp.status_code}"
+        if resp.status_code != 200:
+            overall = "degraded"
     except Exception as e:
-        alpaca_status = f"error: {e}"
+        checks["alpaca"] = f"error: {e}"
+        overall = "degraded"
+
+    # ── Config-only checks (no network) ───────────────────────────────────────
+    checks["anthropic"] = "configured" if os.environ.get("ANTHROPIC_API_KEY") else "missing"
+    checks["stripe"]    = "configured" if os.environ.get("STRIPE_SECRET_KEY") else "missing"
 
     return {
-        "status":    "ok",
+        "status":    overall,
         "service":   "signalbolt-engine",
         "version":   "3.1.0",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "checks": {
-            "database":  db_status,
-            "alpaca":    alpaca_status,
-            "anthropic": "configured" if ANTHROPIC_API_KEY else "missing",
-            "stripe":    "configured" if STRIPE_SECRET_KEY else "missing",
-        },
+        "checks":    checks,
     }
 
 

@@ -1,16 +1,21 @@
 from dotenv import load_dotenv
 import os
-import sys
 
 load_dotenv(override=True)   # .env values always win over shell environment
 
 
 def get_required(key: str) -> str:
+    """
+    Return env var or raise RuntimeError.
+
+    NOTE: This used to call sys.exit(1) on missing keys. That was dangerous
+    because importing this module from any code path (e.g. /health) would
+    terminate the whole process if a key was missing. Raising RuntimeError
+    lets callers decide whether to fail hard or degrade gracefully.
+    """
     value = os.getenv(key)
     if not value:
-        print(f"ERROR: Missing required key: {key}")
-        print(f"Copy .env.example to .env and add your keys")
-        sys.exit(1)
+        raise RuntimeError(f"Missing required environment variable: {key}")
     return value
 
 

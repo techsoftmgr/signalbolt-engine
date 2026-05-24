@@ -48,35 +48,51 @@ def _supabase() -> Client:
 
 
 def _get_profiles() -> list[dict]:
-    """Return cached list of {token, prefs} dicts. Refresh every 5 minutes."""
+    """
+    Return cached list of {token, prefs} dicts. Refresh every 5 minutes.
+
+    Retries up to 3 times (backoff 1s/2s/4s) before logging a single error
+    and falling back to the stale cache. This prevents transient Supabase
+    blips from spamming the logs and from clearing the working cache.
+    """
     global _profile_cache, _profile_cache_ts
     now = time.monotonic()
     if now - _profile_cache_ts < _TOKEN_CACHE_TTL:
         return _profile_cache   # serve from cache
 
-    try:
-        rows = (
-            _supabase()
-            .table("profiles")
-            .select("push_token, notification_prefs")
-            .neq("push_token", None)
-            .execute()
-            .data
-        )
-        profiles = [
-            {
-                "token": r["push_token"],
-                "prefs": {**_DEFAULT_PREFS, **(r.get("notification_prefs") or {})},
-            }
-            for r in rows
-            if r.get("push_token") and r["push_token"].startswith("ExponentPushToken[")
-        ]
-        _profile_cache    = profiles
-        _profile_cache_ts = now
-        return profiles
-    except Exception as e:
-        logger.error(f"[push] Failed to fetch push profiles: {e}")
-        return _profile_cache   # return stale cache on transient error
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            rows = (
+                _supabase()
+                .table("profiles")
+                .select("push_token, notification_prefs")
+                .neq("push_token", None)
+                .execute()
+                .data
+            )
+            profiles = [
+                {
+                    "token": r["push_token"],
+                    "prefs": {**_DEFAULT_PREFS, **(r.get("notification_prefs") or {})},
+                }
+                for r in rows
+                if r.get("push_token") and r["push_token"].startswith("ExponentPushToken[")
+            ]
+            _profile_cache    = profiles
+            _profile_cache_ts = now
+            return profiles
+        except Exception as e:
+            last_error = e
+            if attempt < 2:
+                logger.warning(
+                    "[push] token fetch failed attempt=%s; retrying in %ss",
+                    attempt + 1, 2 ** attempt,
+                )
+                time.sleep(2 ** attempt)
+
+    logger.error(f"[push] Failed to fetch push profiles after retries: {last_error}")
+    return _profile_cache   # return stale cache on persistent error
 
 
 def _tokens_for(pref_key: str) -> list[str]:

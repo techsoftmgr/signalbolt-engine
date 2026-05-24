@@ -528,13 +528,45 @@ def score(
         manipulation:  output of manipulation_detector.detect()  (optional — adds L9)
         chop:          ChopResult from chop_detector.detect()  (optional — subtracts penalty)
     """
+    # ── Determine threshold UP FRONT so every return path includes it ────────
+    # Bug fix: prior early-return paths omitted "threshold", crashing runner.py
+    # with KeyError: 'threshold'. Always compute it before any return.
+    if session is not None:
+        threshold = session.get("threshold", STRATEGY_THRESHOLDS.get(strategy_type, FIRE_THRESHOLD))
+    else:
+        threshold = STRATEGY_THRESHOLDS.get(strategy_type, FIRE_THRESHOLD)
+
     direction = analysis.get("direction")
     if not direction:
-        return {"total": 0, "passes": False, "breakdown": {}}
+        return {
+            "total":              0,
+            "passes":             False,
+            "breakdown":          {},
+            "confidence_factors": [],
+            "direction":          None,
+            "entry":              analysis.get("entry"),
+            "stop_loss":          analysis.get("stop_loss"),
+            "target_one":         analysis.get("target_one"),
+            "target_two":         analysis.get("target_two"),
+            "threshold":          threshold,
+        }
 
-    price  = analysis["current_price"]
+    price  = analysis.get("current_price")
+    if price is None:
+        return {
+            "total":              0,
+            "passes":             False,
+            "breakdown":          {},
+            "confidence_factors": [],
+            "direction":          direction,
+            "entry":              analysis.get("entry"),
+            "stop_loss":          analysis.get("stop_loss"),
+            "target_one":         analysis.get("target_one"),
+            "target_two":         analysis.get("target_two"),
+            "threshold":          threshold,
+        }
     df     = analysis.get("candles") if analysis.get("candles") is not None else __import__("pandas").DataFrame()
-    ticker = analysis["ticker"]
+    ticker = analysis.get("ticker", "?")
 
     flow_strategy = strategy_type in ("options_flow", "dark_pool")
     sweep = analysis.get("liquidity_sweep", {})
@@ -548,13 +580,25 @@ def score(
         return {
             "total":     round(l1),
             "passes":    False,
-            "breakdown": {"l1_smc": round(l1), "l2_technical": 0,
-                          "l3_sentiment": 0, "l4_risk": 0, "l5_mtf": 0},
+            "breakdown": {
+                "l1_smc":          round(l1),
+                "l2_technical":    0,
+                "l3_sentiment":    0,
+                "l4_risk":         0,
+                "l5_mtf":          0,
+                "l6_regime":       0,
+                "l7_session":      0,
+                "l8_gamma":        0,
+                "l9_manipulation": 0,
+                "quant_bonus":     0,
+            },
+            "confidence_factors": [],
             "direction":  direction,
             "entry":      analysis.get("entry"),
             "stop_loss":  analysis.get("stop_loss"),
             "target_one": analysis.get("target_one"),
             "target_two": analysis.get("target_two"),
+            "threshold":  threshold,
         }
 
     l2 = _l2_technical(df, direction, strategy_type) if not df.empty else 10.0
@@ -629,11 +673,7 @@ def score(
 
     normalised = round(min(max(base_score + quant_bonus - chop_penalty, 0), 100))
 
-    # ── Determine threshold ───────────────────────────────────
-    if session is not None:
-        threshold = session.get("threshold", STRATEGY_THRESHOLDS.get(strategy_type, FIRE_THRESHOLD))
-    else:
-        threshold = STRATEGY_THRESHOLDS.get(strategy_type, FIRE_THRESHOLD)
+    # ── Threshold already computed at top of function ──────────
 
     breakdown = {
         "l1_smc":          round(l1),
