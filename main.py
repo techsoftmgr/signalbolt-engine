@@ -82,12 +82,19 @@ except Exception as _e:
 # 5-second window regardless of how many users are connected.
 _indices_cache: dict = {}
 _indices_cache_ts: float = 0.0
-_INDICES_CACHE_TTL: float = 3.0   # seconds
+# 15s — app polls /indices on tab focus + every 15s. A 3s cache fired 5x per
+# poll cycle; 15s aligns with one Alpaca/Polygon call per cycle. Cuts Alpaca
+# spend ~5x at 1k users from ~600/min to ~120/min on this endpoint alone.
+_INDICES_CACHE_TTL: float = 15.0
 
 # Per-ticker price cache so the app can poll every 5 s without hammering Alpaca.
 # Keys are individual ticker symbols; each entry is (timestamp, price_dict).
 _prices_cache: dict[str, tuple[float, dict]] = {}
-_PRICES_CACHE_TTL: float = 3.0   # seconds
+# 15s — REST /prices is a fallback for tickers not on the live WS stream.
+# The WS delivers tick-by-tick anyway, so the REST path doesn't need
+# sub-second freshness. 15s matches the app poll cycle = 1 Alpaca call
+# per tab refresh instead of 3-5.
+_PRICES_CACHE_TTL: float = 15.0
 
 
 def _market_session() -> str:
@@ -778,17 +785,29 @@ def get_prices(tickers: str):
     polling simultaneously don't hammer Alpaca on every request.
     """
     symbols = [t.strip().upper() for t in tickers.split(",") if t.strip()]
-    now     = time.monotonic()
 
     # ── Serve cached entries; collect symbols that need a fresh fetch ──
+    # Cache is now Redis-backed (cross-machine) when REDIS_URL is set, with
+    # automatic fallback to per-process memory. The old _prices_cache dict
+    # is kept as a second-level local mirror for sub-millisecond hits.
+    from engine.cache import kv as _kv
+    ttl_int = int(_PRICES_CACHE_TTL)
+    now      = time.monotonic()
     result:  dict = {}
     to_fetch: list[str] = []
     for sym in symbols:
-        cached = _prices_cache.get(sym)
-        if cached and (now - cached[0]) < _PRICES_CACHE_TTL:
-            result[sym] = cached[1]
-        else:
-            to_fetch.append(sym)
+        # L1: process-local dict (fastest)
+        local = _prices_cache.get(sym)
+        if local and (now - local[0]) < _PRICES_CACHE_TTL:
+            result[sym] = local[1]
+            continue
+        # L2: shared Redis (across machines)
+        shared = _kv.get_json(f"prices:{sym}")
+        if shared:
+            result[sym] = shared
+            _prices_cache[sym] = (now, shared)   # promote into L1
+            continue
+        to_fetch.append(sym)
 
     if to_fetch:
         # ── 1. Alpaca SIP (real-time, consistent with signal engine) ──
@@ -807,10 +826,11 @@ def get_prices(tickers: str):
             if data:
                 fresh[sym] = data
 
-        # ── Store in cache and merge into result ──────────────────────
+        # ── Store in BOTH cache layers and merge into result ──────────
         ts = time.monotonic()
         for sym, data in fresh.items():
             _prices_cache[sym] = (ts, data)
+            _kv.set_json(f"prices:{sym}", data, ttl_sec=ttl_int)
         result.update(fresh)
 
     return result
@@ -975,10 +995,18 @@ def get_indices():
     """
     global _indices_cache, _indices_cache_ts
     import time as _time
+    from engine.cache import kv as _kv
 
-    # Serve from cache if fresh
+    # L1: process-local dict (sub-ms hits)
     if _indices_cache and (_time.monotonic() - _indices_cache_ts) < _INDICES_CACHE_TTL:
         return _indices_cache
+
+    # L2: shared Redis (cross-machine — prevents N machines × 1 Alpaca call)
+    shared = _kv.get_json("indices:all")
+    if shared:
+        _indices_cache    = shared
+        _indices_cache_ts = _time.monotonic()
+        return shared
 
     result: dict = {}
 
@@ -1022,9 +1050,10 @@ def get_indices():
         vix_sentiment = "BEARISH"
     result["VIX_SENTIMENT"] = {"label": vix_sentiment}
 
-    # Store in cache
+    # Store in BOTH cache layers
     _indices_cache    = result
     _indices_cache_ts = _time.monotonic()
+    _kv.set_json("indices:all", result, ttl_sec=int(_INDICES_CACHE_TTL))
 
     return result
 
