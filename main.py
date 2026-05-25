@@ -587,6 +587,58 @@ async def log_requests(request: Request, call_next):
 # Endpoints
 # ---------------------------------------------------------------------------
 
+# ── Market status (public — app uses it to render the holiday banner) ────────
+_market_status_cache: dict = {}
+_market_status_ts: float   = 0.0
+_MARKET_STATUS_TTL: int    = 30  # 30s — short enough that the banner appears within 30s of session changes
+
+
+@app.get("/market/status")
+async def market_status():
+    """
+    Public market session snapshot. App calls this to decide whether to
+    render a 'market closed' banner on signal-related screens.
+
+    Cached 30s — calling /market/status from N tabs shouldn't hammer the
+    calendar lookup. Returns shape:
+      {
+        is_open_today:  bool,
+        is_open_now:    bool,
+        mode:           "STANDARD" | "PRE_MARKET" | "AFTER_HOURS" | "BLOCKED" | ...,
+        block_reason:   "NYSE holiday (2026-05-25) — market closed all day" | "",
+        is_early_close: bool,
+        close_et:       "16:00" | "13:00" | null   (when market is open today)
+      }
+    """
+    global _market_status_cache, _market_status_ts
+    now = time.monotonic()
+    if now - _market_status_ts < _MARKET_STATUS_TTL and _market_status_cache:
+        return _market_status_cache
+
+    from engine.session_classifier import (
+        is_market_open_today, is_market_open_now, today_close_mins_et,
+        _is_early_close, classify,
+    )
+
+    sess = classify(has_premarket_catalyst=False)
+    is_today = is_market_open_today()
+    close_mins = today_close_mins_et() if is_today else None
+    close_et   = f"{close_mins//60:02d}:{close_mins%60:02d}" if close_mins else None
+
+    result = {
+        "is_open_today":  is_today,
+        "is_open_now":    is_market_open_now(),
+        "mode":           sess["mode"],
+        "block_reason":   sess["block_reason"],
+        "is_early_close": _is_early_close(),
+        "close_et":       close_et,
+        "timestamp":      datetime.now(timezone.utc).isoformat(),
+    }
+    _market_status_cache = result
+    _market_status_ts    = now
+    return result
+
+
 @app.get("/health")
 async def health():
     """
