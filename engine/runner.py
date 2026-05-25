@@ -1287,6 +1287,18 @@ def _close_signals(sb: Client) -> None:
 def _run_strategy_scan(config: dict) -> None:
     strategy_type = config["type"]
 
+    # ── Market-closed short-circuit ───────────────────────────────────────────
+    # Skip the entire scan on weekends / NYSE holidays / pre-market /
+    # after-hours. The session classifier would block every signal anyway,
+    # but doing it here avoids the expensive pre-screener + Alpaca calls.
+    from engine.session_classifier import is_market_open_now, is_market_open_today
+    if not is_market_open_today():
+        logger.info(f"[runner] {strategy_type} scan skipped — market closed today (holiday/weekend)")
+        return
+    if not is_market_open_now():
+        logger.info(f"[runner] {strategy_type} scan skipped — outside trading hours")
+        return
+
     # ── Dynamic ticker list via pre-screener ──────────────────────────────────
     # Run the fast Alpaca snapshot screen to find the ~50 tickers showing
     # real momentum or volume activity right now.  Full SMC only runs on those.
@@ -1386,6 +1398,13 @@ def _run_strategy_scan(config: dict) -> None:
 
 def _run_maintenance() -> None:
     """Track open signal results, auto-close hits, expire stale setups. Runs every 15 min."""
+    # Skip on closed-market days. Prices aren't moving, nothing can hit a
+    # level, and the signal_monitor inside this function would just churn
+    # API calls for no information gain.
+    from engine.session_classifier import is_market_open_today
+    if not is_market_open_today():
+        logger.info("[runner] Maintenance skipped — market closed today")
+        return
     logger.info("[runner] Maintenance started")
     try:
         track_signals()

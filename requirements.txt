@@ -15,3 +15,4 @@ requests>=2.32.0
 yfinance>=0.2.40
 optuna>=3.6.0
 slowapi>=0.1.9
+pandas_market_calendars>=4.4.0

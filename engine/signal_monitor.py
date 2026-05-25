@@ -973,6 +973,15 @@ def run() -> None:
     Full monitoring pass — stocks + options.
     Called every 15 minutes from runner.py maintenance job.
     """
+    # Skip on closed-market days. No prices can move, so no levels can
+    # hit and no statuses can change. Belt-and-braces — the runner
+    # maintenance job already short-circuits on holidays, but if anything
+    # ever calls signal_monitor.run() directly this stays consistent.
+    from engine.session_classifier import is_market_open_today
+    if not is_market_open_today():
+        logger.info("[monitor] Pass skipped — market closed today (holiday/weekend)")
+        return
+
     logger.info(
         f"[monitor] Pass started — "
         f"ET={_now_et().strftime('%H:%M')} "
