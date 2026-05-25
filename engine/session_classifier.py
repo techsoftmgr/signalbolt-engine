@@ -56,6 +56,61 @@ FOMC_DATES = [
     "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
 ]
 
+# ── NYSE / NASDAQ market holidays (full closures) ─────────────
+# Hard-coded calendar through 2027. When updating beyond, also extend
+# the early-close list below. Source: nyse.com/markets/hours-calendars.
+# Without this set, the engine treats holidays as normal weekdays and
+# fires signals on stale Friday-close or thin pre-market data — that's
+# the Memorial Day 2026 bug that this calendar fixes.
+NYSE_HOLIDAYS: set[str] = {
+    # 2025
+    "2025-01-01",  # New Year's Day
+    "2025-01-20",  # MLK Day
+    "2025-02-17",  # Presidents' Day
+    "2025-04-18",  # Good Friday
+    "2025-05-26",  # Memorial Day
+    "2025-06-19",  # Juneteenth
+    "2025-07-04",  # Independence Day
+    "2025-09-01",  # Labor Day
+    "2025-11-27",  # Thanksgiving
+    "2025-12-25",  # Christmas
+    # 2026
+    "2026-01-01",  # New Year's Day
+    "2026-01-19",  # MLK Day
+    "2026-02-16",  # Presidents' Day
+    "2026-04-03",  # Good Friday
+    "2026-05-25",  # Memorial Day
+    "2026-06-19",  # Juneteenth (Friday)
+    "2026-07-03",  # Independence Day observed (Jul 4 = Saturday)
+    "2026-09-07",  # Labor Day
+    "2026-11-26",  # Thanksgiving
+    "2026-12-25",  # Christmas
+    # 2027
+    "2027-01-01",  # New Year's Day
+    "2027-01-18",  # MLK Day
+    "2027-02-15",  # Presidents' Day
+    "2027-03-26",  # Good Friday
+    "2027-05-31",  # Memorial Day
+    "2027-06-18",  # Juneteenth observed (Jun 19 = Saturday)
+    "2027-07-05",  # Independence Day observed (Jul 4 = Sunday)
+    "2027-09-06",  # Labor Day
+    "2027-11-25",  # Thanksgiving
+    "2027-12-24",  # Christmas observed (Dec 25 = Saturday)
+}
+
+# Days when NYSE closes early at 1:00 PM ET (13:00).
+# Most common: day after Thanksgiving (Black Friday), and Christmas Eve
+# when it falls on a weekday.
+NYSE_EARLY_CLOSES: set[str] = {
+    "2025-07-03",  # day before Independence Day (Thursday)
+    "2025-11-28",  # day after Thanksgiving (Black Friday)
+    "2025-12-24",  # Christmas Eve
+    "2026-11-27",  # day after Thanksgiving
+    "2026-12-24",  # Christmas Eve (Thursday)
+    "2027-11-26",  # day after Thanksgiving
+}
+EARLY_CLOSE_MINS = 13 * 60   # 1:00 PM ET
+
 # NFP always first Friday of month — we approximate
 # CPI/PPI — 2nd or 3rd week — we use a simple heuristic
 
@@ -92,6 +147,26 @@ def _is_fomc_day() -> bool:
     return today in FOMC_DATES
 
 
+def _today_et_iso() -> str:
+    """ET-local 'YYYY-MM-DD' string. Holidays change at midnight ET, not UTC."""
+    return _et_now().date().isoformat()
+
+
+def _is_market_holiday() -> bool:
+    """True on full NYSE/NASDAQ closure days (Memorial Day, Christmas, etc)."""
+    return _today_et_iso() in NYSE_HOLIDAYS
+
+
+def _is_early_close() -> bool:
+    """True on 1pm-ET-close days (day after Thanksgiving, Christmas Eve)."""
+    return _today_et_iso() in NYSE_EARLY_CLOSES
+
+
+def _is_weekend() -> bool:
+    """Saturday or Sunday."""
+    return _et_now().weekday() >= 5
+
+
 def _fomc_active_now() -> bool:
     """FOMC announcement usually at 2:00 PM ET — block 1:30-2:30 PM window."""
     if not _is_fomc_day():
@@ -102,11 +177,18 @@ def _fomc_active_now() -> bool:
 
 def _classify_mode(et_mins: int, has_catalyst: bool) -> str:
     """Map ET minutes to session mode."""
+    # Weekend / NYSE holiday — market is closed all day. Must come first so
+    # we don't return PRE_MARKET on a Saturday morning, etc.
+    if _is_weekend() or _is_market_holiday():
+        return "BLOCKED"
     if _fomc_active_now():
         return "BLOCKED"
+    # Early-close days (1pm ET): treat 13:00+ as AFTER_HOURS instead of
+    # the normal 16:00 cutoff.
+    effective_close = EARLY_CLOSE_MINS if _is_early_close() else MARKET_CLOSE
     if et_mins < MARKET_OPEN:
         return "PRE_MARKET"
-    if et_mins >= MARKET_CLOSE:
+    if et_mins >= effective_close:
         return "AFTER_HOURS"
     if et_mins >= CLOSE_START:
         return "CLOSE_ONLY"
@@ -141,8 +223,12 @@ def classify(has_premarket_catalyst: bool = False) -> dict:
     now     = _et_now()
     et_mins = now.hour * 60 + now.minute
 
+    holiday      = _is_market_holiday()
+    early_close  = _is_early_close()
+    weekend      = _is_weekend()
     mode         = _classify_mode(et_mins, has_premarket_catalyst)
-    market_open  = MARKET_OPEN <= et_mins < MARKET_CLOSE
+    effective_close = EARLY_CLOSE_MINS if early_close else MARKET_CLOSE
+    market_open  = (not weekend) and (not holiday) and (MARKET_OPEN <= et_mins < effective_close)
     mins_since   = max(0, et_mins - MARKET_OPEN)
     opex_day     = _is_opex_day(now)
     opex_week    = _is_opex_week(now)
@@ -151,10 +237,18 @@ def classify(has_premarket_catalyst: bool = False) -> dict:
 
     blocked      = mode in ("PRE_MARKET", "AFTER_HOURS", "BLOCKED")
     block_reason = ""
-    if mode == "PRE_MARKET":
+    # Order matters: holiday/weekend reason takes precedence over time-of-day.
+    if holiday:
+        block_reason = f"NYSE holiday ({_today_et_iso()}) — market closed all day"
+    elif weekend:
+        block_reason = "Weekend — market closed"
+    elif mode == "PRE_MARKET":
         block_reason = "Pre-market: no signals before 9:30 AM ET"
     elif mode == "AFTER_HOURS":
-        block_reason = "After hours: no signals after 4:00 PM ET"
+        block_reason = (
+            "After early close (1:00 PM ET)" if early_close
+            else "After hours: no signals after 4:00 PM ET"
+        )
     elif mode == "BLOCKED":
         block_reason = "FOMC active — signals paused 1:30–2:30 PM ET"
     elif mode == "CATALYST_ONLY" and not has_premarket_catalyst:
