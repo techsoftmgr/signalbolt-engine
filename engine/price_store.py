@@ -54,10 +54,27 @@ ET = ZoneInfo("America/New_York")
 PRICE_CHANNEL = "signalbolt:price-ticks"
 _REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 
-# Lazy-connected redis-py client (sync). Publishing from the Alpaca SDK thread
-# is fine — PUBLISH is fire-and-forget on the Redis side (just appends to each
-# subscriber's inbox, no synchronous fanout). One pooled connection per worker
-# process is plenty for our message rate (~hundreds of ticks/sec at peak).
+# Batched publish — accumulates the latest price per ticker between flushes.
+# publish_batch_loop() runs every PUBLISH_INTERVAL_SEC and emits ONE Redis
+# message with all dirty tickers. Why batch:
+#   - Per-tick PUBLISH at peak (300 trades/sec) = ~28M ops/month on Upstash
+#     pay-as-you-go = ~$56/month, growing with ticker count
+#   - Batched at 10Hz = ~1M ops/month = ~$2/month, regardless of how busy
+#     individual tickers are
+#   - End-user UX is identical: the web's broadcast_snapshot also runs at
+#     10Hz, so publishing faster than that is wasted bandwidth — phones
+#     can't render updates faster than the WS frame cadence anyway
+PUBLISH_INTERVAL_SEC = 0.1   # 100ms = 10Hz, matches the WS broadcast cadence
+
+# Latest price per ticker since the last flush. Written by update() (Alpaca
+# SDK thread), read+cleared by publish_batch_loop() (asyncio thread). dict
+# operations are GIL-protected for single get/set — no lock needed because
+# the worst race is overwriting an old price with a newer one, which is
+# exactly what we want.
+_publish_buffer: dict[str, float] = {}
+
+# Lazy-connected redis-py client (sync). One pooled connection per worker
+# process is plenty — we PUBLISH at most 10 times per second now.
 _publisher = None
 _publisher_failed_at: float = 0.0
 _PUBLISHER_RETRY_COOLDOWN_SEC = 30  # don't hammer a dead Redis
@@ -81,30 +98,79 @@ def _get_publisher():
 
 def publish_tick(ticker: str, price: float) -> None:
     """
-    Broadcast one tick to every other engine machine via Redis pub/sub.
+    Queue a tick for the next batched Redis PUBLISH cycle.
 
-    Called from update() after the local state update. Fire-and-forget —
-    any Redis error degrades to "no cross-machine forwarding" but the local
-    broadcast (to WS clients connected to THIS machine) still works.
+    Called from update() (Alpaca SDK thread). Just sets a dict entry —
+    no I/O, no event-loop interaction, no chance of blocking. The actual
+    network publish happens at most 10×/sec inside publish_batch_loop()
+    on the worker's asyncio thread.
+
+    If two trades arrive between flushes, only the latest price is kept
+    (intentional — phones can't see intermediate prices at 10Hz anyway,
+    so why pay Redis to ship them).
+    """
+    if not _REDIS_URL:
+        return
+    _publish_buffer[ticker] = price
+
+
+async def publish_batch_loop() -> None:
+    """
+    Spawn this from worker.main() as a background asyncio task.
+
+    Every PUBLISH_INTERVAL_SEC, flushes _publish_buffer into a single Redis
+    PUBLISH message:
+        {"ticks": {"NVDA": 1234.56, "AAPL": 180.25, ...}}
+
+    Idle cycles (empty buffer) cost zero Redis ops — just a sleep and a
+    set check.
+
+    Reconnect / cooldown handled inline; never re-raises so this task
+    stays alive for the worker's lifetime.
     """
     global _publisher_failed_at
     import time as _time
     if not _REDIS_URL:
+        logger.info("[price_store] REDIS_URL not set — publish batch loop disabled")
         return
-    if _publisher_failed_at and (_time.monotonic() - _publisher_failed_at) < _PUBLISHER_RETRY_COOLDOWN_SEC:
-        return
-    try:
-        client = _get_publisher()
-        if client:
-            # Compact payload: {"t":"NVDA","p":1234.56} — ~25 bytes vs ~80
-            # for the full {ticker, price, changePercent, session} dict.
-            # Subscribers re-compute changePercent + session locally from
-            # the price + their own _prev_close cache, so we don't ship
-            # them over the wire on every tick.
-            client.publish(PRICE_CHANNEL, json.dumps({"t": ticker, "p": price}))
-    except Exception as e:
-        _publisher_failed_at = _time.monotonic()
-        logger.warning(f"[price_store] Redis publish failed for {ticker}: {e}")
+
+    logger.info(f"[price_store] Publish batch loop started — flushing every "
+                f"{int(PUBLISH_INTERVAL_SEC * 1000)}ms")
+
+    while True:
+        try:
+            await asyncio.sleep(PUBLISH_INTERVAL_SEC)
+        except asyncio.CancelledError:
+            logger.info("[price_store] Publish batch loop cancelled")
+            raise
+
+        if not _publish_buffer:
+            continue
+
+        # In cooldown after a recent failure? Skip this cycle, but DON'T
+        # clear the buffer — next successful cycle will pick up the latest
+        # prices anyway (we only store latest per ticker).
+        if _publisher_failed_at and (_time.monotonic() - _publisher_failed_at) < _PUBLISHER_RETRY_COOLDOWN_SEC:
+            continue
+
+        # Snapshot + clear buffer atomically by reassigning the module-level
+        # dict. Any concurrent update() writes that arrive AFTER this line
+        # go into the new empty dict and get picked up next cycle.
+        batch = _publish_buffer.copy()
+        _publish_buffer.clear()
+
+        try:
+            client = _get_publisher()
+            if client:
+                # Compact payload: {"ticks": {ticker: price, ...}}
+                # ~10-15 bytes per ticker. A 50-ticker batch = ~700 bytes.
+                client.publish(PRICE_CHANNEL, json.dumps({"ticks": batch}))
+        except Exception as e:
+            _publisher_failed_at = _time.monotonic()
+            # Buffer was already cleared above; we lose this batch but the
+            # next tick from each ticker will re-populate. Not worth holding
+            # a queue of stale prices — phones want LATEST, not history.
+            logger.warning(f"[price_store] Redis publish failed (batch={len(batch)}): {e}")
 
 # ── Price state ───────────────────────────────────────────────────────────────
 

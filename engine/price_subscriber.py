@@ -72,10 +72,21 @@ async def run_subscriber() -> None:
                     continue   # 'subscribe' confirmations, pings, etc.
                 try:
                     payload = json.loads(msg["data"])
-                    ticker = payload.get("t")
-                    price  = payload.get("p")
-                    if ticker and price is not None:
-                        price_store.update_from_remote(ticker, float(price))
+                    # New batched format: {"ticks": {ticker: price, ...}}
+                    # The worker now PUBLISHes at most 10×/sec with all dirty
+                    # tickers bundled (see publish_batch_loop in price_store).
+                    ticks = payload.get("ticks")
+                    if isinstance(ticks, dict):
+                        for ticker, price in ticks.items():
+                            if ticker and price is not None:
+                                price_store.update_from_remote(ticker, float(price))
+                    else:
+                        # Backward-compat for single-tick format (in case the
+                        # worker is mid-deploy and still sending old format)
+                        ticker = payload.get("t")
+                        price  = payload.get("p")
+                        if ticker and price is not None:
+                            price_store.update_from_remote(ticker, float(price))
                 except Exception as e:
                     # Don't let a single bad message kill the loop
                     logger.debug(f"[price_subscriber] bad message: {e}")
