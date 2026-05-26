@@ -276,7 +276,22 @@ def _write_signal(sb: Client, row: dict) -> str | None:
             logger.debug(f"[runner] fired event log failed: {_e}")
         return sig_id   # caller uses this for push deep-link
     except Exception as e:
-        logger.error(f"[runner] Supabase insert failed for {row['ticker']}: {e}")
+        # The partial unique index `idx_unique_active_signal` enforces
+        # "one active signal per (ticker, strategy_type)" at the DB level
+        # to close the TOCTOU race between APScheduler scans and
+        # stream.py bar-event scans. When the race fires, the second
+        # INSERT trips the index and Postgres raises 23505. That's the
+        # ENGINE WORKING AS DESIGNED — log it at info, not error, so we
+        # don't page on duplicate-scan benign collisions.
+        err_str = str(e)
+        if "23505" in err_str or "duplicate key value" in err_str or "idx_unique_active_signal" in err_str:
+            logger.info(
+                f"[runner] Duplicate active signal blocked at DB for "
+                f"{row['ticker']}/{row.get('strategy_type','?')} "
+                f"(race with concurrent scan — expected, no action)"
+            )
+        else:
+            logger.error(f"[runner] Supabase insert failed for {row['ticker']}: {e}")
     return None
 
 
@@ -305,7 +320,15 @@ def _write_option_signal(sb: Client, row: dict) -> str | None:
         )
         return result.data[0]["id"] if result.data else None
     except Exception as e:
-        logger.error(f"[runner] Option signal insert failed for {row['ticker']}: {e}")
+        # Same race protection as _write_signal — see comment there.
+        err_str = str(e)
+        if "23505" in err_str or "duplicate key value" in err_str or "idx_unique_active_option_signal" in err_str:
+            logger.info(
+                f"[runner] Duplicate active option signal blocked at DB for "
+                f"{row['ticker']} (race with concurrent scan — expected, no action)"
+            )
+        else:
+            logger.error(f"[runner] Option signal insert failed for {row['ticker']}: {e}")
     return None
 
 
