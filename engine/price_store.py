@@ -30,12 +30,81 @@ Thread safety:
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger("signalbolt.price_store")
 
 ET = ZoneInfo("America/New_York")
+
+# ── Redis pub/sub bridge ──────────────────────────────────────────────────────
+# The worker process owns the Alpaca SIP subscription; the web process serves
+# /ws/prices to phones. They live in separate Fly apps after the worker split,
+# so they no longer share in-process state. This module-level pub/sub bridge
+# fans price updates from worker → all web machines via a Redis channel.
+#
+# Worker side: each tick calls publish_tick() → PUBLISH to PRICE_CHANNEL
+# Web side:    price_subscriber.py SUBSCRIBE → calls update_from_remote()
+#              → existing broadcast_snapshot() pushes to WS clients
+#
+# Why "signalbolt:price-ticks": namespaced so we don't collide if Redis is
+# shared with other apps later.
+
+PRICE_CHANNEL = "signalbolt:price-ticks"
+_REDIS_URL = os.environ.get("REDIS_URL", "").strip()
+
+# Lazy-connected redis-py client (sync). Publishing from the Alpaca SDK thread
+# is fine — PUBLISH is fire-and-forget on the Redis side (just appends to each
+# subscriber's inbox, no synchronous fanout). One pooled connection per worker
+# process is plenty for our message rate (~hundreds of ticks/sec at peak).
+_publisher = None
+_publisher_failed_at: float = 0.0
+_PUBLISHER_RETRY_COOLDOWN_SEC = 30  # don't hammer a dead Redis
+
+
+def _get_publisher():
+    """Lazy redis client for PUBLISH. Returns None if Redis isn't configured."""
+    global _publisher
+    if not _REDIS_URL:
+        return None
+    if _publisher is None:
+        import redis as _redis
+        _publisher = _redis.Redis.from_url(
+            _REDIS_URL,
+            socket_timeout=2.0,
+            socket_connect_timeout=2.0,
+            retry_on_timeout=False,
+        )
+    return _publisher
+
+
+def publish_tick(ticker: str, price: float) -> None:
+    """
+    Broadcast one tick to every other engine machine via Redis pub/sub.
+
+    Called from update() after the local state update. Fire-and-forget —
+    any Redis error degrades to "no cross-machine forwarding" but the local
+    broadcast (to WS clients connected to THIS machine) still works.
+    """
+    global _publisher_failed_at
+    import time as _time
+    if not _REDIS_URL:
+        return
+    if _publisher_failed_at and (_time.monotonic() - _publisher_failed_at) < _PUBLISHER_RETRY_COOLDOWN_SEC:
+        return
+    try:
+        client = _get_publisher()
+        if client:
+            # Compact payload: {"t":"NVDA","p":1234.56} — ~25 bytes vs ~80
+            # for the full {ticker, price, changePercent, session} dict.
+            # Subscribers re-compute changePercent + session locally from
+            # the price + their own _prev_close cache, so we don't ship
+            # them over the wire on every tick.
+            client.publish(PRICE_CHANNEL, json.dumps({"t": ticker, "p": price}))
+    except Exception as e:
+        _publisher_failed_at = _time.monotonic()
+        logger.warning(f"[price_store] Redis publish failed for {ticker}: {e}")
 
 # ── Price state ───────────────────────────────────────────────────────────────
 
@@ -105,10 +174,31 @@ def _market_session_now() -> str:
 def update(ticker: str, trade_price: float) -> None:
     """
     Record a live trade price and mark the ticker dirty for the next
-    broadcast cycle.  Called from the Alpaca SDK thread — must not touch
-    asyncio primitives directly.  Uses call_soon_threadsafe to queue the
-    dirty-set mutation onto the FastAPI event loop.
+    broadcast cycle.  Called from the Alpaca SDK thread (worker process)
+    — must not touch asyncio primitives directly.  Uses call_soon_threadsafe
+    to queue the dirty-set mutation onto the FastAPI event loop.
+
+    Also publishes the tick to Redis so other engine machines (the web
+    app(s) after the worker split) can broadcast it to their own WS
+    clients. Without that bridge, web's price_store stays empty and
+    /ws/prices delivers only the initial snapshot, no live ticks.
     """
+    _update_local(ticker, trade_price)
+    # Fan out to other machines via Redis. No-op if REDIS_URL unset.
+    publish_tick(ticker, trade_price)
+
+
+def update_from_remote(ticker: str, trade_price: float) -> None:
+    """
+    Apply a tick that arrived via Redis pub/sub from the worker.
+    Same as update() but does NOT re-publish (avoids a loop where every
+    web machine re-broadcasts every tick it receives back to Redis).
+    """
+    _update_local(ticker, trade_price)
+
+
+def _update_local(ticker: str, trade_price: float) -> None:
+    """Shared logic for both local trade updates and remote (pub/sub) updates."""
     prev    = _prev_close.get(ticker)
     chg_pct = ((trade_price - prev) / prev * 100) if prev else 0.0
 

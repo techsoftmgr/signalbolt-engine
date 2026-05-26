@@ -431,10 +431,20 @@ async def lifespan(app: FastAPI):
         _price_broadcast_loop(), name="price_broadcast"
     )
 
+    # ── Redis pub/sub: receive ticks from worker → feed local price_store ───
+    # After splitting worker into its own Fly app, the web process no longer
+    # has the Alpaca stream in-process. This subscriber bridges worker ticks
+    # back to the web's price_store so /ws/prices can broadcast them.
+    # No-op when REDIS_URL is unset (logged once at startup).
+    from engine.price_subscriber import run_subscriber
+    price_sub_task = asyncio.create_task(
+        run_subscriber(), name="price_subscriber"
+    )
+
     logger.info(
         "SignalBolt engine started in WEB process — "
         "scalping=WebSocket real-time | day_trade/swing=APScheduler | "
-        "prices=10 Hz WebSocket push to app"
+        "prices=10 Hz WebSocket push to app (ticks via Redis pub/sub from worker)"
     )
     yield
 
@@ -450,6 +460,12 @@ async def lifespan(app: FastAPI):
 
     if broadcast_task is not None:
         broadcast_task.cancel()
+    if price_sub_task is not None:
+        price_sub_task.cancel()
+        try:
+            await price_sub_task
+        except asyncio.CancelledError:
+            pass
     if stream_task is not None:
         stream_task.cancel()
         try:
