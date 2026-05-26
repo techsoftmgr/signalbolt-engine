@@ -383,22 +383,21 @@ async def lifespan(app: FastAPI):
     scheduler         = None
     stream_task       = None
     broadcast_task    = None
+    price_sub_task    = None
 
-    if not RUN_ENGINE_IN_WEB:
-        logger.info("SignalBolt API started — engine disabled in web process (RUN_ENGINE_IN_WEB=false)")
-        yield
-        logger.info("SignalBolt API stopped")
-        return
-
-    from engine.runner import start_scheduler
-    from engine.stream import run_stream
     from engine import price_store
 
-    # ── Initialise real-time price store with this event loop ────────────────
+    # ── Price plumbing — ALWAYS runs, even when RUN_ENGINE_IN_WEB=false ──────
+    # The web process serves /ws/prices to phones regardless of whether it
+    # also runs the scheduler. After the worker split (RUN_ENGINE_IN_WEB=false),
+    # the web app gets its tick data via Redis pub/sub from the worker. So we
+    # need: price_store init, the 10 Hz broadcast loop, the Redis subscriber.
+    # Skipping these (the previous behavior) was the root cause of WS clients
+    # only ever receiving the initial snapshot — no live ticks.
     price_store.init(asyncio.get_running_loop())
 
-    # ── Seed price store from Alpaca REST snapshot so first WS connect gets
-    #    immediate data even before the first trade arrives ───────────────────
+    # Seed from REST so first /ws/prices subscriber gets immediate data
+    # before the first Redis tick arrives.
     try:
         from engine.runner import ALL_TICKERS
         seed_tickers = list(dict.fromkeys(ALL_TICKERS))[:40]
@@ -412,13 +411,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"[lifespan] Price store seed failed (non-fatal): {e}")
 
-    # ── APScheduler: day_trade / swing / options_flow / dark_pool / maintenance ──
-    scheduler = start_scheduler()
-
-    # ── Alpaca WebSocket: bars (signal scanning) + trades (price broadcast) ──
-    stream_task = asyncio.create_task(run_stream(), name="alpaca_stream")
-
-    # ── 10 Hz price broadcast loop ────────────────────────────────────────────
+    # 10 Hz broadcast loop — pushes dirty tickers to connected WS clients
     async def _price_broadcast_loop():
         while True:
             await asyncio.sleep(0.1)   # 100 ms = 10 Hz
@@ -426,25 +419,50 @@ async def lifespan(app: FastAPI):
                 await price_store.broadcast_snapshot()
             except Exception as _be:
                 logger.debug(f"[price_broadcast] error: {_be}")
+    broadcast_task = asyncio.create_task(_price_broadcast_loop(), name="price_broadcast")
 
-    broadcast_task = asyncio.create_task(
-        _price_broadcast_loop(), name="price_broadcast"
-    )
-
-    # ── Redis pub/sub: receive ticks from worker → feed local price_store ───
-    # After splitting worker into its own Fly app, the web process no longer
-    # has the Alpaca stream in-process. This subscriber bridges worker ticks
-    # back to the web's price_store so /ws/prices can broadcast them.
-    # No-op when REDIS_URL is unset (logged once at startup).
+    # Redis pub/sub: receive ticks from worker → feed local price_store
     from engine.price_subscriber import run_subscriber
-    price_sub_task = asyncio.create_task(
-        run_subscriber(), name="price_subscriber"
-    )
+    price_sub_task = asyncio.create_task(run_subscriber(), name="price_subscriber")
+
+    if not RUN_ENGINE_IN_WEB:
+        logger.info("SignalBolt API started — engine scheduler disabled (RUN_ENGINE_IN_WEB=false); "
+                    "price plumbing active (Redis subscriber + broadcast loop)")
+        try:
+            yield
+        finally:
+            logger.info("SignalBolt API stopping — cancelling price tasks")
+            if price_sub_task is not None:
+                price_sub_task.cancel()
+                try:
+                    await price_sub_task
+                except asyncio.CancelledError:
+                    pass
+            if broadcast_task is not None:
+                broadcast_task.cancel()
+                try:
+                    await broadcast_task
+                except asyncio.CancelledError:
+                    pass
+            logger.info("SignalBolt API stopped")
+        return
+
+    from engine.runner import start_scheduler
+    from engine.stream import run_stream
+
+    # ── APScheduler: day_trade / swing / options_flow / dark_pool / maintenance ──
+    scheduler = start_scheduler()
+
+    # ── Alpaca WebSocket: bars (signal scanning) + trades (price broadcast) ──
+    stream_task = asyncio.create_task(run_stream(), name="alpaca_stream")
+
+    # NOTE: broadcast_task + price_sub_task are spawned ABOVE (before the
+    # RUN_ENGINE_IN_WEB gate) so they run in both modes. Do not respawn here.
 
     logger.info(
-        "SignalBolt engine started in WEB process — "
+        "SignalBolt engine started in WEB process with scheduler — "
         "scalping=WebSocket real-time | day_trade/swing=APScheduler | "
-        "prices=10 Hz WebSocket push to app (ticks via Redis pub/sub from worker)"
+        "prices=10 Hz WebSocket push to app"
     )
     yield
 
