@@ -23,8 +23,6 @@ from unittest.mock import MagicMock
 import pytest
 from engine.risk_manager import (
     TIERS,
-    MAX_CONCURRENT_SIGNALS,
-    MAX_SECTOR_SIGNALS,
     MIN_CONFIDENCE_FIRE,
     SECTOR_MAP,
     get_confidence_tier,
@@ -116,33 +114,11 @@ class TestPortfolioCheck:
         assert result["allowed"] is False
         assert "55" in result["block_reason"] or "60" in result["block_reason"]
 
-    def test_blocks_when_max_concurrent_reached(self):
-        sigs = [self._active(f"T{i}") for i in range(MAX_CONCURRENT_SIGNALS)]
-        sb = self._mock_sb(sigs)
-        result = check(sb, "TSLA", 80)
-        assert result["allowed"] is False
-        assert "concurrent" in result["block_reason"].lower() or str(MAX_CONCURRENT_SIGNALS) in result["block_reason"]
-
-    def test_allows_below_max_concurrent(self):
-        sigs = [self._active(f"T{i}") for i in range(MAX_CONCURRENT_SIGNALS - 1)]
-        sb = self._mock_sb(sigs)
-        result = check(sb, "TSLA", 80)
-        assert result["allowed"] is True
-
-    def test_blocks_sector_limit(self):
-        """2 tech signals open → 3rd tech signal (NVDA) blocked."""
-        sigs = [self._active("AAPL"), self._active("MSFT")]  # both Technology
-        sb = self._mock_sb(sigs)
-        result = check(sb, "NVDA", 80)  # NVDA = Technology
-        assert result["allowed"] is False
-        assert "sector" in result["block_reason"].lower()
-
-    def test_allows_different_sector(self):
-        """2 tech signals open → energy signal still passes."""
-        sigs = [self._active("AAPL"), self._active("MSFT")]
-        sb = self._mock_sb(sigs)
-        result = check(sb, "XOM", 80)  # XOM = Energy
-        assert result["allowed"] is True
+    # Hard caps on concurrent/sector signals were intentionally removed —
+    # the 9-layer scorer now does the gating via confidence tiers. The
+    # corresponding tests (test_blocks_when_max_concurrent_reached,
+    # test_allows_below_max_concurrent, test_blocks_sector_limit,
+    # test_allows_different_sector) were deleted to match the new contract.
 
     def test_result_has_required_keys(self):
         sb = self._mock_sb([])
