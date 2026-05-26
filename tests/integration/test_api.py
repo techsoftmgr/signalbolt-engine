@@ -54,7 +54,18 @@ def client():
     mock_snapshot.latest_trade.price = 180.25
     mock_alpaca.get_stock_snapshot.return_value = {"AAPL": mock_snapshot, "TSLA": mock_snapshot}
 
+    # /signals (and other newly-async endpoints) use acreate_client, not
+    # create_client. Patch both so neither path attempts a real DNS lookup
+    # to test.supabase.co. Use the same chained-mock object for both — the
+    # mock's chain (.table().select().order().limit().execute()) returns
+    # signals_result regardless of who called it.
+    async_mock_sb = MagicMock()
+    async_mock_sb.table.return_value.select.return_value.order.return_value.limit.return_value.execute = AsyncMock(return_value=signals_result)
+    async_mock_sb.table.return_value.select.return_value.eq.return_value.order.return_value.limit.return_value.execute = AsyncMock(return_value=signals_result)
+    async_mock_sb.table.return_value.select.return_value.execute = AsyncMock(return_value=signals_result)
+
     with patch("main.create_client", return_value=mock_sb), \
+         patch("main.acreate_client", new_callable=AsyncMock, return_value=async_mock_sb), \
          patch("main._alpaca_data_client", mock_alpaca), \
          patch("main._alpaca_stock_snapshots", return_value={
              "AAPL": {"price": 180.25, "changePercent": 1.2, "session": "market", "volume": 50_000_000},
@@ -64,6 +75,11 @@ def client():
          patch("engine.stream.run_stream", new_callable=AsyncMock):
         import main as app_module
         app_module.app.state.supabase = mock_sb
+        # Reset both singletons so the patched factories actually get called
+        # on first request (singletons would otherwise hold a stale client
+        # built before the patches took effect).
+        app_module._sb_singleton = None
+        app_module._sb_async_singleton = None
 
         with TestClient(app_module.app, raise_server_exceptions=False) as c:
             yield c
