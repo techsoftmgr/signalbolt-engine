@@ -5,7 +5,12 @@ Calculates Stop Loss and Take Profit levels that are:
 
   1. Based on INTRADAY ATR for scalping/day_trade (High-Low only — no overnight
      gap inflation).  Swing trade uses classic True Range ATR (gaps matter there).
-  2. Capped per strategy — day trades max 0.8% stop, scalps max 0.4%.
+  2. Capped per strategy with VOLATILITY-AWARE widening: the cap is at least
+     the per-strategy floor (e.g. 0.8% for day_trade) but can extend up to a
+     fraction of the ticker's ADR (e.g. 40% of ADR for day_trade), never
+     exceeding the absolute ceiling (e.g. 2.5%). Fixes the "uniform 0.8% SL
+     on every signal" pattern that swept volatile names (NVDA, TSLA) on
+     Friday — those got stopped inside normal noise, then price recovered.
   3. Targeted at achievable moves: T1 ≤ 50% of the Average Daily Range for
      intraday strategies, T2 ≤ 80%.  Swing trade has no ADR cap.
   4. R:R validated: T1 must clear the per-strategy minimum AFTER any ADR cap.
@@ -14,15 +19,19 @@ Calculates Stop Loss and Take Profit levels that are:
   6. Placed beyond nearest gamma support/resistance.
 
 Per-strategy parameters:
-  ┌──────────────┬──────────┬────────┬──────────────┬────────────┐
-  │ Strategy     │ ATR type │ Max SL │ T1 R:R (min) │ T2 R:R     │
-  ├──────────────┼──────────┼────────┼──────────────┼────────────┤
-  │ scalping     │ H-L      │ 0.4%   │ 1.5×         │ 2.5×       │
-  │ day_trade    │ H-L      │ 0.8%   │ 1.5×         │ 2.5×       │
-  │ swing_trade  │ True Rng │ 4.0%   │ 2.0×         │ 3.5×       │
-  │ options_flow │ H-L      │ 1.0%   │ 1.5×         │ 2.5×       │
-  │ dark_pool    │ H-L      │ 1.0%   │ 1.5×         │ 2.5×       │
-  └──────────────┴──────────┴────────┴──────────────┴────────────┘
+  ┌──────────────┬──────────┬───────────┬─────────────┬─────────────┬───────┬───────┐
+  │ Strategy     │ ATR type │ Floor cap │ ADR fraction│ Ceiling cap │ T1 RR │ T2 RR │
+  ├──────────────┼──────────┼───────────┼─────────────┼─────────────┼───────┼───────┤
+  │ scalping     │ H-L      │ 0.4%      │ 0% (off)    │ 0.6%        │ 1.5×  │ 2.5×  │
+  │ day_trade    │ H-L      │ 0.8%      │ 40% of ADR  │ 2.5%        │ 1.5×  │ 2.5×  │
+  │ swing_trade  │ True Rng │ 4.0%      │ 0% (off)    │ 6.0%        │ 2.0×  │ 3.5×  │
+  │ options_flow │ H-L      │ 1.0%      │ 40% of ADR  │ 2.0%        │ 1.5×  │ 2.5×  │
+  │ dark_pool    │ H-L      │ 1.0%      │ 40% of ADR  │ 2.0%        │ 1.5×  │ 2.5×  │
+  └──────────────┴──────────┴───────────┴─────────────┴─────────────┴───────┴───────┘
+
+  Effective SL cap = min( max(floor, ADR×fraction), ceiling )
+  So KO (low vol) stays at floor; NVDA (high vol) widens via ADR; nothing
+  ever blows past the ceiling.
 """
 
 import logging
@@ -42,13 +51,45 @@ _ATR_MULT: dict[str, float] = {
     "dark_pool":    1.5,
 }
 
-# ── Per-strategy stop-loss ceiling ────────────────────────────────────────────
+# ── Per-strategy stop-loss FLOOR cap ──────────────────────────────────────────
+# This is the MINIMUM cap — a low-volatility stock (e.g. KO with ~0.8% ADR)
+# still gets at least this much SL room so we don't choke it inside 1-bar noise.
 _MAX_SL_PCT: dict[str, float] = {
     "scalping":     0.004,   # 0.4%
     "day_trade":    0.008,   # 0.8%  — ↓ from global 8%; keeps stops realistic
     "swing_trade":  0.040,   # 4.0%
     "options_flow": 0.010,   # 1.0%
     "dark_pool":    0.010,   # 1.0%
+}
+
+# ── Per-strategy ADR-fraction cap ─────────────────────────────────────────────
+# Volatility-aware widening: cap may extend up to this fraction of the ticker's
+# Average Daily Range. Friday's data showed every day_trade signal getting
+# clamped to ~0.8% because the floor cap above ignored ticker volatility —
+# NVDA (~3% ADR) got the same SL distance as KO (~0.8% ADR), so NVDA stops
+# fell inside its normal noise band and got swept; price then recovered.
+# A fraction of 0.4 means NVDA's SL can extend to ~1.2% of price (40% of 3%),
+# which sits outside typical intra-bar wiggle for high-vol names.
+#
+# Scalping stays at 0.0 — its tight stops are by design (fast exits).
+# Swing already runs wide (4% floor) so 0.0 too.
+_ADR_SL_FRACTION: dict[str, float] = {
+    "scalping":     0.00,
+    "day_trade":    0.40,
+    "swing_trade":  0.00,
+    "options_flow": 0.40,
+    "dark_pool":    0.40,
+}
+
+# ── Per-strategy absolute SL ceiling ──────────────────────────────────────────
+# Hard upper bound — even on a frothy day with 5% ADR, the SL never goes
+# beyond this. Protects against a single trade blowing the day's risk budget.
+_ABSOLUTE_MAX_SL_PCT: dict[str, float] = {
+    "scalping":     0.006,   # 0.6%
+    "day_trade":    0.025,   # 2.5%
+    "swing_trade":  0.060,   # 6.0%
+    "options_flow": 0.020,   # 2.0%
+    "dark_pool":    0.020,   # 2.0%
 }
 
 # ── Per-strategy minimum stop floor ──────────────────────────────────────────
@@ -277,18 +318,42 @@ def calculate(
     # ── Step 5: Compute base stop distance ────────────────────────────────
     stop_dist = atr * atr_mult
 
-    # ── Step 6: Clamp stop to per-strategy bounds ─────────────────────────
-    max_sl_pct = _MAX_SL_PCT.get(strategy_type, 0.02)
-    min_sl_pct = _MIN_SL_PCT.get(strategy_type, 0.002)
+    # ── Step 5.5: Compute ADR early — needed for the volatility-aware cap ─
+    # (Used again in Step 10 for target capping; cached here.)
+    adr = 0.0
+    if df is not None and not df.empty:
+        adr = _compute_adr(df, interval=interval)
 
-    max_stop = entry * max_sl_pct
+    # ── Step 6: Clamp stop to per-strategy bounds ─────────────────────────
+    # The cap is volatility-aware: at least the per-strategy floor, can
+    # widen up to a fraction of ADR for high-vol names, never above the
+    # absolute ceiling. See _ADR_SL_FRACTION / _ABSOLUTE_MAX_SL_PCT for why.
+    floor_pct    = _MAX_SL_PCT.get(strategy_type, 0.02)
+    adr_fraction = _ADR_SL_FRACTION.get(strategy_type, 0.0)
+    ceiling_pct  = _ABSOLUTE_MAX_SL_PCT.get(strategy_type, 0.025)
+    min_sl_pct   = _MIN_SL_PCT.get(strategy_type, 0.002)
+
+    floor_stop   = entry * floor_pct
+    adr_stop     = adr * adr_fraction if (adr > 0 and adr_fraction > 0) else 0.0
+    ceiling_stop = entry * ceiling_pct
+
+    max_stop = min(max(floor_stop, adr_stop), ceiling_stop)
     min_stop = entry * min_sl_pct
 
     if stop_dist > max_stop:
+        cap_pct = (max_stop / entry) * 100 if entry > 0 else 0.0
+        # Be explicit about which lever actually set the cap so we can
+        # debug later from signal logs without re-deriving the math.
+        if adr_stop >= floor_stop and adr_stop < ceiling_stop:
+            cap_source = f"ADR-aware ({adr_fraction:.0%} of ADR ${adr:.2f})"
+        elif ceiling_stop <= max(floor_stop, adr_stop):
+            cap_source = f"absolute ceiling {ceiling_pct * 100:.1f}%"
+        else:
+            cap_source = f"floor {floor_pct * 100:.1f}%"
         stop_dist = max_stop
         adjustments.append(
-            f"SL capped at {max_sl_pct * 100:.1f}% max for {strategy_type} "
-            f"(ATR-based was {atr * atr_mult:.2f})"
+            f"SL capped at {cap_pct:.2f}% via {cap_source} "
+            f"(raw ATR×mult was ${atr * atr_mult:.2f} = {(atr * atr_mult / entry) * 100:.2f}%)"
         )
     if stop_dist < min_stop:
         stop_dist = min_stop
@@ -316,7 +381,7 @@ def calculate(
             new_dist = abs(entry - sl)
             if new_dist > max_stop:
                 sl = (entry - max_stop) if direction == "LONG" else (entry + max_stop)
-                gamma_sl_reason += f" (re-capped to {max_sl_pct * 100:.1f}%)"
+                gamma_sl_reason += f" (re-capped to {(max_stop / entry) * 100:.2f}%)"
             adjustments.append(gamma_sl_reason)
 
     sl = round(sl, 2)
@@ -326,10 +391,7 @@ def calculate(
     if risk <= 0:
         risk = entry * min_sl_pct
 
-    # ── Step 10: Compute ADR for target capping ───────────────────────────
-    adr = 0.0
-    if df is not None and not df.empty:
-        adr = _compute_adr(df, interval=interval)
+    # ── Step 10: (ADR already computed in Step 5.5 for the SL cap) ────────
 
     # ── Step 11: Calculate targets ────────────────────────────────────────
     min_rr_t1  = _MIN_RR_T1.get(strategy_type, 1.5)
