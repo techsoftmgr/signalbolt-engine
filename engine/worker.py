@@ -96,8 +96,14 @@ async def main() -> None:
     scheduler   = start_scheduler()
     stream_task = asyncio.create_task(run_stream(), name="alpaca_stream")
     heartbeat_task = asyncio.create_task(_heartbeat_loop(stop_event), name="heartbeat")
+    # Publishes batched Alpaca ticks to Redis every 100ms so the web app
+    # machines can broadcast them to their WS clients. No-op when
+    # REDIS_URL isn't set. See engine/price_store.publish_batch_loop.
+    publish_task = asyncio.create_task(
+        price_store.publish_batch_loop(), name="price_publish_batch"
+    )
 
-    logger.info("SignalBolt worker started — scheduler + Alpaca stream + heartbeat active")
+    logger.info("SignalBolt worker started — scheduler + Alpaca stream + heartbeat + Redis publish active")
 
     try:
         await stop_event.wait()
@@ -120,6 +126,10 @@ async def main() -> None:
         heartbeat_task.cancel()
         with suppress(asyncio.CancelledError):
             await heartbeat_task
+
+        publish_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await publish_task
 
         try:
             scheduler.shutdown(wait=False)
