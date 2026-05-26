@@ -13,7 +13,7 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from typing import List, Optional
@@ -783,8 +783,30 @@ def get_prices(tickers: str):
 
     Results are cached per ticker for 5 s so that multiple signal cards
     polling simultaneously don't hammer Alpaca on every request.
+
+    Each ticker entry includes a `staleAfter` ISO timestamp. The UI should
+    grey out the row once `now > staleAfter`. During market hours this is
+    ~15 s out (one cache TTL). When the market is closed (weekends,
+    holidays, or after 4 PM ET on a regular session) the snapshot is the
+    last print — staleAfter is set to the next market open so the UI
+    doesn't flash "stale" between every refresh.
     """
     symbols = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+
+    # Decide the staleAfter horizon once per request.
+    # Open market   → "fresh for one cache TTL" (15 s)
+    # Closed market → much longer; the print isn't going to change soon
+    try:
+        from engine.session_classifier import is_market_open_now
+        _mkt_open = bool(is_market_open_now())
+    except Exception:
+        _mkt_open = True   # fail-open: never make the UI think data is stale on a transient error
+    _now_dt = datetime.now(timezone.utc)
+    _stale_after_iso = (
+        _now_dt + timedelta(seconds=int(_PRICES_CACHE_TTL))
+        if _mkt_open else
+        _now_dt + timedelta(minutes=30)
+    ).isoformat()
 
     # ── Serve cached entries; collect symbols that need a fresh fetch ──
     # Cache is now Redis-backed (cross-machine) when REDIS_URL is set, with
@@ -833,7 +855,10 @@ def get_prices(tickers: str):
             _kv.set_json(f"prices:{sym}", data, ttl_sec=ttl_int)
         result.update(fresh)
 
-    return result
+    # Stamp staleAfter on every entry (cached + freshly fetched alike) so
+    # the UI has a uniform contract. Non-destructive: spread into a copy
+    # so we don't mutate the cached dicts.
+    return {sym: {**data, "staleAfter": _stale_after_iso} for sym, data in result.items()}
 
 
 @app.websocket("/ws/prices")

@@ -1,0 +1,45 @@
+# Fly.io config for the SignalBolt engine WORKER app.
+#
+# Why a separate app from signalbolt-engine?
+#   The web app (signalbolt-engine) is HTTP-only and gets a health-check on
+#   port 8000. The worker doesn't bind any port — it just runs APScheduler +
+#   the Alpaca SIP WebSocket. Sharing one app forced Fly to attempt port-8000
+#   checks against worker machines, producing noise and the occasional false
+#   "unhealthy" status. Splitting them is the cleanest solution and lets us
+#   scale web horizontally without ever accidentally spinning up a second
+#   worker (which would double-subscribe to Alpaca and double-fire pushes).
+#
+# Deploy:
+#   fly apps create signalbolt-worker --org personal
+#   # Copy secrets from the main app (one-time):
+#   #   fly secrets list -a signalbolt-engine    # see what's set
+#   #   fly secrets set KEY=value -a signalbolt-worker   # mirror each one
+#   # Then:
+#   fly deploy -c fly.worker.toml -a signalbolt-worker
+#
+# Keep machine count = 1 (see comment in main fly.toml).
+
+app            = "signalbolt-worker"
+primary_region = "iad"
+
+kill_signal  = "SIGTERM"
+kill_timeout = "30s"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[processes]
+  worker = "python -m engine.worker"
+
+[env]
+  ALPACA_DATA_FEED  = "sip"
+  # This app IS the engine. The flag is here for clarity; worker.py doesn't
+  # read RUN_ENGINE_IN_WEB, but anyone grepping should see the intent.
+  RUN_ENGINE_IN_WEB = "false"
+
+# No [http_service] block — worker doesn't serve HTTP.
+# No [[http_service.checks]] — nothing to check.
+
+[[vm]]
+  size   = "shared-cpu-2x"
+  memory = "1gb"

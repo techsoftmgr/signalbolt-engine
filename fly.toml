@@ -1,12 +1,15 @@
-# Fly.io configuration for signalbolt-engine
+# Fly.io configuration for signalbolt-engine (WEB APP ONLY).
 #
 # Process model:
-#   app    — uvicorn (API only, no engine). Scales horizontally.
-#   worker — runs APScheduler + Alpaca WebSocket. EXACTLY ONE machine.
+#   app — uvicorn (API only, no engine). Scales horizontally.
 #
-# Keep worker count = 1 because the Alpaca SIP WebSocket should not run
-# from multiple machines unless leader election / a distributed lock is
-# implemented. Two workers would also duplicate every push notification.
+# The worker process used to live here under [processes].worker. It was
+# split into its own Fly app (signalbolt-worker, see fly.worker.toml) so
+# that Fly's port-8000 health check doesn't run against worker machines
+# that don't bind any port. Keep worker count = 1 on that app because
+# the Alpaca SIP WebSocket must not run from multiple machines unless
+# leader election / a distributed lock is implemented. Two workers would
+# also duplicate every push notification.
 
 app            = "signalbolt-engine"
 primary_region = "iad"
@@ -26,8 +29,7 @@ kill_timeout = "30s"
   # 1 uvicorn worker per VM — on shared-cpu-1x (1 vCPU), 2 workers fight
   # for the same core and starve the event loop. Scale capacity by raising
   # the machine count (fly scale count app=N) instead.
-  app    = "uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1"
-  worker = "python -m engine.worker"
+  app = "uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1"
 
 [env]
   PORT              = "8000"

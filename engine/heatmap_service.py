@@ -47,6 +47,79 @@ TICKER_SECTORS: dict[str, str] = {
     "MRNA": "Biotech", "BNTX": "Biotech",
 }
 
+# Market cap cache (USD). Hand-curated baseline so the treemap always has
+# size data even when yfinance is slow / rate-limited. Refreshed daily from
+# yfinance in _refresh_market_caps(); these numbers are May 2026 approximations
+# and used as fallback only.
+_BASELINE_MARKET_CAPS: dict[str, float] = {
+    # Mega-caps (trillions)
+    "AAPL":  3_400_000_000_000,  "MSFT":  3_100_000_000_000,
+    "NVDA":  3_000_000_000_000,  "GOOGL": 2_100_000_000_000,
+    "META":  1_400_000_000_000,
+    # Large-caps (hundreds of billions)
+    "TSLA":  900_000_000_000,    "AMD":   270_000_000_000,
+    "JPM":   600_000_000_000,    "XOM":   500_000_000_000,
+    "CVX":   300_000_000_000,    "GS":    140_000_000_000,
+    # Mid-caps (tens of billions)
+    "UBER":   140_000_000_000,   "ABNB":   90_000_000_000,
+    "COIN":   80_000_000_000,    "MSTR":   90_000_000_000,
+    "PLTR":   150_000_000_000,   "HOOD":   30_000_000_000,
+    "RBLX":   30_000_000_000,    "MRNA":   30_000_000_000,
+    "BNTX":   25_000_000_000,
+    # Small-caps (single-digit billions)
+    "MARA":   6_000_000_000,     "RIOT":   3_500_000_000,
+    "CLSK":   3_000_000_000,
+    # ETFs — use AUM as proxy
+    "SPY":   600_000_000_000,    "QQQ":   300_000_000_000,
+    "IWM":    65_000_000_000,    "DIA":    35_000_000_000,
+}
+
+# Daily-refreshing live cap cache (overrides baseline when fresh)
+_market_cap_cache: dict[str, float] = {}
+_market_cap_ts: float = 0.0
+_MARKET_CAP_TTL: int = int(os.environ.get("MARKET_CAP_TTL", "86400"))  # 24h
+
+
+def _get_market_cap(ticker: str) -> float:
+    """
+    Return market cap in USD. Tries the live yfinance-backed cache first,
+    falls back to the baseline. Never raises.
+    """
+    live = _market_cap_cache.get(ticker)
+    if live and live > 0:
+        return live
+    return _BASELINE_MARKET_CAPS.get(ticker, 1_000_000_000)  # 1B floor for unknowns
+
+
+def _refresh_market_caps_if_stale(tickers: list[str]) -> None:
+    """
+    Once a day, refresh market caps from yfinance for the watchlist. Runs
+    inline on first cache miss after TTL — fast enough (~3-5s for 27 tickers)
+    that it's not worth a background job. Failures are silent; baselines
+    cover us.
+    """
+    global _market_cap_ts
+    now = time.monotonic()
+    if now - _market_cap_ts < _MARKET_CAP_TTL and _market_cap_cache:
+        return
+
+    try:
+        import yfinance as yf
+        # Use yf.Tickers (plural) for a batched info fetch
+        joined = " ".join(tickers)
+        for t in tickers:
+            try:
+                info = yf.Ticker(t).fast_info
+                cap = float(getattr(info, "market_cap", None) or 0)
+                if cap > 0:
+                    _market_cap_cache[t] = cap
+            except Exception:
+                continue
+        _market_cap_ts = now
+        logger.info(f"[heatmap] Refreshed market caps for {len(_market_cap_cache)} tickers")
+    except Exception as e:
+        logger.warning(f"[heatmap] Market cap refresh failed (using baselines): {e}")
+
 
 def _safe_float(val, default: float = 0.0) -> float:
     """Convert to float safely, returning default on any error."""
@@ -119,6 +192,9 @@ def compute_heatmap(
 def _build_fresh(tickers: list[str], active_signals: dict[str, str]) -> list[dict]:
     """Fetch data from Alpaca and compute all metrics. Called on cache miss."""
     from engine.alpaca_client import get_latest_prices, get_multi_bars
+
+    # Refresh market caps once a day in-band. Cheap on cache hit.
+    _refresh_market_caps_if_stale(tickers)
 
     try:
         # Three batch calls instead of N×3 individual calls
@@ -257,6 +333,8 @@ def _compute_ticker(
         "volatilityScore": vol_score,
         # colorIntensity: 0-100 for green/red tile shading
         "colorIntensity":  min(100, int(abs(day_change_pct) * 15)),
+        # marketCap: USD. Drives treemap rectangle size in the app.
+        "marketCap":       _get_market_cap(ticker),
         "hasSignal":       ticker in active_signals,
         "signalId":        active_signals.get(ticker),
     }
