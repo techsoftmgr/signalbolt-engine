@@ -60,7 +60,14 @@ def client():
     # mock's chain (.table().select().order().limit().execute()) returns
     # signals_result regardless of who called it.
     async_mock_sb = MagicMock()
+    # All chains end in `await execute()`; AsyncMock makes that awaitable.
+    # The /signals endpoint composes its query as:
+    #   no filter   → table().select().order().limit().execute()
+    #   strategy_type → table().select().order().eq().limit().execute()
     async_mock_sb.table.return_value.select.return_value.order.return_value.limit.return_value.execute = AsyncMock(return_value=signals_result)
+    async_mock_sb.table.return_value.select.return_value.order.return_value.eq.return_value.limit.return_value.execute = AsyncMock(return_value=signals_result)
+    # Defensive: also handle the older `eq()-before-order()` shape some
+    # future endpoint might use.
     async_mock_sb.table.return_value.select.return_value.eq.return_value.order.return_value.limit.return_value.execute = AsyncMock(return_value=signals_result)
     async_mock_sb.table.return_value.select.return_value.execute = AsyncMock(return_value=signals_result)
 
