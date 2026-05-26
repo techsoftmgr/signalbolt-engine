@@ -646,6 +646,29 @@ async def market_status():
     return result
 
 
+@app.get("/earnings/calendar")
+async def earnings_calendar(tickers: str = ""):
+    """
+    Weekly earnings calendar (Mon→Fri of the current week).
+
+    Source: Finnhub free tier (requires FINNHUB_API_KEY env var).
+    If the key isn't set, returns source="unavailable" and an empty list
+    so the app can render a setup hint instead of crashing.
+
+    Query params:
+      tickers — optional comma-separated whitelist to filter results
+                (e.g. "AAPL,NVDA,TSLA"). Omit for the full US calendar.
+
+    Cached 1h via engine.cache (shared Redis when available).
+    """
+    from engine.earnings_service import get_weekly_earnings
+    tlist = [t.strip().upper() for t in tickers.split(",") if t.strip()] if tickers else None
+    # get_weekly_earnings is sync (httpx.Client). Run it off the event loop
+    # so a slow Finnhub call doesn't block other requests.
+    import anyio
+    return await anyio.to_thread.run_sync(get_weekly_earnings, tlist)
+
+
 @app.get("/health")
 async def health():
     """
