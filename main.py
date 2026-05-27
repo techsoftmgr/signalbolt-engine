@@ -2599,7 +2599,9 @@ async def admin_rejection_detail(rejection_id: int, request: Request):
         except Exception as e:
             logger.debug(f"[rejection_detail] sltp error: {e}")
 
-        # Forward-bar outcome analysis (independent of SL/TP — pure price action)
+        # Forward-bar outcome analysis (independent of SL/TP — pure price action).
+        # RTH-only so after-hours / weekend bars don't create phantom hits.
+        forward_bars = gate_validator.filter_rth(forward_bars)
         if len(forward_bars) >= 1:
             highs = forward_bars["high"].astype(float).values
             lows  = forward_bars["low"].astype(float).values
