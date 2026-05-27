@@ -37,10 +37,16 @@ logger = logging.getLogger("signalbolt.trade_tape")
 
 # ── Configuration ───────────────────────────────────────────────────────────
 
-WINDOW_SECS  = 300         # 5-minute rolling window
-MAX_EVENTS   = 5000        # hard cap per ticker (overrides time window if exceeded)
-BLOCK_SIZE   = 10_000      # trades >= this size count as institutional block prints
-RATE_WINDOW  = 60          # trades-per-second computed over last N seconds
+WINDOW_SECS     = 300        # 5-minute rolling window
+MAX_EVENTS      = 5000       # hard cap per ticker (overrides time window if exceeded)
+BLOCK_SIZE      = 10_000     # trades >= this size count as institutional block prints
+RATE_WINDOW     = 60         # trades-per-second computed over last N seconds
+
+# ── Push alert thresholds ──
+PUSH_BLOCK_SIZE = 100_000    # only alert on truly large prints (~$5M+ at typical prices)
+PUSH_THROTTLE_S = 1800       # max 1 push per ticker per 30 min (prevents flood on liquid names)
+_last_push: dict[str, float] = {}
+_last_push_lock = threading.Lock()
 
 
 # ── Per-ticker rolling state ────────────────────────────────────────────────
@@ -86,6 +92,23 @@ def record_trade(ticker: str, price: float, size: float) -> None:
         # Trim events older than window. deque maxlen also caps total size.
         while w.events and w.events[0][0] < cutoff:
             w.events.popleft()
+
+    # Block-print push alert (throttled per ticker — see PUSH_THROTTLE_S)
+    if size >= PUSH_BLOCK_SIZE:
+        with _last_push_lock:
+            last = _last_push.get(ticker, 0)
+            if now - last >= PUSH_THROTTLE_S:
+                _last_push[ticker] = now
+                send = True
+            else:
+                send = False
+        if send:
+            # Import here to avoid circular import + keep startup fast
+            try:
+                from engine import push
+                push.send_block_print_alert(ticker, int(size), float(price))
+            except Exception:
+                pass   # never let push errors kill the stream
 
 
 def get_summary(ticker: str) -> Optional[dict]:
@@ -151,6 +174,51 @@ def get_all_summaries(limit: int = 30) -> list[dict]:
             summaries.append(s)
     summaries.sort(key=lambda x: x["total_volume"], reverse=True)
     return summaries[:limit]
+
+
+def compute_signal_bonus(ticker: str) -> dict:
+    """
+    Calculate a confluence bonus for a fired signal based on current tape.
+    Returns {"bonus": int, "reasons": [str]} — caller appends to score_breakdown.
+
+    Bonuses:
+      +5  block prints present (institutional flow agrees)
+      +3  tape rate >= 3.0/sec (hot tape = real momentum)
+      +2  tape volume >= 250k shares (deep liquidity)
+
+    Penalties (negative bonus):
+      -3  zero block prints AND tape rate < 1.0/sec (only retail interest)
+
+    Capped at -3..+10. Stored in score_breakdown.tape_bonus so the validator
+    can correlate "did tape bonus actually predict outcome."
+    """
+    summary = get_summary(ticker)
+    if summary is None:
+        return {"bonus": 0, "reasons": ["no tape data"]}
+
+    bonus   = 0
+    reasons: list[str] = []
+
+    tps   = summary.get("trades_per_sec", 0.0)
+    vol   = summary.get("total_volume", 0)
+    bcount= summary.get("block_count", 0)
+    bvol  = summary.get("block_volume", 0)
+
+    if bcount > 0:
+        bonus += 5
+        reasons.append(f"+5 institutional block prints ({bcount} blocks, {bvol:,} shares)")
+    if tps >= 3.0:
+        bonus += 3
+        reasons.append(f"+3 hot tape ({tps:.1f}/sec)")
+    if vol >= 250_000:
+        bonus += 2
+        reasons.append(f"+2 deep liquidity ({vol:,} shares)")
+    if bcount == 0 and tps < 1.0:
+        bonus -= 3
+        reasons.append(f"-3 retail-only tape ({tps:.1f}/sec, no blocks)")
+
+    bonus = max(-3, min(10, bonus))
+    return {"bonus": bonus, "reasons": reasons or ["neutral tape"]}
 
 
 def reset(ticker: Optional[str] = None) -> None:
