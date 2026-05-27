@@ -142,6 +142,26 @@ def _gate_1m_reversal(ticker: str, direction: str) -> tuple[bool, str]:
     return False, f"1m no reversal for {direction} ({prev_close:.2f} → {last_close:.2f})"
 
 
+def _gate_spread(ticker: str) -> tuple[bool, str, Optional[float]]:
+    """
+    Block entries when bid-ask spread is too wide → slippage trap.
+    Direct response to the Friday finding of 25-60% SL slippage.
+
+    Threshold: 0.3% absolute. Tickers with naturally wide spreads (low-float
+    biotech, illiquid micro-caps) should not be in the watchlist anyway.
+
+    Returns (passed, reason, spread_pct_for_telemetry).
+    """
+    q = alpaca_client.get_latest_quote(ticker)
+    if q is None:
+        return True, "skipped (no quote available)", None
+
+    spread_pct = q["spread_pct"]
+    if spread_pct > 0.30:
+        return False, f"wide spread {spread_pct:.2f}% (bid={q['bid']:.2f}/ask={q['ask']:.2f})", spread_pct
+    return True, f"spread ok {spread_pct:.2f}%", spread_pct
+
+
 def _gate_patterns(direction: str, df_entry: pd.DataFrame, price: float) -> tuple[bool, str]:
     """Reject obvious bad-entry patterns on the entry timeframe."""
     if df_entry is None or len(df_entry) < 22:
@@ -218,6 +238,16 @@ def check(
     # Gate 4: Pattern rejectors (uses entry-tf df, no extra fetch)
     ok, reason = _gate_patterns(direction, df_entry, price)
     result.gate_log["patterns"] = "pass" if ok else f"fail: {reason}"
+    if not ok:
+        result.allowed = False
+        result.reasons.append(reason)
+
+    # Gate 5: Spread filter (1 extra Alpaca quote call)
+    ok, reason, spread_pct = _gate_spread(ticker)
+    result.gate_log["spread"] = "pass" if ok else f"fail: {reason}"
+    if spread_pct is not None:
+        # Store actual spread for telemetry — see distribution after a week
+        result.gate_log["spread_pct"] = round(spread_pct, 3)
     if not ok:
         result.allowed = False
         result.reasons.append(reason)

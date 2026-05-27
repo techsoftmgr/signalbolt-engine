@@ -56,10 +56,10 @@ _ATR_MULT: dict[str, float] = {
 # still gets at least this much SL room so we don't choke it inside 1-bar noise.
 _MAX_SL_PCT: dict[str, float] = {
     "scalping":     0.004,   # 0.4%
-    "day_trade":    0.008,   # 0.8%  — ↓ from global 8%; keeps stops realistic
+    "day_trade":    0.005,   # 0.5%  — ↓ from 0.8%; was clustering every signal here
     "swing_trade":  0.040,   # 4.0%
-    "options_flow": 0.010,   # 1.0%
-    "dark_pool":    0.010,   # 1.0%
+    "options_flow": 0.007,   # 0.7%  — ↓ from 1.0%
+    "dark_pool":    0.007,   # 0.7%
 }
 
 # ── Per-strategy ADR-fraction cap ─────────────────────────────────────────────
@@ -75,10 +75,10 @@ _MAX_SL_PCT: dict[str, float] = {
 # Swing already runs wide (4% floor) so 0.0 too.
 _ADR_SL_FRACTION: dict[str, float] = {
     "scalping":     0.00,
-    "day_trade":    0.40,
+    "day_trade":    0.60,   # ↑ from 0.40 — high-vol names need more room
     "swing_trade":  0.00,
-    "options_flow": 0.40,
-    "dark_pool":    0.40,
+    "options_flow": 0.60,   # ↑ from 0.40
+    "dark_pool":    0.60,
 }
 
 # ── Per-strategy absolute SL ceiling ──────────────────────────────────────────

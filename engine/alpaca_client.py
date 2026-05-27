@@ -89,6 +89,38 @@ def get_latest_prices(tickers: list[str]) -> dict[str, float]:
         return {}
 
 
+# ── Quote helpers ─────────────────────────────────────────────────────────────
+
+def get_latest_quote(ticker: str) -> Optional[dict]:
+    """
+    Real-time NBBO quote (Alpaca SIP). Returns {'bid', 'ask', 'mid', 'spread_pct'}
+    or None on failure. Used by entry_gate to reject wide-spread entries.
+    """
+    _init()
+    if not _ok or _client is None:
+        return None
+    try:
+        from alpaca.data.requests import StockLatestQuoteRequest
+        resp  = _client.get_stock_latest_quote(
+            StockLatestQuoteRequest(symbol_or_symbols=ticker)
+        )
+        q     = resp[ticker]
+        bid   = float(q.bid_price) if q.bid_price else 0.0
+        ask   = float(q.ask_price) if q.ask_price else 0.0
+        if bid <= 0 or ask <= 0:
+            return None
+        mid   = (bid + ask) / 2
+        return {
+            "bid":        bid,
+            "ask":        ask,
+            "mid":        mid,
+            "spread_pct": (ask - bid) / mid * 100 if mid > 0 else 0.0,
+        }
+    except Exception as e:
+        logger.debug(f"[alpaca] latest_quote({ticker}) failed: {e}")
+        return None
+
+
 # ── Bar helpers ───────────────────────────────────────────────────────────────
 
 def get_bars(

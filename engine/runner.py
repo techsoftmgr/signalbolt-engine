@@ -908,9 +908,15 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
         "sl_adjustments":     sltp.get("adjustments", []),
         "risk_reward":        sltp["risk_reward_1"],
         # Score breakdown stored for optimizer feedback loop.
-        # entry_gate_log is nested in here (no schema change needed) so we
-        # can later correlate which gates passed vs realized outcome.
-        "score_breakdown":    {**scored.get("breakdown", {}), "entry_gate": entry_gate_log},
+        # entry_gate_log + sl_width_pct nested in here (no schema change needed)
+        # so we can later correlate gates / actual SL width vs realized outcome.
+        "score_breakdown":    {
+            **scored.get("breakdown", {}),
+            "entry_gate":    entry_gate_log,
+            "sl_width_pct":  round(abs(price - final_sl) / price * 100, 3) if price else None,
+            "atr_used":      round(sltp.get("atr", 0), 4),
+            "adr_used":      round(sltp.get("adr", 0), 4),
+        },
         # New lifecycle / quality metadata
         "confidence_grade":   scored.get("confidence_grade", "B"),
         "risk_grade":         scored.get("risk_grade", "MEDIUM"),
