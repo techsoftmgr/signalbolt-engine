@@ -83,6 +83,38 @@ _SIM_INTERVAL = {
 
 # ── Outcome simulator ────────────────────────────────────────────────────────
 
+def filter_rth(bars: pd.DataFrame) -> pd.DataFrame:
+    """Public alias for the RTH filter so other modules (main.py, etc.) can use it."""
+    return _filter_rth(bars)
+
+
+def _filter_rth(bars: pd.DataFrame) -> pd.DataFrame:
+    """
+    Drop bars outside US regular trading hours (9:30 AM – 4:00 PM ET,
+    Mon-Fri). Eliminates a major source of validator-vs-reality drift:
+
+      - After-hours bars (4 PM – 8 PM ET) have thin volume + wide spreads,
+        so a "stop hit" on a 100-share AH trade isn't a realistic exit
+      - Pre-market bars (4 AM – 9:30 AM ET) same problem
+      - Weekend = no bars, but the time-walk window can extend through them
+
+    By RTH-filtering, the simulated outcome matches what an actual trader
+    using a regular market-hours order could realistically have achieved.
+    """
+    if bars is None or bars.empty:
+        return bars
+    try:
+        # Bars come back from Alpaca with UTC tz; convert to ET for checking
+        et = bars.index.tz_convert("America/New_York")
+        is_weekday = et.dayofweek < 5
+        minutes_from_open = (et.hour - 9) * 60 + et.minute - 30   # minutes past 9:30 ET
+        rth_mask = is_weekday & (minutes_from_open >= 0) & (minutes_from_open < 390)  # 6.5h × 60
+        return bars[rth_mask]
+    except Exception as e:
+        logger.debug(f"[validator] RTH filter failed, using all bars: {e}")
+        return bars
+
+
 def _simulate(
     direction: str,
     entry: float,
@@ -99,7 +131,11 @@ def _simulate(
 
     realized_pnl_pct is computed against entry price using the price level
     actually touched (target/stop) or last close (for inconclusive).
+
+    Only RTH bars are considered (see _filter_rth) — after-hours / weekend
+    fills aren't realistic exits for the average trader.
     """
+    forward_bars = _filter_rth(forward_bars)
     if forward_bars is None or forward_bars.empty:
         return None, None
 
