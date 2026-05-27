@@ -95,12 +95,18 @@ def _get_profiles() -> list[dict]:
     return _profile_cache   # return stale cache on persistent error
 
 
-def _tokens_for(pref_key: str) -> list[str]:
-    """Return only tokens where the user has enabled the given notification type."""
+def _tokens_for(pref_key: str, default: bool = True) -> list[str]:
+    """
+    Return only tokens where the user has enabled the given notification type.
+
+    `default` controls behavior when the user hasn't set this pref yet:
+      - True  → opt-out (most prefs work this way)
+      - False → opt-in  (used for noisy alerts like block_prints)
+    """
     return [
         p["token"]
         for p in _get_profiles()
-        if p["prefs"].get(pref_key, True)   # default True if pref missing
+        if p["prefs"].get(pref_key, default)
     ]
 
 
@@ -149,7 +155,35 @@ _TYPE_TO_PREF: dict[str, str] = {
     "eod_warning":    "target_hit",
     "book_profit":    "target_hit",
     "reversal":       "stop_hit",
+    "block_print":    "block_prints",  # new — opt-in whale alerts
 }
+
+
+def send_block_print_alert(ticker: str, size: int, price: float) -> None:
+    """
+    Whale-watch alert: institutional block trade just printed on `ticker`.
+    Opt-in (default off) — uses _tokens_for(..., default=False) directly so
+    users have to flip the pref ON to receive these. Fire-and-forget.
+    """
+    try:
+        tokens = _tokens_for("block_prints", default=False)
+        if not tokens:
+            return
+        notional_m = (size * price) / 1_000_000
+        messages = [
+            {
+                "to":    t,
+                "title": f"🐋 {ticker} block print",
+                "body":  f"{size:,} shares @ ${price:.2f}  ·  ~${notional_m:.1f}M trade",
+                "data":  {"type": "block_print", "ticker": ticker, "size": size, "price": price},
+                "sound": "default",
+                "badge": 1,
+            }
+            for t in tokens
+        ]
+        _dispatch(messages, f"BLOCK {ticker}")
+    except Exception as e:
+        logger.debug(f"[push] block_print alert failed for {ticker}: {e}")
 
 
 def _send_raw(

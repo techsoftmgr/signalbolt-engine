@@ -37,6 +37,15 @@ from engine import chop_detector
 from engine import mean_reversion
 from engine import gap_engine
 from engine import entry_gate
+from engine import trade_tape
+
+
+def _tape_bonus(ticker: str) -> dict:
+    """Safely compute the tape bonus — never let it break signal-write."""
+    try:
+        return trade_tape.compute_signal_bonus(ticker)
+    except Exception:
+        return {"bonus": 0, "reasons": ["tape error"]}
 from engine import analytics as signal_analytics
 from engine import premarket_scanner
 from engine.setup_lifecycle import (
@@ -881,6 +890,12 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
             "⚠️ After-hours signal — enter at next session open, not at listed price"
         )
 
+    # Compute tape bonus once so both confidence_score and breakdown use same value
+    _tape_b = _tape_bonus(ticker)
+    _adjusted_score = max(0, min(100, scored["total"] + _tape_b.get("bonus", 0)))
+    if _tape_b.get("bonus", 0) != 0:
+        confidence_factors = list(scored.get("confidence_factors", [])) + _tape_b.get("reasons", [])
+
     signal_row = {
         "ticker":             ticker,
         "direction":          direction,
@@ -888,7 +903,7 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
         "stop_loss":          final_sl,
         "target_one":         final_t1,
         "target_two":         final_t2,
-        "confidence_score":   scored["total"],
+        "confidence_score":   _adjusted_score,
         "confidence_factors": confidence_factors,
         "timeframe":          config["interval"],
         # gap_engine signals get their own strategy tag so they appear separately
@@ -908,14 +923,17 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
         "sl_adjustments":     sltp.get("adjustments", []),
         "risk_reward":        sltp["risk_reward_1"],
         # Score breakdown stored for optimizer feedback loop.
-        # entry_gate_log + sl_width_pct nested in here (no schema change needed)
-        # so we can later correlate gates / actual SL width vs realized outcome.
+        # entry_gate_log + sl_width_pct + tape_bonus nested in here (no schema
+        # change needed) so we can later correlate everything vs realized outcome.
         "score_breakdown":    {
             **scored.get("breakdown", {}),
             "entry_gate":    entry_gate_log,
             "sl_width_pct":  round(abs(price - final_sl) / price * 100, 3) if price else None,
             "atr_used":      round(sltp.get("atr", 0), 4),
             "adr_used":      round(sltp.get("adr", 0), 4),
+            # Tape bonus computed at fire-time from in-memory rolling tape.
+            # Affects displayed confidence and feeds the optimizer feedback loop.
+            "tape_bonus":    _tape_b,
         },
         # New lifecycle / quality metadata
         "confidence_grade":   scored.get("confidence_grade", "B"),

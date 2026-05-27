@@ -142,6 +142,41 @@ def _gate_1m_reversal(ticker: str, direction: str) -> tuple[bool, str]:
     return False, f"1m no reversal for {direction} ({prev_close:.2f} → {last_close:.2f})"
 
 
+def _gate_tape(ticker: str) -> tuple[bool, str, dict]:
+    """
+    Block signals on tickers with no real trade-tape activity. Catches:
+      - Dead tape (no one is trading right now → setup is theoretical)
+      - Illiquid window (cumulative volume too low to enter without slippage)
+
+    Threshold rationale:
+      - trades_per_sec < 0.3  → fewer than 1 trade per 3 seconds = dead
+      - total_volume < 50k    → 5-min window thin enough to slip stops
+    Stocks below these in real market hours are usually pre-market wakeups
+    or low-float micros we shouldn't be firing on anyway.
+
+    Returns (passed, reason, telemetry_dict) — telemetry stored in gate_log.
+    """
+    from engine import trade_tape
+    summary = trade_tape.get_summary(ticker)
+    if summary is None or summary.get("trades", 0) < 5:
+        # No tape data → fail open (might be off-hours or engine cold-start)
+        return True, "skipped (no tape data)", {}
+
+    tps  = summary.get("trades_per_sec", 0.0)
+    vol  = summary.get("total_volume", 0)
+    tele = {
+        "trades_per_sec": tps,
+        "tape_volume":    vol,
+        "block_count":    summary.get("block_count", 0),
+    }
+
+    if tps < 0.3:
+        return False, f"dead tape ({tps:.2f}/sec — illiquid setup)", tele
+    if vol < 50_000:
+        return False, f"thin tape volume ({vol:,} shares in 5min)", tele
+    return True, f"tape ok ({tps:.1f}/sec, {vol:,} shares)", tele
+
+
 def _gate_spread(ticker: str) -> tuple[bool, str, Optional[float]]:
     """
     Block entries when bid-ask spread is too wide → slippage trap.
@@ -248,6 +283,15 @@ def check(
     if spread_pct is not None:
         # Store actual spread for telemetry — see distribution after a week
         result.gate_log["spread_pct"] = round(spread_pct, 3)
+    if not ok:
+        result.allowed = False
+        result.reasons.append(reason)
+
+    # Gate 6: Trade tape health (no extra API call — uses in-memory tape state)
+    ok, reason, tape_tele = _gate_tape(ticker)
+    result.gate_log["tape"] = "pass" if ok else f"fail: {reason}"
+    if tape_tele:
+        result.gate_log["tape_telemetry"] = tape_tele
     if not ok:
         result.allowed = False
         result.reasons.append(reason)
