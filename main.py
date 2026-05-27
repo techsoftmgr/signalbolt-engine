@@ -2655,6 +2655,129 @@ async def community_trending(limit: int = 30, force: bool = False):
     return await anyio.to_thread.run_sync(lambda: social_sentiment.get_trending(limit=limit, force=force))
 
 
+@app.get("/admin/engine-status")
+async def admin_engine_status(request: Request):
+    """
+    Operational snapshot of the engine cadence — what's been running, when,
+    when's next. Surfaces issues like "no signals for X min" at a glance.
+
+    Auth: admin only.
+    """
+    _user_id, sb = _require_admin_jwt(request)
+
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+
+    def _age_sec(iso_str: str) -> float:
+        try:
+            t = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+            return (now - t).total_seconds()
+        except Exception:
+            return -1.0
+
+    out: dict = {
+        "now_utc":      now.isoformat(),
+        "now_local_et": now.astimezone(timezone(timedelta(hours=-4))).strftime("%H:%M ET"),
+    }
+
+    # ── Worker heartbeat ─────────────────────────────────────────────────
+    try:
+        hb = (
+            sb.table("engine_heartbeats")
+              .select("created_at")
+              .order("created_at", desc=True)
+              .limit(1)
+              .execute()
+        ).data or []
+        if hb:
+            ts = hb[0]["created_at"]
+            out["worker"] = {
+                "last_heartbeat_at": ts,
+                "seconds_since":     round(_age_sec(ts), 1),
+                "healthy":           _age_sec(ts) < 300,   # under 5 min = healthy
+            }
+        else:
+            out["worker"] = {"last_heartbeat_at": None, "healthy": False}
+    except Exception as e:
+        out["worker"] = {"error": str(e)}
+
+    # ── Per-strategy last signal + scan interval ─────────────────────────
+    SCAN_INTERVALS_SEC = {
+        "scalping":     300,    # 5 min
+        "day_trade":    600,    # 10 min
+        "swing_trade":  3600,   # 60 min
+        "options_flow": 900,    # 15 min
+        "dark_pool":    900,    # 15 min
+    }
+    out["scans"] = {}
+    try:
+        for strat, interval in SCAN_INTERVALS_SEC.items():
+            rows = (
+                sb.table("signals")
+                  .select("created_at")
+                  .eq("strategy_type", strat)
+                  .order("created_at", desc=True)
+                  .limit(1)
+                  .execute()
+            ).data or []
+            last_at = rows[0]["created_at"] if rows else None
+            out["scans"][strat] = {
+                "interval_sec":  interval,
+                "last_signal_at": last_at,
+                "minutes_since":  round(_age_sec(last_at) / 60, 1) if last_at else None,
+            }
+    except Exception as e:
+        out["scans_error"] = str(e)
+
+    # ── Active signals count ─────────────────────────────────────────────
+    try:
+        cnt = (
+            sb.table("signals")
+              .select("id", count="exact")
+              .eq("status", "active")
+              .execute()
+        )
+        out["active_signals"] = cnt.count
+    except Exception as e:
+        out["active_signals"] = -1
+
+    # ── Gate validator last run ──────────────────────────────────────────
+    try:
+        rows = (
+            sb.table("entry_gate_rejections")
+              .select("created_at, would_have_won")
+              .not_.is_("would_have_won", "null")
+              .order("created_at", desc=True)
+              .limit(1)
+              .execute()
+        ).data or []
+        out["validator"] = {
+            "last_validated_rejection_at": rows[0]["created_at"] if rows else None,
+            "next_scheduled_utc":          "03:00 daily",
+        }
+    except Exception as e:
+        out["validator"] = {"error": str(e)}
+
+    # ── Session mode (rough — hour-based ET) ─────────────────────────────
+    et_hour   = now.astimezone(timezone(timedelta(hours=-4))).hour
+    et_minute = now.astimezone(timezone(timedelta(hours=-4))).minute
+    if et_hour < 9 or (et_hour == 9 and et_minute < 30):
+        mode = "PRE_MARKET"
+    elif et_hour == 9 and et_minute < 45:
+        mode = "CATALYST_ONLY"
+    elif et_hour == 9 and et_minute < 60:
+        mode = "ORB"
+    elif et_hour < 15 or (et_hour == 15 and et_minute < 30):
+        mode = "STANDARD"
+    elif et_hour < 16:
+        mode = "CLOSE_ONLY"
+    else:
+        mode = "AFTER_HOURS"
+    out["session_mode"] = mode
+
+    return out
+
+
 @app.get("/admin/tape/{ticker}")
 async def admin_tape_detail(ticker: str, request: Request):
     """Trade-tape snapshot for a single ticker. JWT-gated to admin."""
