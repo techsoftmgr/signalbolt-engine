@@ -181,6 +181,7 @@ def get_summary(ticker: str) -> Optional[dict]:
         last_price       = w.events[-1][1]
         last_ts          = w.events[-1][0]
         last_block_dir   = '-'
+        last_block_ts    = 0.0           # epoch of most recent block (0 = none)
         n                = len(w.events)
 
         for ev in w.events:
@@ -199,7 +200,8 @@ def get_summary(ticker: str) -> Optional[dict]:
                     block_buy_vol  += sz
                 elif td == 'S':
                     block_sell_vol += sz
-                last_block_dir = td   # ends up as direction of most recent block
+                last_block_dir = td      # ends up as direction of most recent block
+                last_block_ts  = ts      # ends up as ts of most recent block
             if ts >= cutoff_rate:
                 recent_count += 1
 
@@ -209,21 +211,24 @@ def get_summary(ticker: str) -> Optional[dict]:
     # Net block flow: positive = more buy-side blocks, negative = more sell-side
     block_net_flow = round(block_buy_vol - block_sell_vol)
 
+    last_block_age = round(now - last_block_ts, 1) if last_block_ts > 0 else None
+
     return {
-        "ticker":           ticker,
-        "trades":           n,
-        "total_volume":     round(total_volume),
-        "vwap":             round(vwap, 4),
-        "block_count":      block_count,
-        "block_volume":     round(block_volume),
-        "block_buy_vol":    round(block_buy_vol),    # buyer-initiated block shares
-        "block_sell_vol":   round(block_sell_vol),   # seller-initiated block shares
-        "block_net_flow":   block_net_flow,          # +ve = net buying, -ve = net selling
-        "last_block_dir":   last_block_dir,          # 'B', 'S', or '-' for most recent block
-        "trades_per_sec":   round(trades_per_sec, 2),
-        "last_price":       round(last_price, 4),
-        "last_age_sec":     round(now - last_ts, 1),
-        "window_secs":      WINDOW_SECS,
+        "ticker":             ticker,
+        "trades":             n,
+        "total_volume":       round(total_volume),
+        "vwap":               round(vwap, 4),
+        "block_count":        block_count,
+        "block_volume":       round(block_volume),
+        "block_buy_vol":      round(block_buy_vol),    # buyer-initiated block shares
+        "block_sell_vol":     round(block_sell_vol),   # seller-initiated block shares
+        "block_net_flow":     block_net_flow,          # +ve = net buying, -ve = net selling
+        "last_block_dir":     last_block_dir,          # 'B', 'S', or '-' for most recent block
+        "last_block_age_sec": last_block_age,          # seconds since most recent block (None if no blocks)
+        "trades_per_sec":     round(trades_per_sec, 2),
+        "last_price":         round(last_price, 4),
+        "last_age_sec":       round(now - last_ts, 1),
+        "window_secs":        WINDOW_SECS,
     }
 
 
