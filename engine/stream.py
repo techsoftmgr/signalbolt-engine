@@ -1109,6 +1109,22 @@ async def run_stream() -> None:
     # Subscribe to all watched tickers — 1-min bars serve as clock ticks
     # for 5m (scalp), 15m (day_trade/flow), and 1h (swing) boundary detection.
     all_subscribe = list(dict.fromkeys(ALL_TICKERS))   # preserve order, deduplicate
+
+    # Also subscribe tickers from currently-active signals so their stops are
+    # checked tick-by-tick (otherwise we'd rely on the 5-min signal_monitor and
+    # could miss tight stops by hundreds of bps — see AAL incident 2026-05-27).
+    try:
+        from supabase import create_client
+        _sb = create_client(os.environ["SUPABASE_URL"], os.environ.get("SUPABASE_SECRET_KEY") or os.environ.get("SUPABASE_SERVICE_KEY", ""))
+        _rows = _sb.table("signals").select("ticker").eq("status", "active").execute().data or []
+        active_tickers = sorted({r["ticker"] for r in _rows if r.get("ticker")})
+        if active_tickers:
+            extra = [t for t in active_tickers if t not in all_subscribe]
+            all_subscribe.extend(extra)
+            logger.info(f"[stream] Subscribing {len(extra)} extra ticker(s) from active signals: {extra}")
+    except Exception as _e:
+        logger.warning(f"[stream] Could not load active-signal tickers on startup: {_e}")
+
     _subscribed_tickers = set(all_subscribe)           # track base set for dynamic subs
 
     logger.info(
