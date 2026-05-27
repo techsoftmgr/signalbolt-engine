@@ -2644,6 +2644,17 @@ async def admin_rejection_detail(rejection_id: int, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/community/trending")
+async def community_trending(limit: int = 30, force: bool = False):
+    """
+    Trending tickers across Reddit (via Apewisdom) + StockTwits.
+    Public — no auth required (same as /market/pulse). Cached 10 minutes.
+    """
+    from engine import social_sentiment
+    import anyio
+    return await anyio.to_thread.run_sync(lambda: social_sentiment.get_trending(limit=limit, force=force))
+
+
 @app.get("/admin/tape/{ticker}")
 async def admin_tape_detail(ticker: str, request: Request):
     """Trade-tape snapshot for a single ticker. JWT-gated to admin."""
