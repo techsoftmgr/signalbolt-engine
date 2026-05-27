@@ -34,6 +34,11 @@ _loss_cache: tuple[int, float] = (0, 0.0)  # (count, fetched_at)
 _LOSS_CACHE_TTL = 60  # seconds
 
 MIN_CONFIDENCE_FIRE    = 60     # anything below = blocked (tier C)
+# A+ tier is currently anti-predictive in production data: 27 closed A+
+# signals this week → 25.9% win rate (vs 47.5% for B+). The scorer is
+# miscalibrated above ~80. Until it's rescored against real outcomes,
+# we BLOCK A+ entirely. See docs/trade-quality-analysis.md.
+BLOCK_TIERS_TEMP: set[str] = {"A+"}
 
 # Confidence tier thresholds
 TIERS = [
@@ -119,6 +124,23 @@ def check(sb: Client, ticker: str, score: int) -> dict:
         }
     """
     tier, pos_mult = get_confidence_tier(score)
+
+    # TEMP: block A+ tier — currently 25.9% win rate vs 47.5% B+. The
+    # high-score side of the scorer is producing anti-predictive signals.
+    # Remove this gate once the scorer has been recalibrated against
+    # actual outcome data (see docs/trade-quality-analysis.md).
+    if tier in BLOCK_TIERS_TEMP:
+        return {
+            "allowed":            False,
+            "block_reason":       f"Tier {tier} blocked — scorer miscalibration (this week WR={25.9 if tier=='A+' else '?'}%)",
+            "confidence_tier":    tier,
+            "position_mult":      0.0,
+            "open_count":         0,
+            "sector":             get_sector(ticker),
+            "sector_count":       0,
+            "consecutive_losses": 0,
+            "regime_mismatch":    False,
+        }
 
     # Score too low → blocked (tier C, <60)
     if score < MIN_CONFIDENCE_FIRE:

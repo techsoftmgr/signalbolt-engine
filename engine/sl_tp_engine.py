@@ -102,20 +102,26 @@ _MIN_SL_PCT: dict[str, float] = {
 }
 
 # ── Per-strategy R:R ratios ───────────────────────────────────────────────────
+# RAISED 2026-05-27 after this week's data showed avg_loss (1.67%) running
+# 26% bigger than avg_win (1.32%) on day_trade. Even at 50% WR that math
+# loses money. Raising the minimum R:R required at fire time filters out
+# marginal setups whose target is too close relative to the (now-wider,
+# volatility-aware) stop. Trades that DO fire have to clear a higher
+# theoretical bar — fewer signals, better ratio when they print.
 _MIN_RR_T1: dict[str, float] = {
-    "scalping":     1.5,
-    "day_trade":    1.5,   # ↓ from global 2.0 — 1.5× is realistic for same-day
-    "swing_trade":  2.0,
-    "options_flow": 1.5,
-    "dark_pool":    1.5,
+    "scalping":     1.8,    # ↑ from 1.5
+    "day_trade":    2.0,    # ↑ from 1.5
+    "swing_trade":  2.5,    # ↑ from 2.0
+    "options_flow": 1.8,    # ↑ from 1.5
+    "dark_pool":    1.8,    # ↑ from 1.5
 }
 
 _TARGET2_RR: dict[str, float] = {
-    "scalping":     2.5,
-    "day_trade":    2.5,
-    "swing_trade":  3.5,
-    "options_flow": 2.5,
-    "dark_pool":    2.5,
+    "scalping":     3.0,    # ↑ from 2.5
+    "day_trade":    3.0,    # ↑ from 2.5
+    "swing_trade":  4.0,    # ↑ from 3.5
+    "options_flow": 3.0,    # ↑ from 2.5
+    "dark_pool":    3.0,    # ↑ from 2.5
 }
 
 # ── Which strategies use H-L ATR (intraday, no overnight gap) ────────────────

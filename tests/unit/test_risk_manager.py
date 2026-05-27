@@ -128,9 +128,22 @@ class TestPortfolioCheck:
 
     def test_position_mult_matches_tier(self):
         sb = self._mock_sb([])
-        result = check(sb, "AAPL", 92)   # A+ tier
-        assert result["position_mult"] == 1.00
+        # 92 score = A+ tier — currently BLOCKED at the check() layer due
+        # to scorer miscalibration (see BLOCK_TIERS_TEMP in risk_manager).
+        # The tier label is still A+; position_mult is 0 because blocked.
+        result = check(sb, "AAPL", 92)
         assert result["confidence_tier"] == "A+"
+        assert result["allowed"] is False
+        assert result["position_mult"] == 0.0
+
+    def test_position_mult_matches_tier_b_plus(self):
+        # B+ tier (≥70 <80) is currently the highest *allowed* tier.
+        # 0.50x multiplier per TIERS table.
+        sb = self._mock_sb([])
+        result = check(sb, "AAPL", 75)
+        assert result["confidence_tier"] == "B+"
+        assert result["allowed"] is True
+        assert result["position_mult"] == 0.50
 
 
 # ──────────────────────────────────────────────────────────────

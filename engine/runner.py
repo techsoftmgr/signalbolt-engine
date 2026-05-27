@@ -139,18 +139,23 @@ ALL_TICKERS = prescreener.CORE_TICKERS  # overridden dynamically in _run_strateg
 # Strategy configs
 # ---------------------------------------------------------------------------
 
+# TEMP: day_trade is PAUSED at the strategy config level. This week's data
+# shows day_trade at 44.2% WR with -42.7% P&L vs scalping 53.8% and swing
+# 20% (small sample). day_trade is the only bleeder; pausing it stops the
+# bleeding while we recalibrate the scorer. Restore by uncommenting the
+# day_trade dict below. See docs/trade-quality-analysis.md.
 STRATEGY_CONFIGS = [
     # NOTE: scalping is intentionally excluded here.
     # It is handled by engine/stream.py via Alpaca WebSocket bar events,
     # which fires within 2-5 seconds of each 5-min bar close (real-time).
     # APScheduler polling for scalping would add up to 5 min lag — not acceptable.
-    {
-        "type":              "day_trade",
-        "tickers":           ALL_TICKERS,
-        "interval":          "15m",
-        "period":            "5d",
-        "run_every_minutes": 10,   # APScheduler job fires every 10 min during market hours
-    },
+    # {
+    #     "type":              "day_trade",
+    #     "tickers":           ALL_TICKERS,
+    #     "interval":          "15m",
+    #     "period":            "5d",
+    #     "run_every_minutes": 10,   # APScheduler job fires every 10 min during market hours
+    # },
     {
         "type":              "swing_trade",
         "tickers":           ALL_TICKERS,
@@ -1577,28 +1582,35 @@ def start_scheduler() -> BackgroundScheduler:
     # day_trade scan every 10 min with a freshly-screened ticker list catches
     # new movers up to 5 min sooner. The 15m bar data is unchanged between closes
     # but the prescreener will surface newly-active tickers for SMC analysis.
-    day_trade_config = next(c for c in STRATEGY_CONFIGS if c["type"] == "day_trade")
-
-    def _intraday_scan_job():
-        from zoneinfo import ZoneInfo as _ZI
-        from datetime import datetime as _dt
-        _now = _dt.now(_ZI("America/New_York"))
-        _mins = _now.hour * 60 + _now.minute
-        # 9:30 AM = 570, 3:55 PM = 955 — stop 5 min before EOD force-close
-        if 570 <= _mins <= 955 and _now.weekday() < 5:
-            try:
-                _run_strategy_scan(day_trade_config)
-            except Exception as _e:
-                logger.error(f"[runner] 10-min day_trade scan failed: {_e}")
-
-    scheduler.add_job(
-        _intraday_scan_job,
-        trigger=IntervalTrigger(minutes=10),
-        id="day_trade_10min",
-        name="Day trade scan (10-min, 9:30 AM–3:55 PM ET)",
-        replace_existing=True,
+    # TEMP: day_trade 10-min intraday scan job is PAUSED — day_trade strategy
+    # itself is excluded from STRATEGY_CONFIGS above. The lookup below would
+    # raise StopIteration when day_trade isn't in the list; guard it so the
+    # scheduler boots cleanly without firing day_trade signals.
+    day_trade_config = next(
+        (c for c in STRATEGY_CONFIGS if c["type"] == "day_trade"), None
     )
-    logger.info("[runner] Scheduled day_trade scan every 10 min (9:30 AM–3:55 PM ET)")
+    if day_trade_config is not None:
+        def _intraday_scan_job():
+            from zoneinfo import ZoneInfo as _ZI
+            from datetime import datetime as _dt
+            _now = _dt.now(_ZI("America/New_York"))
+            _mins = _now.hour * 60 + _now.minute
+            if 570 <= _mins <= 955 and _now.weekday() < 5:
+                try:
+                    _run_strategy_scan(day_trade_config)
+                except Exception as _e:
+                    logger.error(f"[runner] 10-min day_trade scan failed: {_e}")
+
+        scheduler.add_job(
+            _intraday_scan_job,
+            trigger=IntervalTrigger(minutes=10),
+            id="day_trade_10min",
+            name="Day trade scan (10-min, 9:30 AM–3:55 PM ET)",
+            replace_existing=True,
+        )
+        logger.info("[runner] Scheduled day_trade scan every 10 min (9:30 AM–3:55 PM ET)")
+    else:
+        logger.warning("[runner] day_trade scan PAUSED — strategy not in STRATEGY_CONFIGS")
 
     # ── Pre-market scans — 8:00 AM ET (12:00 UTC) and 9:00 AM ET (13:00 UTC) ──
     from apscheduler.triggers.cron import CronTrigger
