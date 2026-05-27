@@ -2760,7 +2760,7 @@ async def admin_engine_status(request: Request):
         ).data or []
         out["validator"] = {
             "last_validated_rejection_at": rows[0]["created_at"] if rows else None,
-            "next_scheduled_utc":          "20:00 daily (4 PM ET / market close)",
+            "next_scheduled_utc":          "19:30 daily (3:30 PM ET / 2:30 PM CDT)",
         }
     except Exception as e:
         out["validator"] = {"error": str(e)}
