@@ -2644,6 +2644,60 @@ async def admin_rejection_detail(rejection_id: int, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/admin/inject-test-rejection")
+async def admin_inject_test_rejection(request: Request, ticker: str = "NVDA"):
+    """
+    Inject a synthetic rejection row for UI testing — lets you preview the
+    Rejection Analysis page without waiting for live rejections to accumulate.
+
+    Uses the latest Alpaca price as 'entry' and a realistic-looking gate_log
+    where the 1m_reversal gate failed. Returns {id, url_path} so the caller
+    can immediately navigate to /admin-rejection/{id}.
+    """
+    _user_id, sb = _require_admin_jwt(request)
+
+    try:
+        from engine import alpaca_client
+        from datetime import datetime, timezone, timedelta
+
+        # Backdate by 60 min so the hold window has elapsed → outcome stats populate
+        ts = datetime.now(timezone.utc) - timedelta(minutes=60)
+        price = alpaca_client.get_latest_price(ticker) or 100.0
+
+        row = {
+            "created_at":       ts.isoformat(),
+            "ticker":           ticker.upper(),
+            "direction":        "LONG",
+            "strategy_type":    "day_trade",
+            "price":            round(float(price), 2),
+            "confidence_score": 76,
+            "gate_log": {
+                "15m_trend":   "pass",
+                "5m_macd":     "pass",
+                "1m_reversal": "fail: 1m no reversal for LONG (synthetic test)",
+                "patterns":    "pass",
+                "spread":      "pass",
+                "spread_pct":  0.042,
+            },
+            "reasons": [
+                "1m no reversal for LONG (synthetic test rejection)",
+            ],
+        }
+        resp = sb.table("entry_gate_rejections").insert(row).execute()
+        new_id = resp.data[0]["id"] if resp.data else None
+        return {
+            "id":       new_id,
+            "ticker":   ticker.upper(),
+            "url_path": f"/admin-rejection/{new_id}" if new_id else None,
+            "note":     "Backdated 60 min so forward-bar outcome is computable",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"POST /admin/inject-test-rejection error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/admin/run-gate-validator")
 async def admin_run_gate_validator(request: Request, limit: int = 200):
     """Manually trigger the entry-gate rejection validator (for testing / on-demand backfill)."""
