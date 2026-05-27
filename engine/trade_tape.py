@@ -94,6 +94,10 @@ def record_trade(ticker: str, price: float, size: float) -> None:
             w.events.popleft()
 
     # Block-print push alert (throttled per ticker — see PUSH_THROTTLE_S)
+    # CRITICAL: this runs inside the async on_trade event loop. The push call
+    # makes synchronous HTTP to Expo's API which would block the entire loop
+    # and starve every other ticker's tick processing → scans stop firing.
+    # Always dispatch in a daemon thread so we return immediately.
     if size >= PUSH_BLOCK_SIZE:
         with _last_push_lock:
             last = _last_push.get(ticker, 0)
@@ -103,12 +107,23 @@ def record_trade(ticker: str, price: float, size: float) -> None:
             else:
                 send = False
         if send:
-            # Import here to avoid circular import + keep startup fast
             try:
-                from engine import push
-                push.send_block_print_alert(ticker, int(size), float(price))
+                threading.Thread(
+                    target=_dispatch_block_alert,
+                    args=(ticker, int(size), float(price)),
+                    daemon=True,
+                ).start()
             except Exception:
-                pass   # never let push errors kill the stream
+                pass
+
+
+def _dispatch_block_alert(ticker: str, size: int, price: float) -> None:
+    """Fire push in a daemon thread so we don't block the stream event loop."""
+    try:
+        from engine import push
+        push.send_block_print_alert(ticker, size, price)
+    except Exception as e:
+        logger.debug(f"[trade_tape] block alert dispatch failed for {ticker}: {e}")
 
 
 def get_summary(ticker: str) -> Optional[dict]:
