@@ -1235,6 +1235,7 @@ async def run_stream() -> None:
             async def on_trade(trade) -> None:
                 ticker = trade.symbol
                 price  = float(trade.price)
+                size   = float(getattr(trade, "size", 0) or 0)
 
                 # 1. Feed price to WebSocket clients (always — no throttle)
                 try:
@@ -1242,6 +1243,14 @@ async def run_stream() -> None:
                     price_update(ticker, price)
                 except Exception:
                     pass   # never let price broadcast errors kill the stream
+
+                # 1b. Feed trade tape (block prints, tape acceleration, VWAP).
+                #     Pure in-memory, very fast. See engine/trade_tape.py.
+                try:
+                    from engine import trade_tape
+                    trade_tape.record_trade(ticker, price, size)
+                except Exception:
+                    pass
 
                 # 2. Real-time T1/T2/SL check for ALL active non-scalp signals.
                 #    Throttled to at most once per second per ticker so we don't

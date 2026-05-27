@@ -2644,6 +2644,25 @@ async def admin_rejection_detail(rejection_id: int, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/admin/tape/{ticker}")
+async def admin_tape_detail(ticker: str, request: Request):
+    """Trade-tape snapshot for a single ticker. JWT-gated to admin."""
+    _require_admin_jwt(request)
+    from engine import trade_tape
+    s = trade_tape.get_summary(ticker.upper())
+    if s is None:
+        return {"ticker": ticker.upper(), "trades": 0, "note": "no tape data (ticker not in stream subscription, or engine restarted recently)"}
+    return s
+
+
+@app.get("/admin/tape")
+async def admin_tape_all(request: Request, limit: int = 30):
+    """Top N tickers by tape volume in the rolling window."""
+    _require_admin_jwt(request)
+    from engine import trade_tape
+    return {"window_secs": trade_tape.WINDOW_SECS, "tapes": trade_tape.get_all_summaries(limit=limit)}
+
+
 @app.post("/admin/inject-test-rejection")
 async def admin_inject_test_rejection(request: Request, ticker: str = "NVDA"):
     """
