@@ -2424,7 +2424,8 @@ async def admin_gate_rejections(request: Request, hours: int = 24, limit: int = 
     try:
         rows = (
             sb.table("entry_gate_rejections")
-              .select("id, created_at, ticker, direction, strategy_type, price, confidence_score, gate_log, reasons")
+              .select("id, created_at, ticker, direction, strategy_type, price, confidence_score, "
+                      "gate_log, reasons, would_have_won, realized_pnl_pct")
               .gte("created_at", since)
               .order("created_at", desc=True)
               .limit(max(1, min(limit, 500)))
