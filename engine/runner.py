@@ -250,6 +250,38 @@ def _has_active_signal(sb: Client, ticker: str, strategy_type: str) -> bool:
 
 
 
+def _ensure_stream_subscription(ticker: str) -> None:
+    """
+    Add `ticker` to the live Alpaca trade stream so on_trade ticks → real-time
+    SL/TP checks (_check_rt_levels) fire as soon as price crosses a level.
+
+    Without this, only the fixed watchlist + prescreener movers have tick
+    subscriptions; freshly-fired signals on other tickers had to wait for
+    the 5-min signal_monitor to catch stop hits. User saw a 1% extra loss
+    on AAL because of exactly this gap (stop crossed at 9:22, closed 9:27).
+
+    Safe to call from sync context — schedules the async subscribe on the
+    running event loop if there is one; queues otherwise.
+    """
+    try:
+        import asyncio
+        from engine import stream as _stream
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = None
+        if loop and loop.is_running():
+            asyncio.ensure_future(_stream.subscribe_extra_tickers([ticker]))
+        else:
+            # No running loop (e.g. sync APScheduler thread). The function
+            # itself queues to _pending_tickers when _wss_ref is None, so
+            # just touch _subscribed_tickers directly.
+            _stream._subscribed_tickers.add(ticker)
+            _stream._pending_tickers.add(ticker)
+    except Exception as e:
+        logger.debug(f"[runner] stream subscribe failed for {ticker}: {e}")
+
+
 def _write_signal(sb: Client, row: dict) -> str | None:
     """Insert signal row, log the 'fired' event, and return the new signal ID."""
     try:
@@ -258,6 +290,11 @@ def _write_signal(sb: Client, row: dict) -> str | None:
             f"[runner] SIGNAL SAVED  {row['ticker']:6s} {row['direction']:5s} "
             f"[{row.get('strategy_type','?')}]  entry={row['entry_price']}  score={row['confidence_score']}"
         )
+        # CRITICAL: subscribe the ticker to the live trade stream so real-time
+        # SL/TP checks fire on every tick instead of waiting 5 min for
+        # signal_monitor. Without this, tight stops can blow past the level
+        # without the engine reacting (see AAL incident 2026-05-27).
+        _ensure_stream_subscription(row["ticker"])
         # Log the initial "fired" event so History always has a starting entry
         sig_id: str | None = None
         try:
