@@ -1559,6 +1559,23 @@ def _run_weight_optimization() -> None:
         logger.error(f"[runner] Weight optimization failed: {e}", exc_info=True)
 
 
+def _run_gate_validator() -> None:
+    """
+    Nightly entry-gate rejection validator. Walks unjudged rows in
+    entry_gate_rejections and backfills would_have_won + realized_pnl_pct
+    via historical bar simulation. Runs daily at 3 AM UTC.
+    """
+    logger.info("[runner] ═══ Entry-gate rejection validator started ═══")
+    try:
+        from engine import gate_validator
+        sb = create_client(os.environ["SUPABASE_URL"], _supabase_key())
+        result = gate_validator.validate_batch(sb, limit=500)
+        logger.info(f"[runner] ═══ Validator done — {result} ═══")
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        logger.error(f"[runner] Gate validator failed: {e}", exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # Scheduler
 # ---------------------------------------------------------------------------
@@ -1692,6 +1709,18 @@ def start_scheduler() -> BackgroundScheduler:
         replace_existing=True,
     )
     logger.info("[runner] Scheduled weekly weight optimization (Sunday 2:00 AM UTC)")
+
+    # ── Nightly entry-gate rejection validator (3 AM UTC) ────────────────
+    # Backfills would_have_won / realized_pnl_pct on entry_gate_rejections so
+    # we can measure whether the gate is correctly rejecting losers.
+    scheduler.add_job(
+        _run_gate_validator,
+        trigger=CronTrigger(hour=3, minute=0, timezone="UTC"),
+        id="gate_validator",
+        name="SignalBolt entry-gate rejection validator",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled nightly entry-gate validator (3:00 AM UTC)")
 
     scheduler.start()
     logger.info(
