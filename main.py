@@ -2785,12 +2785,16 @@ async def admin_engine_status(request: Request):
 
 @app.get("/admin/tape/{ticker}")
 async def admin_tape_detail(ticker: str, request: Request):
-    """Trade-tape snapshot for a single ticker. JWT-gated to admin."""
+    """Trade-tape snapshot for a single ticker. JWT-gated to admin.
+    Reads from Redis snapshot first (cross-process — the worker holds the
+    in-memory tape, the web only serves HTTP). Falls back to local memory
+    if no Redis snapshot exists (covers same-process testing)."""
     _require_admin_jwt(request)
     from engine import trade_tape
-    s = trade_tape.get_summary(ticker.upper())
+    s = trade_tape.get_summary_redis(ticker.upper()) or trade_tape.get_summary(ticker.upper())
     if s is None:
-        return {"ticker": ticker.upper(), "trades": 0, "note": "no tape data (ticker not in stream subscription, or engine restarted recently)"}
+        return {"ticker": ticker.upper(), "trades": 0,
+                "note": "no tape data — worker may not have observed trades yet, or snapshot is stale"}
     return s
 
 

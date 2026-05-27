@@ -93,6 +93,11 @@ def record_trade(ticker: str, price: float, size: float) -> None:
         while w.events and w.events[0][0] < cutoff:
             w.events.popleft()
 
+    # Periodically push snapshot to Redis so the web app can serve /admin/tape
+    # (trade tape lives in worker memory; web is a different process). Throttled
+    # to _SNAPSHOT_INTERVAL_S internally — calling on every tick is fine.
+    maybe_snapshot_to_redis()
+
     # Block-print push alert (throttled per ticker — see PUSH_THROTTLE_S)
     # CRITICAL: this runs inside the async on_trade event loop. The push call
     # makes synchronous HTTP to Expo's API which would block the entire loop
@@ -181,7 +186,20 @@ def get_summary(ticker: str) -> Optional[dict]:
 
 
 def get_all_summaries(limit: int = 30) -> list[dict]:
-    """Return summaries for all tracked tickers, sorted by activity desc."""
+    """
+    Return summaries for all tracked tickers, sorted by activity desc.
+    First tries Redis (cross-process), falls back to in-memory.
+    """
+    # Cross-process fast-path: read snapshot the worker publishes to Redis
+    try:
+        from engine import cache
+        snap = cache.kv.get_json(_REDIS_SNAPSHOT_KEY)
+        if snap and isinstance(snap, list):
+            return snap[:limit]
+    except Exception:
+        pass
+
+    # Local fallback (same-process)
     summaries = []
     for t in list(_tapes.keys()):
         s = get_summary(t)
@@ -189,6 +207,55 @@ def get_all_summaries(limit: int = 30) -> list[dict]:
             summaries.append(s)
     summaries.sort(key=lambda x: x["total_volume"], reverse=True)
     return summaries[:limit]
+
+
+# Redis cross-process snapshot (the worker writes, the web reads)
+_REDIS_SNAPSHOT_KEY  = "trade_tape:snapshot:v1"
+_REDIS_SNAPSHOT_TTL  = 60          # expires fast; freshness > continuity
+_SNAPSHOT_INTERVAL_S = 15
+_last_snapshot_at    = 0.0
+_snapshot_lock       = threading.Lock()
+
+
+def maybe_snapshot_to_redis(force: bool = False) -> None:
+    """
+    Called periodically (e.g. from the stream's on_trade tick or a tiny
+    scheduler) to push a summary of all tape state to Redis so the web
+    process can serve /admin/tape from a different machine.
+    """
+    global _last_snapshot_at
+    now = time.time()
+    with _snapshot_lock:
+        if not force and (now - _last_snapshot_at) < _SNAPSHOT_INTERVAL_S:
+            return
+        _last_snapshot_at = now
+
+    # Snapshot all summaries
+    summaries = []
+    for t in list(_tapes.keys()):
+        s = get_summary(t)
+        if s and s["trades"] > 0:
+            summaries.append(s)
+    summaries.sort(key=lambda x: x["total_volume"], reverse=True)
+    try:
+        from engine import cache
+        cache.kv.set_json(_REDIS_SNAPSHOT_KEY, summaries, ttl_sec=_REDIS_SNAPSHOT_TTL)
+    except Exception as e:
+        logger.debug(f"[trade_tape] snapshot publish failed: {e}")
+
+
+def get_summary_redis(ticker: str) -> Optional[dict]:
+    """Cross-process per-ticker lookup via Redis snapshot."""
+    try:
+        from engine import cache
+        snap = cache.kv.get_json(_REDIS_SNAPSHOT_KEY)
+        if snap and isinstance(snap, list):
+            for row in snap:
+                if row.get("ticker") == ticker:
+                    return row
+    except Exception:
+        pass
+    return None
 
 
 def compute_signal_bonus(ticker: str) -> dict:

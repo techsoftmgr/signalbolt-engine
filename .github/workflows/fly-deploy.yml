@@ -8,17 +8,31 @@ on:
   workflow_dispatch:
 
 jobs:
-  deploy:
-    name: Deploy Engine
+  deploy-web:
+    name: Deploy Engine (web)
     runs-on: ubuntu-latest
     concurrency: deploy-signalbolt-engine
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: superfly/flyctl-actions/setup-flyctl@master
-
-      - name: Deploy to Fly.io
+      - name: Deploy web to Fly.io
         run: flyctl deploy --remote-only
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  deploy-worker:
+    name: Deploy Engine (worker)
+    runs-on: ubuntu-latest
+    concurrency: deploy-signalbolt-worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Deploy worker to Fly.io
+        # CRITICAL: web and worker are two separate Fly apps. Before this job
+        # existed, only web deployed on push to main — worker silently ran
+        # stale code for hours, blocking the entire trade-tape + entry-gate
+        # rollout on 2026-05-27. Don't remove without putting equivalent
+        # manual-trigger discipline in place.
+        run: flyctl deploy --remote-only --config fly.worker.toml --app signalbolt-worker
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
