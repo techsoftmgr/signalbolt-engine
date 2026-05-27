@@ -2521,6 +2521,129 @@ async def admin_gate_validation_stats(request: Request, days: int = 7):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/admin/rejection/{rejection_id}")
+async def admin_rejection_detail(rejection_id: int, request: Request):
+    """
+    Full enriched detail for a single rejection. Powers the Rejection
+    Analysis page in the app. Returns:
+
+      rejection      — full row from entry_gate_rejections
+      computed_sltp  — SL/TP that the engine would have used (post-rejection)
+      outcome        — max favorable / max adverse / bars-to-target / bars-to-stop
+                       over the strategy hold window
+
+    Auth: admin email only.
+    """
+    _user_id, sb = _require_admin_jwt(request)
+
+    try:
+        row_resp = (
+            sb.table("entry_gate_rejections")
+              .select("*")
+              .eq("id", rejection_id)
+              .limit(1)
+              .execute()
+        )
+        rows = row_resp.data or []
+        if not rows:
+            raise HTTPException(status_code=404, detail="Rejection not found")
+        rejection = rows[0]
+
+        # Compute would-be SL/TP + outcome inline using validator helpers
+        from engine import gate_validator, alpaca_client, sl_tp_engine
+        from datetime import datetime, timezone, timedelta
+
+        ticker        = rejection["ticker"]
+        direction     = rejection["direction"]
+        strategy_type = rejection["strategy_type"]
+        entry         = float(rejection["price"]) if rejection.get("price") else None
+
+        result: dict = {"rejection": rejection, "computed_sltp": None, "outcome": None}
+
+        if not entry:
+            return result
+
+        t_reject_raw = rejection["created_at"]
+        t_reject = datetime.fromisoformat(t_reject_raw.replace("Z", "+00:00"))
+        if t_reject.tzinfo is None:
+            t_reject = t_reject.replace(tzinfo=timezone.utc)
+        hold_hours = gate_validator._MAX_HOLD_HOURS.get(strategy_type, 8.0)
+        t_end      = t_reject + timedelta(hours=hold_hours)
+        interval   = gate_validator._SIM_INTERVAL.get(strategy_type, "5Min")
+        days_needed = max(5, int(hold_hours / 24) + 2)
+
+        bars = alpaca_client.get_bars(ticker, timeframe=interval, days=days_needed + 7)
+        if bars is None or len(bars) < 30:
+            return result
+
+        context_bars = bars[bars.index <= t_reject]
+        forward_bars = bars[(bars.index > t_reject) & (bars.index <= t_end)]
+        if len(context_bars) < 25:
+            return result
+
+        try:
+            sltp = sl_tp_engine.calculate(
+                direction=direction, entry=entry, df=context_bars,
+                regime={}, session={}, gamma={"available": False},
+                strategy_type=strategy_type,
+                interval=interval.replace("Min", "m").replace("Hour", "h"),
+            )
+            result["computed_sltp"] = {
+                "stop_loss":     round(sltp.get("stop_loss", 0), 4),
+                "target_one":    round(sltp.get("target_one", 0), 4),
+                "target_two":    round(sltp.get("target_two", 0), 4),
+                "atr":           round(sltp.get("atr", 0), 4),
+                "risk_reward_1": round(sltp.get("risk_reward_1", 0), 2),
+                "valid":         sltp.get("valid", False),
+            }
+        except Exception as e:
+            logger.debug(f"[rejection_detail] sltp error: {e}")
+
+        # Forward-bar outcome analysis (independent of SL/TP — pure price action)
+        if len(forward_bars) >= 1:
+            highs = forward_bars["high"].astype(float).values
+            lows  = forward_bars["low"].astype(float).values
+            if direction == "LONG":
+                max_fav     = (max(highs) - entry) / entry * 100
+                max_adv     = (min(lows)  - entry) / entry * 100
+            else:
+                max_fav     = (entry - min(lows))  / entry * 100
+                max_adv     = (entry - max(highs)) / entry * 100
+
+            # Bars to SL/TP if we have them
+            bars_to_target: Optional[int] = None
+            bars_to_stop:   Optional[int] = None
+            if result["computed_sltp"]:
+                tp = result["computed_sltp"]["target_one"]
+                sl = result["computed_sltp"]["stop_loss"]
+                for i in range(len(forward_bars)):
+                    h, l = highs[i], lows[i]
+                    if direction == "LONG":
+                        if bars_to_target is None and h >= tp: bars_to_target = i + 1
+                        if bars_to_stop   is None and l <= sl: bars_to_stop   = i + 1
+                    else:
+                        if bars_to_target is None and l <= tp: bars_to_target = i + 1
+                        if bars_to_stop   is None and h >= sl: bars_to_stop   = i + 1
+                    if bars_to_target and bars_to_stop:
+                        break
+
+            result["outcome"] = {
+                "max_favorable_pct": round(max_fav, 3),
+                "max_adverse_pct":   round(max_adv, 3),
+                "bars_seen":         len(forward_bars),
+                "bars_to_target":    bars_to_target,
+                "bars_to_stop":      bars_to_stop,
+                "interval":          interval,
+            }
+
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GET /admin/rejection/{rejection_id} error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/admin/run-gate-validator")
 async def admin_run_gate_validator(request: Request, limit: int = 200):
     """Manually trigger the entry-gate rejection validator (for testing / on-demand backfill)."""
