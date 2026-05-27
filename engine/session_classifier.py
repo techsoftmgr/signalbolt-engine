@@ -203,6 +203,26 @@ def _fomc_active_now() -> bool:
     return 13 * 60 + 30 <= mins <= 14 * 60 + 30  # 1:30 PM – 2:30 PM ET
 
 
+# Low-win-rate hour windows (ET, in minutes from midnight).
+# Determined from production data analysis 2026-05-26 over 172 closed signals:
+#   10:00-11:00 ET = 35.0% WR (opening reversal chop, post-ORB fade)
+#   14:00-15:00 ET = 30.0% WR (mid-afternoon Fed news / pre-EOD reversals)
+# High-WR windows that we KEEP firing:
+#   09:30-10:00 = 60.5% (ORB session)
+#   11:00-12:00 = 50.0%
+#   12:00-13:00 = 57.1%
+#   13:00-14:00 = 75.0% (best window)
+#   15:00-16:00 = 35.3% (already covered by CLOSE_ONLY at 15:30+)
+LOW_WR_WINDOWS = [
+    (10 * 60,      11 * 60),     # 10:00-11:00 ET
+    (14 * 60,      15 * 60),     # 14:00-15:00 ET
+]
+
+
+def _in_low_wr_window(et_mins: int) -> bool:
+    return any(start <= et_mins < end for start, end in LOW_WR_WINDOWS)
+
+
 def _classify_mode(et_mins: int, has_catalyst: bool) -> str:
     """Map ET minutes to session mode."""
     # Weekend or NYSE holiday — market is closed all day. Must come first so
@@ -217,6 +237,10 @@ def _classify_mode(et_mins: int, has_catalyst: bool) -> str:
         return "PRE_MARKET"
     if et_mins >= effective_close:
         return "AFTER_HOURS"
+    # Low-WR hour blocks — production data shows 30-35% WR vs 50-75% elsewhere.
+    # Block both day_trade scheduler AND tick-event scans inside these windows.
+    if _in_low_wr_window(et_mins):
+        return "BLOCKED"
     if et_mins >= CLOSE_START:
         return "CLOSE_ONLY"
     if et_mins >= ORB_END:
@@ -276,7 +300,17 @@ def classify(has_premarket_catalyst: bool = False) -> dict:
             else "After hours: no signals after 4:00 PM ET"
         )
     elif mode == "BLOCKED":
-        block_reason = "FOMC active — signals paused 1:30–2:30 PM ET"
+        # BLOCKED can be FOMC, low-WR hour, or a few other cases.
+        # Choose the most specific reason.
+        if fomc_day and _fomc_active_now():
+            block_reason = "FOMC active — signals paused 1:30–2:30 PM ET"
+        elif _in_low_wr_window(et_mins):
+            block_reason = (
+                f"Low win-rate hour ({now.strftime('%H:%M')} ET): historical WR <40% "
+                f"in this window — see LOW_WR_WINDOWS"
+            )
+        else:
+            block_reason = "Trading paused"
     elif mode == "CATALYST_ONLY" and not has_premarket_catalyst:
         block_reason = "9:30-9:45 AM: catalyst required — no pre-market sweep detected"
 
