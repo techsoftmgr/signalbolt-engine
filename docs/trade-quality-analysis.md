@@ -6,6 +6,50 @@
 
 ---
 
+## Update 2026-05-27 — Two new high-priority items discovered
+
+### A. Entry-confirmation rule (HIGHEST PRIORITY)
+
+User-reported pattern on multiple Friday losses (verified on chart):
+
+```
+Bar 1:  ████████   (huge green — strong move up)
+Bar 2:    ▒▒▒     (red — start of pullback)
+Bar 3:    ▒▒▒     (red — pullback continues)
+              ↑ Engine fires LONG here — CHASING into a downtrend
+Bar 4:    ▒▒▒     (red — pullback continues, signal stops out)
+```
+
+The engine sees "uptrend + pullback to MA = buy the dip" and fires
+mid-pullback, before any reversal candle confirms. SL hit on the next bar.
+
+**Fix proposal:**
+At fire-time, require a 1-bar reversal candle:
+- LONG: last completed bar's close > previous bar's close
+- SHORT: last completed bar's close < previous bar's close
+
+Could escalate to engulfing patterns, 2-bar confirmation, etc. once
+1-bar shows lift. This is price-action 101 — well documented to add
+5-15% WR on retail momentum systems.
+
+Implementation site: `engine/runner.py` SMC pipeline, AFTER setup
+detection passes, BEFORE risk_manager.check(). Reject the candidate
+if the latest bar isn't a reversal in the signal's direction.
+
+### B. Don't add more TA indicators to scoring
+
+The L2 (technical) layer already includes RSI, MACD, BB, volume —
+and the data shows it has ZERO predictive signal (win avg 14.91,
+loss avg 15.24, basically identical means).
+
+Adding more indicators to a noise-producing system just adds more
+noise. Indicators ≠ entry timing. The user's observation above is
+an entry-timing problem, not a scoring problem.
+
+---
+
+---
+
 ## TL;DR
 
 Friday produced 93 signals at a **41.6% overall win rate**. Drilling in, the
