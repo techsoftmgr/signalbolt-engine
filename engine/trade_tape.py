@@ -53,9 +53,13 @@ _last_push_lock = threading.Lock()
 
 @dataclass
 class _TapeWindow:
-    # deque of (ts_epoch, price, size) tuples
-    events: deque   = field(default_factory=lambda: deque(maxlen=MAX_EVENTS))
-    lock:   threading.Lock = field(default_factory=threading.Lock)
+    # deque of (ts_epoch, price, size, direction_char) tuples
+    # direction_char: 'B' = buy-initiated (uptick), 'S' = sell-initiated (downtick),
+    #                 '-' = neutral / zero-tick / first trade
+    events:        deque = field(default_factory=lambda: deque(maxlen=MAX_EVENTS))
+    lock:          threading.Lock = field(default_factory=threading.Lock)
+    last_price:    float = 0.0   # for tick-rule classification
+    last_tick_dir: str   = '-'   # carries forward on zero-ticks
 
 
 _tapes: dict[str, _TapeWindow] = {}
@@ -87,8 +91,25 @@ def record_trade(ticker: str, price: float, size: float) -> None:
     w = _get_window(ticker)
     now = time.time()
     cutoff = now - WINDOW_SECS
+    block_direction = '-'   # captured after tick-rule below for push alert
     with w.lock:
-        w.events.append((now, float(price), float(size)))
+        # Tick-rule classification: compare this trade price to the last
+        # trade price for this ticker. Uptick = buy-initiated, downtick =
+        # sell-initiated. Zero-tick = carry forward last known direction
+        # (standard Lee-Ready tick-test fallback). First trade = neutral.
+        if w.last_price <= 0:
+            tick_dir = '-'
+        elif price > w.last_price:
+            tick_dir = 'B'
+        elif price < w.last_price:
+            tick_dir = 'S'
+        else:
+            tick_dir = w.last_tick_dir   # zero-tick, inherit
+        w.last_price    = float(price)
+        w.last_tick_dir = tick_dir
+        block_direction = tick_dir if size >= BLOCK_SIZE else '-'
+
+        w.events.append((now, float(price), float(size), tick_dir))
         # Trim events older than window. deque maxlen also caps total size.
         while w.events and w.events[0][0] < cutoff:
             w.events.popleft()
@@ -115,18 +136,18 @@ def record_trade(ticker: str, price: float, size: float) -> None:
             try:
                 threading.Thread(
                     target=_dispatch_block_alert,
-                    args=(ticker, int(size), float(price)),
+                    args=(ticker, int(size), float(price), block_direction),
                     daemon=True,
                 ).start()
             except Exception:
                 pass
 
 
-def _dispatch_block_alert(ticker: str, size: int, price: float) -> None:
+def _dispatch_block_alert(ticker: str, size: int, price: float, direction: str = '-') -> None:
     """Fire push in a daemon thread so we don't block the stream event loop."""
     try:
         from engine import push
-        push.send_block_print_alert(ticker, size, price)
+        push.send_block_print_alert(ticker, size, price, direction)
     except Exception as e:
         logger.debug(f"[trade_tape] block alert dispatch failed for {ticker}: {e}")
 
@@ -150,38 +171,59 @@ def get_summary(ticker: str) -> Optional[dict]:
         if not w.events:
             return None
 
-        total_volume = 0.0
-        vwap_num     = 0.0           # Σ price × size
-        block_count  = 0
-        block_volume = 0.0
-        recent_count = 0             # trades within RATE_WINDOW seconds
-        last_price   = w.events[-1][1]
-        last_ts      = w.events[-1][0]
-        n            = len(w.events)
+        total_volume     = 0.0
+        vwap_num         = 0.0           # Σ price × size
+        block_count      = 0
+        block_volume     = 0.0
+        block_buy_vol    = 0.0
+        block_sell_vol   = 0.0
+        recent_count     = 0             # trades within RATE_WINDOW seconds
+        last_price       = w.events[-1][1]
+        last_ts          = w.events[-1][0]
+        last_block_dir   = '-'
+        n                = len(w.events)
 
-        for ts, p, sz in w.events:
+        for ev in w.events:
+            # Support old 3-tuple events from before tick-rule was added
+            if len(ev) == 4:
+                ts, p, sz, td = ev
+            else:
+                ts, p, sz = ev
+                td = '-'
             total_volume += sz
             vwap_num     += p * sz
             if sz >= BLOCK_SIZE:
                 block_count  += 1
                 block_volume += sz
+                if td == 'B':
+                    block_buy_vol  += sz
+                elif td == 'S':
+                    block_sell_vol += sz
+                last_block_dir = td   # ends up as direction of most recent block
             if ts >= cutoff_rate:
                 recent_count += 1
 
         vwap = (vwap_num / total_volume) if total_volume > 0 else last_price
         trades_per_sec = recent_count / RATE_WINDOW if RATE_WINDOW > 0 else 0.0
 
+    # Net block flow: positive = more buy-side blocks, negative = more sell-side
+    block_net_flow = round(block_buy_vol - block_sell_vol)
+
     return {
-        "ticker":         ticker,
-        "trades":         n,
-        "total_volume":   round(total_volume),
-        "vwap":           round(vwap, 4),
-        "block_count":    block_count,
-        "block_volume":   round(block_volume),
-        "trades_per_sec": round(trades_per_sec, 2),
-        "last_price":     round(last_price, 4),
-        "last_age_sec":   round(now - last_ts, 1),
-        "window_secs":    WINDOW_SECS,
+        "ticker":           ticker,
+        "trades":           n,
+        "total_volume":     round(total_volume),
+        "vwap":             round(vwap, 4),
+        "block_count":      block_count,
+        "block_volume":     round(block_volume),
+        "block_buy_vol":    round(block_buy_vol),    # buyer-initiated block shares
+        "block_sell_vol":   round(block_sell_vol),   # seller-initiated block shares
+        "block_net_flow":   block_net_flow,          # +ve = net buying, -ve = net selling
+        "last_block_dir":   last_block_dir,          # 'B', 'S', or '-' for most recent block
+        "trades_per_sec":   round(trades_per_sec, 2),
+        "last_price":       round(last_price, 4),
+        "last_age_sec":     round(now - last_ts, 1),
+        "window_secs":      WINDOW_SECS,
     }
 
 
