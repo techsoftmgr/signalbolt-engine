@@ -703,6 +703,24 @@ async def earnings_calendar(tickers: str = ""):
     return await anyio.to_thread.run_sync(get_weekly_earnings, tlist)
 
 
+@app.get("/market/pulse")
+async def market_pulse(tickers: str = ""):
+    """
+    Market Pulse — sector-ETF directional bias dashboard.
+
+    For each tracked ETF returns a directional score in [-100, +100] derived
+    from 1H EMA-9/EMA-21 confluence + slope + 5h momentum. Plus the
+    "strongest read" (highest |score|) and buy/sell alert lists.
+
+    Cached 30s. Default tickers: SPY, QQQ, DIA, IWM, SMH, IGV, XLK, RSP.
+    Public — no auth required (this is market-context data, not user data).
+    """
+    from engine.pulse_service import get_pulse, DEFAULT_ETFS
+    tlist = [t.strip().upper() for t in tickers.split(",") if t.strip()] if tickers else DEFAULT_ETFS
+    import anyio
+    return await anyio.to_thread.run_sync(get_pulse, tlist)
+
+
 @app.get("/health")
 async def health():
     """
