@@ -125,9 +125,12 @@ def _build_dashboard(tickers: list[str]) -> dict:
         # ── Bucket the scored stocks ──────────────────────────────────────────
         sorted_by_quant = sorted(scored, key=lambda x: x["finalQuantScore"], reverse=True)
 
+        # Bucket thresholds intentionally permissive so dashboard stays useful
+        # outside market hours when realized volume drops the scores. During
+        # live RTH the thresholds still cluster the strongest setups at the top.
         top_momentum = [
             x for x in sorted_by_quant
-            if x["momentumScore"] >= 65 and x["finalQuantScore"] >= 60
+            if x["momentumScore"] >= 55 and x["finalQuantScore"] >= 45
         ][:6]
 
         pullbacks = [
@@ -141,7 +144,7 @@ def _build_dashboard(tickers: list[str]) -> dict:
         ][:6]
 
         high_volume = sorted(
-            [x for x in scored if x["volumeScore"] >= 70],
+            [x for x in scored if x["volumeScore"] >= 50],
             key=lambda x: x["volumeScore"], reverse=True,
         )[:6]
 
@@ -360,13 +363,15 @@ def _classify_setup(
 ) -> tuple[str, str]:
     """Return (setup_type, plain-English reason)."""
 
-    # Momentum: strong RSI + above MA + high volume
-    if rsi >= 60 and price > ma20 and rel_vol >= 1.5:
-        return "momentum", f"RSI {rsi:.0f} — momentum improving above 20-day average, volume elevated"
+    # Momentum: strong RSI + above MA. Volume requirement loosened so
+    # after-hours / pre-market still surfaces top movers from RTH session.
+    if rsi >= 55 and price > ma20 and rel_vol >= 1.1:
+        return "momentum", f"RSI {rsi:.0f} — momentum above 20-day average"
 
-    # Breakout candidate: near 20-day high, volume picking up
-    if breakout_score >= 70 and rel_vol >= 1.2:
-        return "breakout", "Price approaching 20-day high — breakout candidate on elevated volume"
+    # Breakout candidate: near 20-day high. Volume requirement loosened
+    # for the same reason as momentum.
+    if breakout_score >= 60 and rel_vol >= 1.0:
+        return "breakout", "Price approaching 20-day high — breakout candidate"
 
     # VWAP reclaim: price just crossed back above VWAP
     if vwap and price > vwap and price < vwap * 1.005:
