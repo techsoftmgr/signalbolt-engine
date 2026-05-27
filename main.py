@@ -2458,6 +2458,82 @@ async def admin_gate_rejections(request: Request, hours: int = 24, limit: int = 
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/admin/gate-validation-stats")
+async def admin_gate_validation_stats(request: Request, days: int = 7):
+    """
+    Backtest-validated gate effectiveness:
+      gate_correct_pct = % of rejected signals that would have actually lost.
+      Higher = gate is killing losers (good). Lower = gate is killing winners (bad).
+
+    Only counts rejections that have been judged by gate_validator
+    (would_have_won IS NOT NULL).
+    """
+    _user_id, sb = _require_admin_jwt(request)
+
+    from datetime import datetime, timezone, timedelta
+    since = (datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 30)))).isoformat()
+
+    try:
+        rows = (
+            sb.table("entry_gate_rejections")
+              .select("would_have_won, realized_pnl_pct, strategy_type")
+              .gte("created_at", since)
+              .not_.is_("would_have_won", "null")
+              .execute()
+        ).data or []
+
+        total      = len(rows)
+        wins_avoided  = sum(1 for r in rows if not r["would_have_won"])
+        winners_lost  = sum(1 for r in rows if r["would_have_won"])
+        gate_correct  = round(wins_avoided / total * 100, 1) if total > 0 else None
+
+        # Average P/L of rejected signals (negative = we correctly avoided drift)
+        pnls = [float(r["realized_pnl_pct"]) for r in rows if r.get("realized_pnl_pct") is not None]
+        avg_pnl_avoided = round(sum(pnls) / len(pnls), 3) if pnls else None
+
+        # Per-strategy breakdown
+        by_strategy: dict[str, dict] = {}
+        for r in rows:
+            st = r.get("strategy_type", "?")
+            d  = by_strategy.setdefault(st, {"total": 0, "wins": 0, "losses": 0})
+            d["total"] += 1
+            if r["would_have_won"]:
+                d["wins"] += 1
+            else:
+                d["losses"] += 1
+        for st, d in by_strategy.items():
+            d["gate_correct_pct"] = round(d["losses"] / d["total"] * 100, 1) if d["total"] else None
+
+        return {
+            "since":             since,
+            "total_judged":      total,
+            "would_have_lost":   wins_avoided,
+            "would_have_won":    winners_lost,
+            "gate_correct_pct":  gate_correct,
+            "avg_pnl_avoided":   avg_pnl_avoided,
+            "by_strategy":       by_strategy,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GET /admin/gate-validation-stats error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/run-gate-validator")
+async def admin_run_gate_validator(request: Request, limit: int = 200):
+    """Manually trigger the entry-gate rejection validator (for testing / on-demand backfill)."""
+    _user_id, sb = _require_admin_jwt(request)
+    try:
+        from engine import gate_validator
+        import anyio
+        result = await anyio.to_thread.run_sync(lambda: gate_validator.validate_batch(sb, limit=limit))
+        return result
+    except Exception as e:
+        logger.error(f"POST /admin/run-gate-validator error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ── Premium Feature Endpoints ─────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
