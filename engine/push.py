@@ -159,9 +159,12 @@ _TYPE_TO_PREF: dict[str, str] = {
 }
 
 
-def send_block_print_alert(ticker: str, size: int, price: float) -> None:
+def send_block_print_alert(ticker: str, size: int, price: float, direction: str = "-") -> None:
     """
     Whale-watch alert: institutional block trade just printed on `ticker`.
+    `direction` is tick-rule classification: 'B' buy-initiated, 'S' sell-
+    initiated, '-' neutral / unknown.
+
     Opt-in (default off) — uses _tokens_for(..., default=False) directly so
     users have to flip the pref ON to receive these. Fire-and-forget.
     """
@@ -170,18 +173,25 @@ def send_block_print_alert(ticker: str, size: int, price: float) -> None:
         if not tokens:
             return
         notional_m = (size * price) / 1_000_000
+        if direction == "B":
+            label, emoji = "BUY", "🟢"
+        elif direction == "S":
+            label, emoji = "SELL", "🔴"
+        else:
+            label, emoji = "block", "🐋"
         messages = [
             {
                 "to":    t,
-                "title": f"🐋 {ticker} block print",
-                "body":  f"{size:,} shares @ ${price:.2f}  ·  ~${notional_m:.1f}M trade",
-                "data":  {"type": "block_print", "ticker": ticker, "size": size, "price": price},
+                "title": f"{emoji} {ticker} {label} block",
+                "body":  f"{size:,} shares @ ${price:.2f}  ·  ~${notional_m:.1f}M",
+                "data":  {"type": "block_print", "ticker": ticker, "size": size,
+                          "price": price, "direction": direction},
                 "sound": "default",
                 "badge": 1,
             }
             for t in tokens
         ]
-        _dispatch(messages, f"BLOCK {ticker}")
+        _dispatch(messages, f"BLOCK {direction} {ticker}")
     except Exception as e:
         logger.debug(f"[push] block_print alert failed for {ticker}: {e}")
 
