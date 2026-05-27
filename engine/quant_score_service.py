@@ -261,15 +261,23 @@ def _score_ticker(
     mean_reversion_score = float(np.clip(mean_rev_raw, 0, 100))
 
     # ── Risk Score (0-100; higher = riskier) ─────────────────────────────────
-    # Based on ATR% (average true range as % of price)
-    if len(closes) >= 5 and "high" in daily_df and "low" in daily_df:
-        highs  = daily_df["high"].values[-14:].astype(float)
-        lows   = daily_df["low"].values[-14:].astype(float)
-        tr     = np.maximum(highs - lows, np.abs(highs - closes[-14:-1][:len(highs)]))
-        atr    = float(np.mean(tr))
+    # Based on ATR% (average true range as % of price).
+    # True Range for bar i needs prev_close (close[i-1]). We have 15 bars
+    # of close history, so we can compute TR over the last 14 bars where
+    # prev_close is closes[-15:-1] (length 14) aligned with highs[-14:].
+    if len(closes) >= 15 and "high" in daily_df and "low" in daily_df:
+        highs       = daily_df["high"].values[-14:].astype(float)
+        lows        = daily_df["low"].values[-14:].astype(float)
+        prev_closes = closes[-15:-1]               # length 14, aligned with highs/lows
+        tr = np.maximum.reduce([
+            highs - lows,
+            np.abs(highs - prev_closes),
+            np.abs(lows  - prev_closes),
+        ])
+        atr     = float(np.mean(tr))
         atr_pct = (atr / current * 100) if current > 0 else 2.0
     else:
-        atr_pct = 2.0  # default 2% if no data
+        atr_pct = 2.0  # default 2% if not enough history
 
     risk_score = _normalize(atr_pct, 0.5, 5.0)
 
