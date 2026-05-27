@@ -2681,20 +2681,25 @@ async def admin_engine_status(request: Request):
     }
 
     # ── Worker heartbeat ─────────────────────────────────────────────────
+    # engine_heartbeats schema: service (PK), last_beat (timestamptz), pid,
+    # machine_id, notes. The worker upserts itself as service='engine_worker'.
     try:
         hb = (
             sb.table("engine_heartbeats")
-              .select("created_at")
-              .order("created_at", desc=True)
+              .select("service, last_beat, pid, machine_id")
+              .eq("service", "engine_worker")
               .limit(1)
               .execute()
         ).data or []
         if hb:
-            ts = hb[0]["created_at"]
+            ts = hb[0]["last_beat"]
+            age = _age_sec(ts)
             out["worker"] = {
                 "last_heartbeat_at": ts,
-                "seconds_since":     round(_age_sec(ts), 1),
-                "healthy":           _age_sec(ts) < 300,   # under 5 min = healthy
+                "seconds_since":     round(age, 1),
+                "healthy":           age < 300,   # under 5 min = healthy
+                "pid":               hb[0].get("pid"),
+                "machine_id":        hb[0].get("machine_id"),
             }
         else:
             out["worker"] = {"last_heartbeat_at": None, "healthy": False}
