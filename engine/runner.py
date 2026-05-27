@@ -1765,20 +1765,19 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled weekly weight optimization (Sunday 2:00 AM UTC)")
 
-    # ── End-of-day entry-gate rejection validator (21:30 UTC = 4:30 PM ET) ─
-    # Backfills would_have_won / realized_pnl_pct on entry_gate_rejections so
-    # we can measure whether the gate is correctly rejecting losers.
-    # Timed to align with daily analytics report and after the market close —
-    # day_trade rejections from the morning have had their 8h hold window
-    # elapse, scalp rejections (30min hold) all judged, swing waits days.
+    # ── Market-close entry-gate rejection validator (20:00 UTC = 4 PM ET) ──
+    # Runs at the closing bell so all intraday bars are final. Scalp rejections
+    # (30min hold) all judged. Day_trade signals that hit SL/TP intraday are
+    # judged; signals still open at close are marked inconclusive and re-judged
+    # on the next day's run. Swing rejections (240h hold) always wait days.
     scheduler.add_job(
         _run_gate_validator,
-        trigger=CronTrigger(hour=21, minute=30, timezone="UTC"),
+        trigger=CronTrigger(hour=20, minute=0, timezone="UTC"),
         id="gate_validator",
         name="SignalBolt entry-gate rejection validator",
         replace_existing=True,
     )
-    logger.info("[runner] Scheduled entry-gate validator (21:30 UTC / 4:30 PM ET)")
+    logger.info("[runner] Scheduled entry-gate validator (20:00 UTC / market close)")
 
     scheduler.start()
     logger.info(
