@@ -2388,6 +2388,76 @@ async def admin_active_signals(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+ADMIN_EMAIL = "techsoftmgr@gmail.com"
+
+
+def _require_admin_jwt(request: Request):
+    """JWT-gated admin check (email match). Returns (user_id, sb)."""
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Authorization required")
+    sb = _make_supabase()
+    try:
+        user_resp = sb.auth.get_user(token)
+        if not user_resp or not user_resp.user:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        if (user_resp.user.email or "").lower() != ADMIN_EMAIL.lower():
+            raise HTTPException(status_code=403, detail="Admin only")
+        return user_resp.user.id, sb
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="Token verification failed")
+
+
+@app.get("/admin/gate-rejections")
+async def admin_gate_rejections(request: Request, hours: int = 24, limit: int = 200):
+    """
+    Recent entry_gate rejections + summary stats.
+    Admin-only (JWT email == ADMIN_EMAIL).
+    """
+    _user_id, sb = _require_admin_jwt(request)
+
+    from datetime import datetime, timezone, timedelta
+    since = (datetime.now(timezone.utc) - timedelta(hours=max(1, min(hours, 168)))).isoformat()
+
+    try:
+        rows = (
+            sb.table("entry_gate_rejections")
+              .select("id, created_at, ticker, direction, strategy_type, price, confidence_score, gate_log, reasons")
+              .gte("created_at", since)
+              .order("created_at", desc=True)
+              .limit(max(1, min(limit, 500)))
+              .execute()
+        ).data or []
+
+        # Summary aggregates
+        by_strategy: dict[str, int] = {}
+        by_ticker:   dict[str, int] = {}
+        by_reason:   dict[str, int] = {}
+        for r in rows:
+            by_strategy[r.get("strategy_type", "?")] = by_strategy.get(r.get("strategy_type", "?"), 0) + 1
+            by_ticker[r.get("ticker", "?")]          = by_ticker.get(r.get("ticker", "?"), 0) + 1
+            for reason in (r.get("reasons") or []):
+                # Bucket on the gate name (before the colon) — full text is too noisy
+                bucket = reason.split(":")[0].split("(")[0].strip()[:60]
+                by_reason[bucket] = by_reason.get(bucket, 0) + 1
+
+        return {
+            "since":       since,
+            "count":       len(rows),
+            "by_strategy": by_strategy,
+            "by_ticker":   dict(sorted(by_ticker.items(),  key=lambda kv: -kv[1])[:15]),
+            "by_reason":   dict(sorted(by_reason.items(),  key=lambda kv: -kv[1])),
+            "rejections":  rows,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GET /admin/gate-rejections error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ── Premium Feature Endpoints ─────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════

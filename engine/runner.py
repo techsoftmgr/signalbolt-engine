@@ -36,6 +36,7 @@ from engine import prescreener
 from engine import chop_detector
 from engine import mean_reversion
 from engine import gap_engine
+from engine import entry_gate
 from engine import analytics as signal_analytics
 from engine import premarket_scanner
 from engine.setup_lifecycle import (
@@ -801,6 +802,44 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
     if not scored["passes"]:
         return
 
+    # ── ENTRY GATE v2: multi-timeframe + pattern confirmation ─
+    # Runs AFTER scoring passes (cheap fast-path) and BEFORE expensive
+    # SL/TP calc. Rejects signals that look good on the entry timeframe
+    # but lack 15m trend agreement, 5m MACD lean, 1m reversal candle,
+    # or print obvious bad-entry patterns (3 reds, overextended, vol drop).
+    # See engine/entry_gate.py for details.
+    entry_gate_log: dict = {}
+    try:
+        gate = entry_gate.check(
+            ticker        = ticker,
+            direction     = direction,
+            strategy_type = strategy_type,
+            df_entry      = df,
+            price         = price,
+            entry_tf      = config.get("interval", "15m"),
+        )
+        entry_gate_log = dict(gate.gate_log)
+        if not gate.allowed:
+            logger.info(
+                f"[runner] {ticker} [{strategy_type}] BLOCKED — entry_gate: "
+                + " | ".join(gate.reasons)
+            )
+            entry_gate.log_rejection(
+                sb               = sb,
+                ticker           = ticker,
+                direction        = direction,
+                strategy_type    = strategy_type,
+                price            = price,
+                confidence_score = scored.get("total", 0),
+                gate             = gate,
+            )
+            return
+        logger.debug(f"[runner] {ticker} entry_gate PASS — {gate.gate_log}")
+    except Exception as _gate_err:
+        # Fail open on any unexpected error — no worse than today's engine
+        logger.warning(f"[runner] {ticker} entry_gate error (failing open): {_gate_err}")
+        entry_gate_log = {"error": str(_gate_err)}
+
     # ── QUANT GATE 5: Realistic SL/TP ────────────────────────
     # interval is used to select the correct ATR method (H-L for intraday)
     # and to estimate the Average Daily Range for target capping.
@@ -868,8 +907,10 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
         "manipulation_flags": manipulation.get("flags", []),
         "sl_adjustments":     sltp.get("adjustments", []),
         "risk_reward":        sltp["risk_reward_1"],
-        # Score breakdown stored for optimizer feedback loop
-        "score_breakdown":    scored.get("breakdown", {}),
+        # Score breakdown stored for optimizer feedback loop.
+        # entry_gate_log is nested in here (no schema change needed) so we
+        # can later correlate which gates passed vs realized outcome.
+        "score_breakdown":    {**scored.get("breakdown", {}), "entry_gate": entry_gate_log},
         # New lifecycle / quality metadata
         "confidence_grade":   scored.get("confidence_grade", "B"),
         "risk_grade":         scored.get("risk_grade", "MEDIUM"),
