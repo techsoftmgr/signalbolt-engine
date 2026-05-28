@@ -82,6 +82,12 @@ TRAIL_PEAK_PCT = {
 TRAIL_DEFAULT_PCT  = 0.012
 TRAIL_MIN_MOVE_PCT = 0.005  # peak must be ≥0.5% beyond T1 before trailing starts
 
+# Pre-T1 breakeven protection: if a profitable position shows MODERATE reversal
+# pressure (this score ≤ pressure < exit threshold of 55) we don't book early,
+# but we move the stop to breakeven to protect the gain while it rides. Below
+# this we leave the stop alone so a clean trend isn't whipsawed.
+_BE_PROTECT_SCORE = 40
+
 # Market close stages for intraday signals
 # EOD_WARN  → push "N min to close, consider booking profit" (no auto-close)
 # FORCE_CLOSE → auto-close all intraday positions with accurate P&L
@@ -856,6 +862,21 @@ def _monitor_stocks(sb: Client) -> None:
                         except Exception:
                             pass
                         continue   # signal is now closed
+
+                    # Convergence-tied breakeven: we're holding (pressure below the
+                    # exit threshold) but there's MODERATE reversal pressure — so
+                    # don't bail, just protect the unrealized gain by moving the
+                    # stop to breakeven. Worst case becomes a scratch, not a loss,
+                    # if the ride doesn't work out. Below this band we leave the
+                    # stop alone so a clean trend can breathe. Once at breakeven,
+                    # step 4b (trailing + convergence exit) takes over the ride.
+                    elif decision["score"] >= _BE_PROTECT_SCORE and abs(sl - entry) > 0.01:
+                        _update_sl(sb, sig["id"], round(entry, 2))
+                        _log_event(sb, sig["id"], "be_move", price=price,
+                                   note=(f"🛡 Stop → breakeven ${entry:.2f} — reversal pressure "
+                                         f"{decision['score']}, protecting +{pnl_pct:.1f}% (riding, pre-T1)"))
+                        logger.info(f"[monitor] {ticker} pre-T1 breakeven — pressure={decision['score']} "
+                                    f"pnl={pnl_pct:.1f}%")
             except Exception as e:
                 logger.debug(f"[monitor] Early booking check error for {ticker}: {e}")
 
