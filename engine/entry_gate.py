@@ -347,6 +347,10 @@ _BREAKOUT_DETECTORS = {"COMPRESSION", "SWING_BREAKOUT"}
 # 15m_trend (must agree — it's a confirmed uptrend), spread + tape (liquidity).
 _SKIP_GATES_BY_DETECTOR: dict[str, set[str]] = {
     "EMA_RECLAIM": {"1m_reversal", "patterns", "5m_macd"},
+    # TREND_MOMENTUM is a daily-bar swing — intraday gates are pure noise at
+    # that timescale; the daily trend + cross-sectional rank IS the filter.
+    # Keep only spread (liquidity / slippage sanity).
+    "TREND_MOMENTUM": {"15m_trend", "5m_macd", "1m_reversal", "patterns", "tape"},
 }
 
 
