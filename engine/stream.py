@@ -272,7 +272,8 @@ def _check_retest(ticker: str, close: float,
     try:
         from engine import runner as _runner
         fire = {"SWING_BREAKOUT": _runner.fire_swing_breakout,
-                "COMPRESSION":    _runner.fire_compression_breakout}.get(detector)
+                "COMPRESSION":    _runner.fire_compression_breakout,
+                "PULLBACK":       _runner.fire_pullback_reclaim}.get(detector)
         if fire:
             _scan_executor.submit(fire, ticker, direction, close, None, level)
     except Exception as e:
@@ -341,14 +342,13 @@ def _check_pullback_reclaim(ticker: str, price: float,
     if not _market_allows(direction):
         return   # fighting the market regime
 
+    level = reclaim_level
     with _pullback_lock:
         _pullback_fired[ticker] = now
         _pullback_zones.pop(ticker, None)
-    try:
-        from engine.runner import fire_pullback_reclaim
-        _scan_executor.submit(fire_pullback_reclaim, ticker, direction, price, staged_ts)
-    except Exception as e:
-        logger.debug(f"[stream] pullback fire dispatch failed for {ticker}: {e}")
+    # Don't fire on the raw reclaim (INTC/UMAC fired into reversals) — wait for a
+    # retest/hold of the reclaim level, with the stop placed beyond it.
+    _arm_retest(ticker, direction, level, atr, "PULLBACK")
 
 
 # ── Swing-high breakout watch (per-tick firing) ───────────────────────────────

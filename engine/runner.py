@@ -1251,6 +1251,11 @@ def _process_ticker(sb: Client, ticker: str, config: dict,
                 logger.debug(f"[runner] {ticker} predictive error: {e}")
 
 
+# Predictive setups must clear this target:stop ratio. Several losers had ~1.4-
+# 1.5 R:R (BKNG, NKE), which can't survive a sub-50% hit rate. (2026-05-28)
+_MIN_PREDICTIVE_RR = 2.0
+
+
 def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
                                 regime: dict = None, session: dict = None) -> None:
     """
@@ -1378,6 +1383,10 @@ def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
     )
     if not sltp.get("valid"):
         logger.info(f"[runner] {ticker} [{strategy_type}] PREDICTIVE blocked — R:R={sltp.get('risk_reward_1', 0):.2f}")
+        return
+    if (sltp.get("risk_reward_1") or 0) < _MIN_PREDICTIVE_RR:
+        logger.info(f"[runner] {ticker} [{strategy_type}] PREDICTIVE blocked — R:R "
+                    f"{sltp.get('risk_reward_1', 0):.2f} < {_MIN_PREDICTIVE_RR}")
         return
 
     # ── Run the same entry gates as SMC for consistency ─────────────────
@@ -1517,6 +1526,11 @@ def _fire_per_tick_predictive(ticker: str, direction: str, price: float,
         risk = abs(price - sltp["stop_loss"])
         if risk > 0:
             sltp["risk_reward_1"] = round(abs(sltp["target_one"] - price) / risk, 2)
+
+    if (sltp.get("risk_reward_1") or 0) < _MIN_PREDICTIVE_RR:
+        logger.info(f"[runner] {ticker} {detector} — R:R {sltp.get('risk_reward_1', 0):.2f} "
+                    f"< {_MIN_PREDICTIVE_RR}, skipping")
+        return
 
     entry_gate_log: dict = {}
     try:
