@@ -1316,8 +1316,19 @@ def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
         # the live subscription can't grow without bound.
         if zone_staged:
             _ensure_stream_subscription(ticker, cap=200)
-        # Persist staged zones to Redis so they survive worker restarts
-        # (throttled inside _persist_zones to avoid hammering Redis per ticker).
+            # Record whether this ticker is currently relaxed-eligible (extended
+            # past the standard cap with trend+volume confirming) so the Armed
+            # Zones view can badge it. Cleared automatically when not eligible.
+            try:
+                _stream.set_zone_relaxed(ticker, entry_gate.momentum_relaxed_state(df, price))
+            except Exception:
+                pass
+        else:
+            try:
+                _stream.set_zone_relaxed(ticker, None)
+            except Exception:
+                pass
+        # Persist staged zones (throttled inside _persist_zones).
         _stream._persist_zones()
     except Exception:
         pass
