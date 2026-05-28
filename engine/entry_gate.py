@@ -235,6 +235,36 @@ _STD_MAX_ATR      = 2.5
 _MOMENTUM_MAX_ATR = 4.0
 
 
+def momentum_relaxed_state(df_entry: pd.DataFrame, price: float) -> dict:
+    """Is `price` currently in a relaxed-eligible momentum state?
+
+    Mirrors the _gate_patterns relaxation logic (extended past the standard cap
+    AND trend EMA9/EMA21 + entry-bar volume confirm) so the Armed Zones view can
+    flag zones that, if they fired now, would use the wider 4.0-ATR cap.
+    Returns {eligible, ext_atr, direction}.
+    """
+    out = {"eligible": False, "ext_atr": 0.0, "direction": None}
+    if df_entry is None or len(df_entry) < 22:
+        return out
+    ema9  = float(_ema(df_entry["close"], 9).iloc[-1])
+    ema21 = float(_ema(df_entry["close"], 21).iloc[-1])
+    atr   = _atr(df_entry, 14)
+    if atr <= 0:
+        return out
+    dev = (price - ema21) / atr
+    out["ext_atr"] = round(dev, 2)
+    strong_vol = False
+    if "volume" in df_entry.columns and len(df_entry) >= 11:
+        rv = float(df_entry["volume"].iloc[-1])
+        av = float(df_entry["volume"].iloc[-11:-1].mean())
+        strong_vol = av > 0 and rv >= av
+    if dev > _STD_MAX_ATR and ema9 > ema21 and strong_vol:
+        out["eligible"] = True; out["direction"] = "LONG"
+    elif dev < -_STD_MAX_ATR and ema9 < ema21 and strong_vol:
+        out["eligible"] = True; out["direction"] = "SHORT"
+    return out
+
+
 def _gate_patterns(direction: str, df_entry: pd.DataFrame, price: float) -> tuple[bool, str]:
     """Reject obvious bad-entry patterns on the entry timeframe."""
     if df_entry is None or len(df_entry) < 22:

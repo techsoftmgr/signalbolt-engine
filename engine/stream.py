@@ -255,6 +255,22 @@ _ZONE_KV_KEY    = "stream:zones:v1"
 _ZONE_PERSIST_MIN_INTERVAL_S = 15.0   # throttle writes (scan calls this ~40×/scan)
 _last_zone_persist_ts = 0.0
 
+# Per-ticker "relaxed-eligible" state (computed at staging): is this ticker
+# currently extended past the standard cap with trend+volume confirming, so a
+# fire would use the wider momentum cap? Shown as a badge in the Armed Zones UI.
+_zone_relaxed: dict[str, dict] = {}
+_zone_relaxed_lock = _threading.Lock()
+
+
+def set_zone_relaxed(ticker: str, state: dict | None) -> None:
+    """Record (or clear) the relaxed-eligible state for a ticker."""
+    with _zone_relaxed_lock:
+        if state and state.get("eligible"):
+            _zone_relaxed[ticker] = {"ext_atr": state.get("ext_atr"),
+                                     "direction": state.get("direction")}
+        else:
+            _zone_relaxed.pop(ticker, None)
+
 
 def _zone_supabase():
     """Service-role Supabase client for zone persistence (worker context)."""
@@ -284,6 +300,7 @@ def _persist_zones(force: bool = False) -> None:
             "compression": {k: list(v) for k, v in _compression_zones.items()},
             "pullback":    {k: list(v) for k, v in _pullback_zones.items()},
             "swing":       {k: list(v) for k, v in _swing_zones.items()},
+            "relaxed":     dict(_zone_relaxed),
         }
         _zone_supabase().table("engine_kv").upsert({
             "key": _ZONE_KV_KEY, "value": snap,
@@ -313,6 +330,8 @@ def load_zones_from_db() -> set[str]:
             _pullback_zones.update({k: tuple(v) for k, v in (snap.get("pullback") or {}).items()})
         with _swing_lock:
             _swing_zones.update({k: tuple(v) for k, v in (snap.get("swing") or {}).items()})
+        with _zone_relaxed_lock:
+            _zone_relaxed.update(snap.get("relaxed") or {})
         logger.info(f"[stream] Restored zones from DB — "
                     f"comp={len(_compression_zones)} pb={len(_pullback_zones)} swing={len(_swing_zones)}")
         return set(_compression_zones) | set(_pullback_zones) | set(_swing_zones)

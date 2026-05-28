@@ -2912,9 +2912,10 @@ async def admin_armed_zones(request: Request):
     except Exception:
         snap = {}
 
-    comp  = snap.get("compression") or {}
-    pull  = snap.get("pullback")    or {}
-    swing = snap.get("swing")       or {}
+    comp    = snap.get("compression") or {}
+    pull    = snap.get("pullback")    or {}
+    swing   = snap.get("swing")       or {}
+    relaxed = snap.get("relaxed")     or {}
 
     now_ts = datetime.now(timezone.utc).timestamp()
 
@@ -3002,6 +3003,10 @@ async def admin_armed_zones(request: Request):
             if cands:
                 nearest = round(min(abs(px - t) / px * 100 for t in cands), 2)
         z["nearest_trigger_pct"] = nearest
+        # Relaxed-eligible: would a fire now use the wider momentum cap?
+        rel = relaxed.get(z["ticker"]) or {}
+        z["relaxed_eligible"] = bool(rel)
+        z["ext_atr"] = rel.get("ext_atr")
 
     # Closest-to-triggering first; unknown distance (no price) last
     zones.sort(key=lambda z: (z["nearest_trigger_pct"] is None,
