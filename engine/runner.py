@@ -1447,11 +1447,15 @@ def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
 
 
 def _fire_per_tick_predictive(ticker: str, direction: str, price: float,
-                              detector: str, setup_type: str, label: str) -> None:
+                              detector: str, setup_type: str, label: str,
+                              armed_ts: float | None = None) -> None:
     """
-    Shared per-tick fire path for predictive detectors (compression / pullback).
-    Called the INSTANT price crosses a staged level from stream.on_trade — the
-    fast path that catches the move mid-bar instead of at the next 15m scan.
+    Shared fire path for predictive detectors (compression / pullback / swing).
+    Called from stream.on_bar when a 1-minute bar CLOSES beyond a staged level
+    (body confirmation), instead of waiting for the next 15m scan.
+
+    `armed_ts`: epoch seconds when the zone was staged — stored as armed_at so
+    the chart can mark the accumulation point alongside the fire point.
 
     Self-contained: own Supabase client, fetches bars for SL/TP, runs the same
     entry_gate + risk checks as scan-fired signals. Deduped by active-signal
@@ -1536,7 +1540,9 @@ def _fire_per_tick_predictive(ticker: str, direction: str, price: float,
             "detector_source":   detector,
             "predictive_setup":  setup_type,
             "predictive_reason": setup_reason,
-            "fire_path":         "per_tick",
+            "fire_path":         "bar_close_1m",
+            "armed_at":          (datetime.fromtimestamp(armed_ts, tz=timezone.utc).isoformat()
+                                  if armed_ts else None),
             "entry_gate":        entry_gate_log,
             "sl_width_pct":      round(abs(price - sltp["stop_loss"]) / price * 100, 3),
             "atr_used":          round(sltp.get("atr", 0), 4),
@@ -1553,28 +1559,31 @@ def _fire_per_tick_predictive(ticker: str, direction: str, price: float,
         pass
 
 
-def fire_compression_breakout(ticker: str, direction: str, price: float) -> None:
-    """Per-tick compression breakout fire (called from stream.on_trade)."""
+def fire_compression_breakout(ticker: str, direction: str, price: float,
+                              armed_ts: float | None = None) -> None:
+    """1m-close compression breakout fire (called from stream.on_bar)."""
     _fire_per_tick_predictive(ticker, direction, price,
                               detector="COMPRESSION",
                               setup_type="COMPRESSION_BREAKOUT",
-                              label="Compression breakout")
+                              label="Compression breakout", armed_ts=armed_ts)
 
 
-def fire_pullback_reclaim(ticker: str, direction: str, price: float) -> None:
-    """Per-tick pullback reclaim fire (called from stream.on_trade)."""
+def fire_pullback_reclaim(ticker: str, direction: str, price: float,
+                          armed_ts: float | None = None) -> None:
+    """1m-close pullback reclaim fire (called from stream.on_bar)."""
     _fire_per_tick_predictive(ticker, direction, price,
                               detector="PULLBACK",
                               setup_type="PULLBACK_CONTINUATION",
-                              label="Pullback reclaim")
+                              label="Pullback reclaim", armed_ts=armed_ts)
 
 
-def fire_swing_breakout(ticker: str, direction: str, price: float) -> None:
-    """Per-tick swing-high breakout fire (called from stream.on_trade)."""
+def fire_swing_breakout(ticker: str, direction: str, price: float,
+                        armed_ts: float | None = None) -> None:
+    """1m-close swing-high breakout fire (called from stream.on_bar)."""
     _fire_per_tick_predictive(ticker, direction, price,
                               detector="SWING_BREAKOUT",
                               setup_type="SWING_BREAKOUT",
-                              label="Swing-high breakout")
+                              label="Swing-high breakout", armed_ts=armed_ts)
 
 
 # ---------------------------------------------------------------------------
