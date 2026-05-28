@@ -2907,7 +2907,8 @@ async def admin_zone_history(request: Request, days: int = 7):
     try:
         rows = (
             sb.table("armed_zone_history")
-              .select("detector, outcome, relaxed, fired_signal_id, session_date")
+              .select("detector, outcome, relaxed, fired_signal_id, session_date, "
+                      "would_have_won")
               .gte("session_date", since)
               .limit(20000)
               .execute()
@@ -2927,8 +2928,10 @@ async def admin_zone_history(request: Request, days: int = 7):
         det: dict[str, dict] = {}
         for r in rows:
             d = det.setdefault(r["detector"], {
-                "armed": 0, "fired": 0, "expired": 0, "relaxed_armed": 0,
-                "fired_wins": 0, "fired_losses": 0})
+                "armed": 0, "fired": 0, "expired": 0, "no_trigger": 0, "relaxed_armed": 0,
+                "fired_wins": 0, "fired_losses": 0,
+                # counterfactual on UNfired zones that actually triggered a breakout
+                "skipped_would_win": 0, "skipped_would_lose": 0})
             outcome = r.get("outcome")
             d["armed"] += 1
             if r.get("relaxed"):
@@ -2938,13 +2941,22 @@ async def admin_zone_history(request: Request, days: int = 7):
                 res = result_by_id.get(r.get("fired_signal_id"))
                 if res == "win":   d["fired_wins"]   += 1
                 elif res == "loss": d["fired_losses"] += 1
+            elif outcome == "expired_no_trigger":
+                d["no_trigger"] += 1
             elif outcome == "expired":
                 d["expired"] += 1
+                won = r.get("would_have_won")
+                if won is True:    d["skipped_would_win"]  += 1
+                elif won is False: d["skipped_would_lose"] += 1
 
         for s in det.values():
             s["conversion_pct"] = round(s["fired"] / s["armed"] * 100, 1) if s["armed"] else None
             judged = s["fired_wins"] + s["fired_losses"]
             s["fired_win_rate"] = round(s["fired_wins"] / judged * 100, 1) if judged else None
+            # Of the unfired-but-triggered zones, how many would have won? High =
+            # our firing filters are killing winners; low = correctly skipping.
+            skj = s["skipped_would_win"] + s["skipped_would_lose"]
+            s["skipped_would_win_pct"] = round(s["skipped_would_win"] / skj * 100, 1) if skj else None
 
         return {"since": since, "days": days, "by_detector": det,
                 "total_armed": len(rows)}
@@ -2985,10 +2997,26 @@ async def admin_gate_performance(request: Request, days: int = 7):
             return [k for k, v in (gl or {}).items()
                     if isinstance(v, str) and v.startswith("fail")]
 
-        by_gate: dict[str, dict] = {}
+        def _new_bucket():
+            return {"rejections": 0, "would_won": 0, "would_lost": 0, "pending": 0,
+                    "pnl_sum": 0.0, "pnl_n": 0, "signals": []}
+
+        def _accumulate(bucket: dict, won, pct, sig_row):
+            bucket["rejections"] += 1
+            if won is True:    bucket["would_won"]  += 1
+            elif won is False: bucket["would_lost"] += 1
+            else:              bucket["pending"]    += 1
+            if pct is not None:
+                bucket["pnl_sum"] += float(pct); bucket["pnl_n"] += 1
+            if len(bucket["signals"]) < 25:
+                bucket["signals"].append(sig_row)
+
+        by_gate:   dict[str, dict] = {}
+        by_ticker: dict[str, dict] = {}
         overall = {"rejections": 0, "would_won": 0, "would_lost": 0, "pending": 0}
         for r in rows:
             won = r.get("would_have_won")
+            pct = r.get("realized_pnl_pct")
             overall["rejections"] += 1
             if won is True:    overall["would_won"]  += 1
             elif won is False: overall["would_lost"] += 1
@@ -3005,35 +3033,30 @@ async def admin_gate_performance(request: Request, days: int = 7):
                 "exit":        r.get("exit_price"),
                 "exit_reason": r.get("exit_reason"),
                 "would_have_won":   won,
-                "result_pct":  r.get("realized_pnl_pct"),
+                "result_pct":  pct,
                 "created_at":  r.get("created_at"),
             }
             for g in _failed_gates(r.get("gate_log")):
-                b = by_gate.setdefault(g, {
-                    "rejections": 0, "would_won": 0, "would_lost": 0, "pending": 0,
-                    "pnl_sum": 0.0, "pnl_n": 0, "signals": []})
-                b["rejections"] += 1
-                if won is True:    b["would_won"]  += 1
-                elif won is False: b["would_lost"] += 1
-                else:              b["pending"]    += 1
-                pct = r.get("realized_pnl_pct")
-                if pct is not None:
-                    b["pnl_sum"] += float(pct); b["pnl_n"] += 1
-                if len(b["signals"]) < 25:
-                    b["signals"].append(sig_row)
+                _accumulate(by_gate.setdefault(g, _new_bucket()), won, pct, sig_row)
+            tk = r.get("ticker") or "?"
+            _accumulate(by_ticker.setdefault(tk, _new_bucket()), won, pct, sig_row)
 
-        for g, b in by_gate.items():
-            judged = b["would_won"] + b["would_lost"]
-            # "correct" = rejection that would have lost (gate did its job)
-            b["correct_pct"] = round(b["would_lost"] / judged * 100, 1) if judged else None
-            b["won_pct"]     = round(b["would_won"]  / judged * 100, 1) if judged else None
-            b["avg_pnl"]     = round(b["pnl_sum"] / b["pnl_n"], 3) if b["pnl_n"] else None
-            b.pop("pnl_sum", None); b.pop("pnl_n", None)
+        def _finalize(d: dict):
+            for b in d.values():
+                judged = b["would_won"] + b["would_lost"]
+                # "correct" = rejection that would have lost (gate did its job)
+                b["correct_pct"] = round(b["would_lost"] / judged * 100, 1) if judged else None
+                b["won_pct"]     = round(b["would_won"]  / judged * 100, 1) if judged else None
+                b["avg_pnl"]     = round(b["pnl_sum"] / b["pnl_n"], 3) if b["pnl_n"] else None
+                b.pop("pnl_sum", None); b.pop("pnl_n", None)
+        _finalize(by_gate)
+        _finalize(by_ticker)
 
         judged = overall["would_won"] + overall["would_lost"]
         overall["correct_pct"] = round(overall["would_lost"] / judged * 100, 1) if judged else None
 
-        return {"since": since, "days": days, "by_gate": by_gate, "overall": overall}
+        return {"since": since, "days": days, "by_gate": by_gate,
+                "by_ticker": by_ticker, "overall": overall}
     except HTTPException:
         raise
     except Exception as e:

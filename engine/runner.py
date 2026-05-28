@@ -2142,6 +2142,7 @@ def _run_gate_validator() -> None:
     via historical bar simulation. Runs daily at 3 AM UTC.
     """
     logger.info("[runner] ═══ Entry-gate rejection validator started ═══")
+    sb = None
     try:
         from engine import gate_validator
         sb = create_client(os.environ["SUPABASE_URL"], _supabase_key())
@@ -2150,6 +2151,17 @@ def _run_gate_validator() -> None:
     except Exception as e:
         sentry_sdk.capture_exception(e)
         logger.error(f"[runner] Gate validator failed: {e}", exc_info=True)
+
+    # Armed-zone counterfactual: judge unfired zones (would a breakout have won?)
+    try:
+        from engine import zone_validator
+        if sb is None:
+            sb = create_client(os.environ["SUPABASE_URL"], _supabase_key())
+        zresult = zone_validator.validate_batch(sb, limit=500)
+        logger.info(f"[runner] ═══ Zone validator done — {zresult} ═══")
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        logger.error(f"[runner] Zone validator failed: {e}", exc_info=True)
 
 
 def _clear_zones_overnight() -> None:
