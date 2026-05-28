@@ -233,6 +233,16 @@ def _gate_patterns(direction: str, df_entry: pd.DataFrame, price: float) -> tupl
 
 # ── Public entry point ──────────────────────────────────────────────────
 
+# Gates that don't fit specific strategy timeframes — skipped (not failed) for
+# those strategies. Swing trades hold for ~10 days, so 5-min MACD, 1-min
+# reversal, and 5-min tape activity are noise at that timescale. We keep
+# the structurally meaningful gates (15m trend, patterns, spread).
+_SKIP_GATES_BY_STRATEGY: dict[str, set[str]] = {
+    "swing_trade":   {"5m_macd", "1m_reversal", "tape"},
+    "position_trade":{"5m_macd", "1m_reversal", "tape", "15m_trend"},  # even longer hold
+}
+
+
 def check(
     ticker:        str,
     direction:     str,
@@ -242,59 +252,76 @@ def check(
     entry_tf:      str = "15m",
 ) -> GateResult:
     """
-    Run all four gates. Returns GateResult with allowed=False if any fails.
+    Run all six gates. Returns GateResult with allowed=False if any fails.
 
     df_entry is the entry-timeframe candles already loaded by the runner —
     we reuse it where possible to avoid extra Alpaca calls.
+
+    Gates that don't fit the strategy timeframe are skipped (logged as
+    'skipped (n/a for strategy)') instead of evaluated — see
+    _SKIP_GATES_BY_STRATEGY.
     """
     result = GateResult(allowed=True)
+    skip = _SKIP_GATES_BY_STRATEGY.get(strategy_type, set())
+
+    def _maybe_skip(gate_name: str) -> bool:
+        if gate_name in skip:
+            result.gate_log[gate_name] = f"skipped (n/a for {strategy_type})"
+            return True
+        return False
 
     # Gate 1: 15m trend
-    ok, reason = _gate_15m_trend(ticker, direction, df_entry, entry_tf)
-    result.gate_log["15m_trend"] = "pass" if ok else f"fail: {reason}"
-    if not ok:
-        result.allowed = False
-        result.reasons.append(reason)
+    if not _maybe_skip("15m_trend"):
+        ok, reason = _gate_15m_trend(ticker, direction, df_entry, entry_tf)
+        result.gate_log["15m_trend"] = "pass" if ok else f"fail: {reason}"
+        if not ok:
+            result.allowed = False
+            result.reasons.append(reason)
 
     # Gate 2: 5m MACD
-    ok, reason = _gate_5m_macd(ticker, direction, df_entry, entry_tf)
-    result.gate_log["5m_macd"] = "pass" if ok else f"fail: {reason}"
-    if not ok:
-        result.allowed = False
-        result.reasons.append(reason)
+    if not _maybe_skip("5m_macd"):
+        ok, reason = _gate_5m_macd(ticker, direction, df_entry, entry_tf)
+        result.gate_log["5m_macd"] = "pass" if ok else f"fail: {reason}"
+        if not ok:
+            result.allowed = False
+            result.reasons.append(reason)
 
     # Gate 3: 1m reversal candle
-    ok, reason = _gate_1m_reversal(ticker, direction)
-    result.gate_log["1m_reversal"] = "pass" if ok else f"fail: {reason}"
-    if not ok:
-        result.allowed = False
-        result.reasons.append(reason)
+    if not _maybe_skip("1m_reversal"):
+        ok, reason = _gate_1m_reversal(ticker, direction)
+        result.gate_log["1m_reversal"] = "pass" if ok else f"fail: {reason}"
+        if not ok:
+            result.allowed = False
+            result.reasons.append(reason)
 
     # Gate 4: Pattern rejectors (uses entry-tf df, no extra fetch)
-    ok, reason = _gate_patterns(direction, df_entry, price)
-    result.gate_log["patterns"] = "pass" if ok else f"fail: {reason}"
-    if not ok:
-        result.allowed = False
-        result.reasons.append(reason)
+    if not _maybe_skip("patterns"):
+        ok, reason = _gate_patterns(direction, df_entry, price)
+        result.gate_log["patterns"] = "pass" if ok else f"fail: {reason}"
+        if not ok:
+            result.allowed = False
+            result.reasons.append(reason)
 
-    # Gate 5: Spread filter (1 extra Alpaca quote call)
-    ok, reason, spread_pct = _gate_spread(ticker)
-    result.gate_log["spread"] = "pass" if ok else f"fail: {reason}"
-    if spread_pct is not None:
-        # Store actual spread for telemetry — see distribution after a week
-        result.gate_log["spread_pct"] = round(spread_pct, 3)
-    if not ok:
-        result.allowed = False
-        result.reasons.append(reason)
+    # Gate 5: Spread filter (1 extra Alpaca quote call) — universal
+    if not _maybe_skip("spread"):
+        ok, reason, spread_pct = _gate_spread(ticker)
+        result.gate_log["spread"] = "pass" if ok else f"fail: {reason}"
+        if spread_pct is not None:
+            # Store actual spread for telemetry — see distribution after a week
+            result.gate_log["spread_pct"] = round(spread_pct, 3)
+        if not ok:
+            result.allowed = False
+            result.reasons.append(reason)
 
     # Gate 6: Trade tape health (no extra API call — uses in-memory tape state)
-    ok, reason, tape_tele = _gate_tape(ticker)
-    result.gate_log["tape"] = "pass" if ok else f"fail: {reason}"
-    if tape_tele:
-        result.gate_log["tape_telemetry"] = tape_tele
-    if not ok:
-        result.allowed = False
-        result.reasons.append(reason)
+    if not _maybe_skip("tape"):
+        ok, reason, tape_tele = _gate_tape(ticker)
+        result.gate_log["tape"] = "pass" if ok else f"fail: {reason}"
+        if tape_tele:
+            result.gate_log["tape_telemetry"] = tape_tele
+        if not ok:
+            result.allowed = False
+            result.reasons.append(reason)
 
     return result
 
