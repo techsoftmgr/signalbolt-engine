@@ -59,6 +59,15 @@ class CompressionSetup:
     setup_type:   str = "COMPRESSION_BREAKOUT"
 
 
+@dataclass
+class CompressionZone:
+    """A staged compression envelope — detected on bar close, watched per-tick
+    for a breakout. No direction yet; that's decided by which edge price breaks."""
+    range_high: float
+    range_low:  float
+    atr:        float
+
+
 def _atr_hl(df: pd.DataFrame, period: int = 14) -> float:
     """High-low ATR over `period` bars. Intraday-friendly (no overnight gap)."""
     if df is None or len(df) < period:
@@ -130,3 +139,33 @@ def detect(df: pd.DataFrame, current_price: float) -> Optional[CompressionSetup]
             breakout_pct = (range_low - current_price) / range_low * 100,
         )
     return None
+
+
+def detect_zone(df: pd.DataFrame) -> Optional[CompressionZone]:
+    """
+    Detect a compression envelope WITHOUT requiring a breakout — used to stage
+    a ticker for per-tick breakout watching. Returns the {range_high, range_low,
+    atr} if the last COMPRESSION_BARS are tight, else None.
+
+    This is the staging half of the two-phase compression flow:
+      1. detect_zone() on bar close → stage envelope in stream watch set
+      2. per-tick check in stream.on_trade → fire when price crosses an edge
+    """
+    if df is None or len(df) < (COMPRESSION_BARS + 15):
+        return None
+    atr = _atr_hl(df, period=14)
+    if atr <= 0:
+        return None
+
+    comp_window = df.iloc[-COMPRESSION_BARS:]
+    bar_ranges  = (comp_window["high"].values.astype(float)
+                   - comp_window["low"].values.astype(float))
+    if float(bar_ranges.max()) > COMPRESSION_RATIO * atr:
+        return None
+
+    range_high = float(comp_window["high"].max())
+    range_low  = float(comp_window["low"].min())
+    if (range_high - range_low) > 1.0 * atr:
+        return None
+
+    return CompressionZone(range_high=range_high, range_low=range_low, atr=atr)
