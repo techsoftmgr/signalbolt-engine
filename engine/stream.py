@@ -144,6 +144,7 @@ _subscribed_tickers: set[str] = set()   # all tickers currently live on Alpaca
 _pending_tickers:    set[str] = set()   # requested before stream connected
 _wss_ref                      = None    # StockDataStream (set while stream is live)
 _on_trade_ref                 = None    # stored handler for re-subscriptions
+_on_bar_ref                   = None    # stored bar handler (dynamic bar subs)
 
 # ── Compression breakout watch (per-tick firing) ──────────────────────────────
 # Staged on bar close by runner._process_predictive_ticker; checked on EVERY
@@ -217,7 +218,7 @@ def _check_pullback_reclaim(ticker: str, price: float) -> None:
         _pullback_zones.pop(ticker, None)
     try:
         from engine.runner import fire_pullback_reclaim
-        _scan_executor.submit(fire_pullback_reclaim, ticker, direction, price)
+        _scan_executor.submit(fire_pullback_reclaim, ticker, direction, price, staged_ts)
     except Exception as e:
         logger.debug(f"[stream] pullback fire dispatch failed for {ticker}: {e}")
 
@@ -328,7 +329,7 @@ def _check_swing_breakout(ticker: str, price: float) -> None:
         _swing_zones.pop(ticker, None)
     try:
         from engine.runner import fire_swing_breakout
-        _scan_executor.submit(fire_swing_breakout, ticker, direction, price)
+        _scan_executor.submit(fire_swing_breakout, ticker, direction, price, staged_ts)
     except Exception as e:
         logger.debug(f"[stream] swing fire dispatch failed for {ticker}: {e}")
 
@@ -375,7 +376,7 @@ def _check_compression_breakout(ticker: str, price: float) -> None:
     # Dispatch the fire on the scan executor — never block the event loop
     try:
         from engine.runner import fire_compression_breakout
-        _scan_executor.submit(fire_compression_breakout, ticker, direction, price)
+        _scan_executor.submit(fire_compression_breakout, ticker, direction, price, staged_ts)
     except Exception as e:
         logger.debug(f"[stream] compression fire dispatch failed for {ticker}: {e}")
 
@@ -391,7 +392,7 @@ async def subscribe_extra_tickers(tickers: list[str]) -> None:
     Safe to call at any time — if the stream is not yet connected, the tickers are
     queued and applied as soon as the stream comes up (or on the next reconnect).
     """
-    global _subscribed_tickers, _pending_tickers, _wss_ref, _on_trade_ref
+    global _subscribed_tickers, _pending_tickers, _wss_ref, _on_trade_ref, _on_bar_ref
 
     new = [t for t in tickers if t not in _subscribed_tickers]
     if not new:
@@ -399,18 +400,22 @@ async def subscribe_extra_tickers(tickers: list[str]) -> None:
 
     _subscribed_tickers.update(new)
 
-    if _wss_ref is None or _on_trade_ref is None:
+    if _wss_ref is None or _on_trade_ref is None or _on_bar_ref is None:
         _pending_tickers.update(new)
         logger.debug(f"[stream] Queued dynamic tickers (stream not ready yet): {new}")
         return
 
-    # subscribe_trades() calls asyncio.run_coroutine_threadsafe().result()
-    # internally — blocks the calling thread, not the FastAPI event loop.
-    # Run it in an executor so we don't block the async event loop.
+    # subscribe_trades()/subscribe_bars() call asyncio.run_coroutine_threadsafe()
+    # internally — blocks the calling thread, not the FastAPI event loop. Run in
+    # an executor so we don't block the async event loop.
     loop = asyncio.get_running_loop()
     try:
         await loop.run_in_executor(None, _wss_ref.subscribe_trades, _on_trade_ref, *new)
-        logger.info(f"[stream] ✅ Dynamic trade subscription added: {new}")
+        # CRITICAL: also subscribe BARS. Breakout confirmation runs on the 1m bar
+        # close (on_bar); without a bar subscription, dynamically-added movers
+        # would get trades but no bars → their armed zones could never confirm.
+        await loop.run_in_executor(None, _wss_ref.subscribe_bars, _on_bar_ref, *new)
+        logger.info(f"[stream] ✅ Dynamic trade+bar subscription added: {new}")
     except Exception as e:
         # Stream may be mid-reconnect — pending set ensures retry on next connect
         _pending_tickers.update(new)
@@ -1335,7 +1340,7 @@ async def run_stream() -> None:
     feed_env  = os.environ.get("ALPACA_DATA_FEED", "sip").lower()
     feed      = DataFeed.SIP if feed_env == "sip" else DataFeed.IEX
 
-    global _subscribed_tickers, _pending_tickers, _wss_ref, _on_trade_ref
+    global _subscribed_tickers, _pending_tickers, _wss_ref, _on_trade_ref, _on_bar_ref
 
     from engine.runner import ALL_TICKERS, SCALP_TICKERS
     scalp_set = set(SCALP_TICKERS)
@@ -1430,6 +1435,25 @@ async def run_stream() -> None:
                 # Uses _rt_executor (dedicated) so strategy scans never delay this.
                 _rt_executor.submit(_check_scalp_levels, symbol, bar_high, bar_low)
 
+                # ── Per-1m-CLOSE breakout/reclaim confirmation ────────────────
+                # Compression / pullback / swing-breakout fire here (not per-tick)
+                # so they require the 1-minute bar to CLOSE beyond the level —
+                # body confirmation. A tall wick that retraces by the close no
+                # longer triggers a false breakout. `close` is the bar body, not
+                # an intrabar high/low.
+                try:
+                    _check_compression_breakout(symbol, close)
+                except Exception:
+                    pass
+                try:
+                    _check_pullback_reclaim(symbol, close)
+                except Exception:
+                    pass
+                try:
+                    _check_swing_breakout(symbol, close)
+                except Exception:
+                    pass
+
                 # ── Scalping: every 5-min bar close, per ticker ───────────────
                 # Fires for each SCALP ticker individually as its bar arrives.
                 # This gives sub-5-second latency per ticker (vs polling which
@@ -1506,31 +1530,11 @@ async def run_stream() -> None:
                 except Exception:
                     pass
 
-                # 1c. Per-tick compression breakout check — fires the INSTANT
-                #     price crosses a staged compression envelope. This is the
-                #     fast path that catches breakouts mid-bar instead of at the
-                #     next 15m scan. In-memory dict lookup, near-zero cost.
-                try:
-                    _check_compression_breakout(ticker, price)
-                except Exception:
-                    pass
-
-                # 1d. Per-tick pullback reclaim check — fires when price crosses
-                #     a staged swing-reclaim level. Same repaint-safe price-cross
-                #     logic as compression. In-memory lookup, near-zero cost.
-                try:
-                    _check_pullback_reclaim(ticker, price)
-                except Exception:
-                    pass
-
-                # 1e. Per-tick swing-high breakout — fires when price breaks the
-                #     recent swing high/low. Broader than compression (catches
-                #     momentum breaks without a tight coil). Noisier — relies on
-                #     the gate stack to filter fakeouts.
-                try:
-                    _check_swing_breakout(ticker, price)
-                except Exception:
-                    pass
+                # NOTE: breakout/reclaim confirmation moved OFF the per-tick path
+                # (2026-05-28). Firing on a single trade tick crossing the level
+                # fired on intrabar WICKS that immediately retraced (NVDA false
+                # positive). The three _check_* detectors now run in on_bar on the
+                # 1-minute CLOSE (body confirmation) so a wick alone can't trigger.
 
                 # 2. Real-time T1/T2/SL check for ALL active non-scalp signals.
                 #    Throttled to at most once per second per ticker so we don't
@@ -1575,6 +1579,7 @@ async def run_stream() -> None:
             # ── Register live references for dynamic ticker subscriptions ──
             _wss_ref      = wss
             _on_trade_ref = on_trade
+            _on_bar_ref   = on_bar
 
             # Apply any tickers that were requested by WS clients before
             # this connection was established (or queued during a reconnect).
@@ -1606,6 +1611,7 @@ async def run_stream() -> None:
             # Re-queue any dynamic tickers so they're reapplied on next connect.
             _wss_ref      = None
             _on_trade_ref = None
+            _on_bar_ref   = None
             dynamic = _subscribed_tickers - set(all_subscribe)
             if dynamic:
                 _pending_tickers.update(dynamic)
@@ -1626,6 +1632,7 @@ async def run_stream() -> None:
                 logger.debug(f"[stream] wss.stop() error (non-fatal): {_se}")
             _wss_ref      = None
             _on_trade_ref = None
+            _on_bar_ref   = None
             logger.info("[stream] Stream task cancelled — shutting down")
             _scan_executor.shutdown(wait=False)
             _rt_executor.shutdown(wait=False)
@@ -1634,6 +1641,7 @@ async def run_stream() -> None:
         except Exception as e:
             _wss_ref      = None
             _on_trade_ref = None
+            _on_bar_ref   = None
             sentry_sdk.capture_exception(e)
             err_str = str(e).lower()
             # Treat connection limit, 429, AND TimeoutError the same way:
