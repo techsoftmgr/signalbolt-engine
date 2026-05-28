@@ -2891,6 +2891,91 @@ async def admin_detector_stats(request: Request, days: int = 7):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/admin/detector-scorecard")
+async def admin_detector_scorecard(request: Request, days: int = 30, cost_pct: float = 0.10):
+    """
+    Realized-edge scorecard per detector — the "what to keep / cut" view. For
+    each detector_source, over CLOSED signals in the window, computes:
+
+      win_rate, avg_win%, avg_loss%, payoff (avg_win/|avg_loss|),
+      expectancy_gross% = mean realized result_pct per trade,
+      expectancy_net%   = gross − round-trip cost (default 0.10%),
+      verdict (KEEP / WATCH / CUT, sample-size aware).
+
+    Expectancy per trade is the honest bottom line: positive net = the detector
+    makes money after costs; negative = it bleeds. Admin only.
+    """
+    _user_id, sb = _require_admin_jwt(request)
+    from datetime import datetime, timezone, timedelta
+    days     = max(1, min(days, 120))
+    cost_pct = max(0.0, min(cost_pct, 2.0))
+    since    = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    _MIN_N   = 15   # below this, sample is too small to trust a verdict
+
+    try:
+        rows = (
+            sb.table("signals")
+              .select("result, result_pct, status, score_breakdown, created_at")
+              .eq("status", "closed")
+              .gte("created_at", since)
+              .limit(5000)
+              .execute()
+        ).data or []
+
+        det: dict[str, dict] = {}
+        for r in rows:
+            bd  = r.get("score_breakdown") or {}
+            src = bd.get("detector_source") or "SMC"
+            pct = r.get("result_pct")
+            if pct is None:
+                continue
+            pct = float(pct)
+            d = det.setdefault(src, {"n": 0, "wins": 0, "losses": 0,
+                                     "win_sum": 0.0, "loss_sum": 0.0, "pnl_sum": 0.0})
+            d["n"] += 1
+            d["pnl_sum"] += pct
+            if r.get("result") == "win" or pct > 0:
+                d["wins"] += 1; d["win_sum"] += pct
+            else:
+                d["losses"] += 1; d["loss_sum"] += pct
+
+        out = []
+        for src, d in det.items():
+            n = d["n"]
+            win_rate = round(d["wins"] / n * 100, 1) if n else None
+            avg_win  = round(d["win_sum"]  / d["wins"],   3) if d["wins"]   else None
+            avg_loss = round(d["loss_sum"] / d["losses"], 3) if d["losses"] else None
+            payoff   = round(avg_win / abs(avg_loss), 2) if (avg_win and avg_loss) else None
+            exp_gross = round(d["pnl_sum"] / n, 3) if n else None
+            exp_net   = round(exp_gross - cost_pct, 3) if exp_gross is not None else None
+
+            if n < _MIN_N:
+                verdict = "WATCH"; reason = f"low sample (n={n})"
+            elif exp_net is None:
+                verdict = "WATCH"; reason = "no data"
+            elif exp_net >= 0.10:
+                verdict = "KEEP"; reason = f"+{exp_net}%/trade after costs"
+            elif exp_net <= -0.05:
+                verdict = "CUT"; reason = f"{exp_net}%/trade after costs"
+            else:
+                verdict = "WATCH"; reason = "marginal edge"
+
+            out.append({"detector": src, "n": n, "win_rate": win_rate,
+                        "avg_win": avg_win, "avg_loss": avg_loss, "payoff": payoff,
+                        "expectancy_gross": exp_gross, "expectancy_net": exp_net,
+                        "verdict": verdict, "reason": reason})
+
+        # Rank best → worst by net expectancy (None last)
+        out.sort(key=lambda x: (x["expectancy_net"] is None, -(x["expectancy_net"] or -999)))
+        return {"since": since, "days": days, "cost_pct": cost_pct,
+                "min_sample": _MIN_N, "detectors": out}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GET /admin/detector-scorecard error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/admin/zone-history")
 async def admin_zone_history(request: Request, days: int = 7):
     """
