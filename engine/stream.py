@@ -236,20 +236,17 @@ def _arm_retest(ticker: str, direction: str, level: float, atr: float, detector:
     logger.info(f"[stream] {ticker} {detector} broke {direction} @ {level:.2f} — awaiting retest")
 
 
-_zones_cleared_day = None   # date we last cleared zones at the close
-
-
 def clear_all_zones() -> None:
-    """Clear all armed per-tick zones — called at market close so the admin
-    display doesn't show stale intraday zones after hours; they re-arm next
-    session."""
+    """Clear all armed per-tick zones — called by the overnight scheduler
+    (~12:30 AM ET) so zones survive after-hours for admin analysis and re-arm
+    fresh next session."""
     with _compression_lock:  _compression_zones.clear()
     with _pullback_lock:     _pullback_zones.clear()
     with _swing_lock:        _swing_zones.clear()
     with _zone_relaxed_lock: _zone_relaxed.clear()
     with _retest_lock:       _retest_pending.clear()
     _persist_zones(force=True)
-    logger.info("[stream] Cleared all armed zones (market close)")
+    logger.info("[stream] Cleared all armed zones (overnight)")
 
 
 def _check_retest(ticker: str, close: float,
@@ -1624,7 +1621,7 @@ async def run_stream() -> None:
             wss = StockDataStream(api_key, api_secret, feed=feed)
 
             async def on_bar(bar) -> None:
-                global _last_15m_barrier, _last_1h_barrier, _zones_cleared_day
+                global _last_15m_barrier, _last_1h_barrier
 
                 symbol   = bar.symbol
                 close    = float(bar.close)
@@ -1642,14 +1639,10 @@ async def run_stream() -> None:
                 hour    = ts_et.hour
                 min_key = hour * 60 + minute   # unique key per minute-of-day (0-1439)
 
-                # ── EOD: clear armed zones at/after the close (once/day) so the
-                #    admin display doesn't show stale intraday zones after hours.
-                if hour >= 16 and _zones_cleared_day != ts_et.date():
-                    _zones_cleared_day = ts_et.date()
-                    try:
-                        clear_all_zones()
-                    except Exception:
-                        pass
+                # NOTE: armed zones are NOT cleared at the close — they're kept
+                # through after-hours for analysis. A scheduled job clears them
+                # ~00:30 ET (runner._clear_zones_overnight) so the next session
+                # starts fresh.
 
                 # ── EVERY bar: check scalp T1/SL in real-time ─────────────────
                 # Uses bar high/low (wicks) so we catch levels touched intra-bar.
