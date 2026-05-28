@@ -1447,6 +1447,10 @@ def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
         "confidence_grade":   "B+",   # predictive setups default tier
         "setup_type":         setup_name,
     }
+    _det2 = "COMPRESSION" if setup_name == "COMPRESSION_BREAKOUT" else "PULLBACK"
+    if _det2 in _SHADOW_DETECTORS:
+        _log_shadow_fire(sb, ticker, direction, strategy_type, price, adjusted_score, _det2, entry_gate_log)
+        return
     new_sig_id = _write_signal(sb, signal_row)
     try:
         push.send_signal_alert(
@@ -1455,6 +1459,32 @@ def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
         )
     except Exception:
         pass
+
+
+# ── Shadow mode for predictive detectors ──────────────────────────────────────
+# PULLBACK / SWING_BREAKOUT / COMPRESSION went 0-for-6 live (2026-05-28). Per
+# user decision, they no longer fire live signals (no card/push). Instead each
+# would-be fire is logged to entry_gate_rejections (tagged shadow_detector) so
+# the daily gate_validator backtests would_have_won — we keep measuring their
+# edge while keeping unproven signals off the phone. SMC stays live. Zones still
+# arm (staging unchanged) so the armed-zone view + relaxed badges keep working.
+_SHADOW_DETECTORS = {"COMPRESSION", "PULLBACK", "SWING_BREAKOUT"}
+
+
+def _log_shadow_fire(sb, ticker: str, direction: str, strategy_type: str,
+                     price: float, score: float, detector: str, gate_log: dict) -> None:
+    try:
+        gl = dict(gate_log or {}); gl["shadow_detector"] = detector
+        sb.table("entry_gate_rejections").insert({
+            "ticker": ticker, "direction": direction, "strategy_type": strategy_type,
+            "price": round(float(price), 4) if price else None,
+            "confidence_score": round(float(score), 2) if score else None,
+            "gate_log": gl,
+            "reasons": [f"shadow: {detector} live-fire disabled (measuring)"],
+        }).execute()
+        logger.info(f"[runner] {ticker} {detector} SHADOW (not fired live) {direction} @ ${price:.2f}")
+    except Exception as e:
+        logger.debug(f"[runner] shadow log failed for {ticker}: {e}")
 
 
 def _fire_per_tick_predictive(ticker: str, direction: str, price: float,
@@ -1562,6 +1592,9 @@ def _fire_per_tick_predictive(ticker: str, direction: str, price: float,
         "confidence_grade":   "B+",
         "setup_type":         setup_type,
     }
+    if detector in _SHADOW_DETECTORS:
+        _log_shadow_fire(sb, ticker, direction, strategy_type, price, adjusted_score, detector, entry_gate_log)
+        return
     new_sig_id = _write_signal(sb, signal_row)
     try:
         push.send_signal_alert(ticker, direction, adjusted_score, "stock",
