@@ -1288,6 +1288,21 @@ def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
     if df is None or df.empty or not price:
         return
 
+    # ── Stage compression zone for per-tick breakout watching ───────────
+    # If this ticker is in tight consolidation (no breakout yet), register
+    # its envelope so stream.on_trade can fire the INSTANT price crosses the
+    # edge — instead of waiting for the next 15m scan. This is the fix for
+    # missing breakouts that happen mid-bar.
+    try:
+        zone = compression_detector.detect_zone(df)
+        from engine import stream as _stream
+        if zone is not None:
+            _stream.stage_compression_zone(ticker, zone.range_high, zone.range_low, zone.atr)
+        else:
+            _stream.clear_compression_zone(ticker)
+    except Exception:
+        pass
+
     # Try compression breakout first
     setup_name: str  = ""
     setup_reason: str = ""
@@ -1404,6 +1419,115 @@ def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
             ticker, direction, adjusted_score, "stock",
             signal_id=str(new_sig_id) if new_sig_id else None,
         )
+    except Exception:
+        pass
+
+
+def fire_compression_breakout(ticker: str, direction: str, price: float) -> None:
+    """
+    Fire a compression-breakout signal from a per-tick trigger (stream.on_trade).
+    Called the INSTANT price crosses a staged compression envelope — this is the
+    fast path that catches breakouts mid-bar instead of waiting for the next
+    15m scan.
+
+    Self-contained: creates its own Supabase client, fetches bars for SL/TP,
+    runs the same entry_gate + risk checks as scan-fired signals. Deduped by
+    the active-signal check + DB unique index.
+    """
+    try:
+        sb = create_client(os.environ["SUPABASE_URL"], _supabase_key())
+    except Exception as e:
+        logger.debug(f"[runner] compression fire — supabase init failed: {e}")
+        return
+
+    strategy_type = "day_trade"
+    if _has_active_signal(sb, ticker, strategy_type):
+        return
+
+    try:
+        from engine import alpaca_client as _alpaca
+        df = _alpaca.get_bars(ticker, timeframe="15m", days=5)
+    except Exception:
+        return
+    if df is None or df.empty:
+        return
+
+    setup_reason = f"Compression breakout (per-tick) — {direction} @ ${price:.2f}"
+    logger.info(f"[runner] {ticker} COMPRESSION BREAKOUT (per-tick) {direction} @ ${price:.2f}")
+
+    # SL/TP
+    sltp = sl_tp_engine.calculate(
+        direction=direction, entry=price, df=df,
+        regime={}, session={}, gamma={"available": False},
+        strategy_type=strategy_type, interval="15m",
+    )
+    if not sltp.get("valid"):
+        logger.info(f"[runner] {ticker} compression — R:R too low, skipping")
+        return
+
+    # Entry gate (same stack as everything else)
+    entry_gate_log: dict = {}
+    try:
+        gate = entry_gate.check(
+            ticker=ticker, direction=direction, strategy_type=strategy_type,
+            df_entry=df, price=price, entry_tf="15m",
+        )
+        entry_gate_log = dict(gate.gate_log)
+        if not gate.allowed:
+            logger.info(f"[runner] {ticker} compression blocked by gate: {' | '.join(gate.reasons)}")
+            entry_gate.log_rejection(
+                sb=sb, ticker=ticker, direction=direction, strategy_type=strategy_type,
+                price=price, confidence_score=75, gate=gate,
+            )
+            return
+    except Exception as e:
+        logger.warning(f"[runner] {ticker} compression gate error (failing open): {e}")
+        entry_gate_log = {"error": str(e)}
+
+    risk = risk_manager.check(sb, ticker, 75)
+    if not risk["allowed"]:
+        logger.info(f"[runner] {ticker} compression blocked — portfolio: {risk['block_reason']}")
+        return
+
+    _tape_b = _tape_bonus(ticker)
+    adjusted_score = max(0, min(100, 75 + _tape_b.get("bonus", 0)))
+
+    signal_row = {
+        "ticker":             ticker,
+        "direction":          direction,
+        "entry_price":        round(price, 2),
+        "stop_loss":          sltp["stop_loss"],
+        "target_one":         sltp["target_one"],
+        "target_two":         sltp["target_two"],
+        "confidence_score":   adjusted_score,
+        "confidence_factors": [setup_reason] + _tape_b.get("reasons", []),
+        "timeframe":          "15m",
+        "strategy_type":      strategy_type,
+        "status":             "active",
+        "ai_explanation":     setup_reason,
+        "regime_type":        "",
+        "session_mode":       "",
+        "confidence_tier":    risk["confidence_tier"],
+        "position_multiplier": risk["position_mult"],
+        "sl_adjustments":     sltp.get("adjustments", []),
+        "risk_reward":        sltp["risk_reward_1"],
+        "score_breakdown":    {
+            "detector_source":   "COMPRESSION",
+            "predictive_setup":  "COMPRESSION_BREAKOUT",
+            "predictive_reason": setup_reason,
+            "fire_path":         "per_tick",
+            "entry_gate":        entry_gate_log,
+            "sl_width_pct":      round(abs(price - sltp["stop_loss"]) / price * 100, 3),
+            "atr_used":          round(sltp.get("atr", 0), 4),
+            "tape_bonus":        _tape_b,
+        },
+        "confidence_grade":   "B+",
+        "setup_type":         "COMPRESSION_BREAKOUT",
+    }
+    new_sig_id = _write_signal(sb, signal_row)
+    try:
+        push.send_signal_alert(ticker, direction, adjusted_score, "stock",
+                               signal_id=str(new_sig_id) if new_sig_id else None)
     except Exception:
         pass
 

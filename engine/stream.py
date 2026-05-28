@@ -145,6 +145,78 @@ _pending_tickers:    set[str] = set()   # requested before stream connected
 _wss_ref                      = None    # StockDataStream (set while stream is live)
 _on_trade_ref                 = None    # stored handler for re-subscriptions
 
+# ── Compression breakout watch (per-tick firing) ──────────────────────────────
+# Staged on bar close by runner._process_predictive_ticker; checked on EVERY
+# tick in on_trade so a breakout fires the instant price crosses the envelope
+# edge — not at the next 15m scan. {ticker: (range_high, range_low, atr, staged_ts)}
+import threading as _threading
+_compression_zones: dict[str, tuple] = {}
+_compression_lock = _threading.Lock()
+_compression_fired: dict[str, float] = {}      # ticker -> last fire ts (re-fire throttle)
+_COMPRESSION_ZONE_TTL   = 2 * 3600             # drop a staged zone after 2h
+_COMPRESSION_FIRE_THROTTLE = 1800              # don't re-fire same ticker within 30 min
+_COMPRESSION_BREAKOUT_PCT  = 0.10              # price must clear edge by this % (anti-wick)
+
+
+def stage_compression_zone(ticker: str, range_high: float, range_low: float, atr: float) -> None:
+    """Register a compression envelope for per-tick breakout watching."""
+    import time as _t
+    with _compression_lock:
+        _compression_zones[ticker] = (range_high, range_low, atr, _t.time())
+
+
+def clear_compression_zone(ticker: str) -> None:
+    """Remove a ticker from the compression watch (no longer compressed)."""
+    with _compression_lock:
+        _compression_zones.pop(ticker, None)
+
+
+def _check_compression_breakout(ticker: str, price: float) -> None:
+    """
+    Called on every tick. If `ticker` has a staged compression zone and price
+    just crossed an edge, fire a breakout signal via runner (in the scan
+    executor so we don't block the event loop).
+    """
+    import time as _t
+    zone = _compression_zones.get(ticker)
+    if zone is None:
+        return
+    range_high, range_low, atr, staged_ts = zone
+    now = _t.time()
+
+    # Expire stale zones
+    if now - staged_ts > _COMPRESSION_ZONE_TTL:
+        with _compression_lock:
+            _compression_zones.pop(ticker, None)
+        return
+
+    # Re-fire throttle
+    if now - _compression_fired.get(ticker, 0) < _COMPRESSION_FIRE_THROTTLE:
+        return
+
+    upper = range_high * (1 + _COMPRESSION_BREAKOUT_PCT / 100)
+    lower = range_low  * (1 - _COMPRESSION_BREAKOUT_PCT / 100)
+
+    direction = None
+    if price >= upper:
+        direction = "LONG"
+    elif price <= lower:
+        direction = "SHORT"
+    if direction is None:
+        return
+
+    # Mark fired + remove zone (one breakout per staging) before dispatching
+    with _compression_lock:
+        _compression_fired[ticker] = now
+        _compression_zones.pop(ticker, None)
+
+    # Dispatch the fire on the scan executor — never block the event loop
+    try:
+        from engine.runner import fire_compression_breakout
+        _scan_executor.submit(fire_compression_breakout, ticker, direction, price)
+    except Exception as e:
+        logger.debug(f"[stream] compression fire dispatch failed for {ticker}: {e}")
+
 
 async def subscribe_extra_tickers(tickers: list[str]) -> None:
     """
@@ -1265,6 +1337,15 @@ async def run_stream() -> None:
                 try:
                     from engine import trade_tape
                     trade_tape.record_trade(ticker, price, size)
+                except Exception:
+                    pass
+
+                # 1c. Per-tick compression breakout check — fires the INSTANT
+                #     price crosses a staged compression envelope. This is the
+                #     fast path that catches breakouts mid-bar instead of at the
+                #     next 15m scan. In-memory dict lookup, near-zero cost.
+                try:
+                    _check_compression_breakout(ticker, price)
                 except Exception:
                     pass
 
