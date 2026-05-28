@@ -107,37 +107,67 @@ def _check_levels(signal: dict, price: float) -> Optional[dict]:
     hit_target = None
     result     = None
 
+    # IMPORTANT: T1 does NOT close the signal. Hitting T1 moves the stop to
+    # breakeven (signal_monitor) and the position RIDES toward T2 with a
+    # trailing stop. Closing at T1 here was the SMCI bug (2026-05-28): the
+    # tracker force-closed a "riding to T2" signal the moment price ticked
+    # past T1, booking a random in-between price as a "T1 win".
+    #
+    # Close only on:
+    #   • T2 reached         → full target win
+    #   • price <= stop (LONG) / >= stop (SHORT) → exit at the (possibly
+    #     trailed) stop. Win if the trailed stop locked profit above entry,
+    #     scratch/loss otherwise.
+    at_breakeven_or_trailed = (is_long and stop >= entry - 0.01) or \
+                              (not is_long and stop <= entry + 0.01)
+
     if is_long:
         if price >= target_two:
             hit_target, result = "t2", "win"
-        elif price >= target_one:
-            hit_target, result = "t1", "win"
         elif price <= stop:
-            hit_target, result = "sl", "loss"
+            if at_breakeven_or_trailed and stop > entry + 0.01:
+                hit_target, result = "trail", "win"      # trailed stop locked profit
+            elif at_breakeven_or_trailed:
+                hit_target, result = "breakeven", "win"  # scratched at BE (counts as win/flat)
+            else:
+                hit_target, result = "sl", "loss"
     else:
         if price <= target_two:
             hit_target, result = "t2", "win"
-        elif price <= target_one:
-            hit_target, result = "t1", "win"
         elif price >= stop:
-            hit_target, result = "sl", "loss"
+            if at_breakeven_or_trailed and stop < entry - 0.01:
+                hit_target, result = "trail", "win"
+            elif at_breakeven_or_trailed:
+                hit_target, result = "breakeven", "win"
+            else:
+                hit_target, result = "sl", "loss"
 
     if result is None:
         return None
 
-    # P&L — always positive for wins, negative for losses
-    if is_long:
-        pnl_pct = ((price - entry) / entry) * 100
-        pnl_abs = price - entry
+    # Exit price = the actual level that triggered, not the (possibly
+    # gapped-past) current tick. T2 → exit at T2; stop hit → exit at stop.
+    # This stops the tracker from booking a random in-between price.
+    if hit_target == "t2":
+        exit_price = target_two
+    elif hit_target in ("trail", "breakeven", "sl"):
+        exit_price = stop
     else:
-        pnl_pct = ((entry - price) / entry) * 100
-        pnl_abs = entry - price
+        exit_price = price
+
+    if is_long:
+        pnl_pct = ((exit_price - entry) / entry) * 100
+        pnl_abs = exit_price - entry
+    else:
+        pnl_pct = ((entry - exit_price) / entry) * 100
+        pnl_abs = entry - exit_price
 
     return {
         "result":       result,
         "hit_target":   hit_target,
         "result_pct":   round(pnl_pct, 4),
         "result_pnl":   round(pnl_abs, 4),
+        "exit_price":   round(exit_price, 4),
         "status":       "closed",
         "closed_reason": "target_hit" if result == "win" else "stop_hit",
         "closed_at":    datetime.now(timezone.utc).isoformat(),
@@ -164,19 +194,26 @@ def _log_event(sb: Client, signal_id: str, outcome: dict) -> None:
     """Write a closed_win / closed_loss event to signal_events — best-effort."""
     try:
         result     = outcome["result"]
-        hit        = outcome.get("hit_target", "").upper()
+        hit        = outcome.get("hit_target", "")
         pct        = outcome.get("result_pct", 0)
+        exit_price = outcome.get("exit_price")
         event_type = "closed_win" if result == "win" else "closed_loss"
-        hit_map    = {"T1": "Target 1", "T2": "Target 2", "SL": "Stop Loss"}
-        hit_label  = hit_map.get(hit, hit)
-        note = (
-            f"{hit_label} hit — closed +{pct:.1f}%"
-            if result == "win"
-            else f"{hit_label} hit — stopped out {pct:.1f}%"
-        )
+        px_str     = f"${exit_price:.2f}" if exit_price is not None else "market"
+        # Accurate, reason-specific note — no more misleading "Target 1 hit"
+        # when the real exit was a trailing stop at a different price.
+        label = {
+            "t2":        f"🎯 Target 2 hit @ {px_str}",
+            "t1":        f"🎯 Target 1 hit @ {px_str}",
+            "trail":     f"📈 Trailing stop @ {px_str}",
+            "breakeven": f"⚖️ Closed at breakeven @ {px_str}",
+            "sl":        f"🛑 Stop loss hit @ {px_str}",
+        }.get(hit, f"Closed @ {px_str}")
+        sign = "+" if pct >= 0 else ""
+        note = f"{label} ({sign}{pct:.1f}%)"
         sb.table("signal_events").insert({
             "signal_id":  signal_id,
             "event_type": event_type,
+            "price":      float(exit_price) if exit_price is not None else None,
             "note":       note,
         }).execute()
     except Exception as e:

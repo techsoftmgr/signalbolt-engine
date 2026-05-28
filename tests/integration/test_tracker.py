@@ -95,14 +95,39 @@ class TestOutcomeDetection:
         update_data = update_calls[0][0][0]
         assert update_data.get("result") == "loss" or update_data.get("status") == "closed"
 
-    def test_long_t1_hit_closes_as_win(self):
-        sig = _signal(direction="LONG", entry=180.0, sl=177.0, t1=183.0)
-        mock_sb = self._run_pass([sig], prices={"AAPL": 184.0})  # above T1
+    def test_long_t1_hit_does_NOT_close(self):
+        # NEW behavior (2026-05-28): T1 no longer closes the signal. It moves
+        # the stop to breakeven (signal_monitor) and rides to T2 with a
+        # trailing stop. Price between T1 and T2 → tracker leaves it open.
+        sig = _signal(direction="LONG", entry=180.0, sl=177.0, t1=183.0, t2=186.0)
+        mock_sb = self._run_pass([sig], prices={"AAPL": 184.0})  # above T1, below T2
+
+        update_calls = mock_sb.table.return_value.update.call_args_list
+        # Must NOT have closed it as a win at T1
+        for call in update_calls:
+            data = call[0][0]
+            assert data.get("status") != "closed", "T1 should not close — rides to T2"
+
+    def test_long_t2_hit_closes_as_win(self):
+        sig = _signal(direction="LONG", entry=180.0, sl=177.0, t1=183.0, t2=186.0)
+        mock_sb = self._run_pass([sig], prices={"AAPL": 187.0})  # above T2
 
         update_calls = mock_sb.table.return_value.update.call_args_list
         assert len(update_calls) > 0
         update_data = update_calls[0][0][0]
         assert update_data.get("result") == "win" or update_data.get("status") == "closed"
+
+    def test_long_trailed_stop_closes_as_win(self):
+        # After T1 the stop trails up above entry. Price hitting that trailed
+        # stop should close as a WIN (locked profit), not a loss.
+        sig = _signal(direction="LONG", entry=180.0, sl=184.0, t1=183.0, t2=186.0)
+        mock_sb = self._run_pass([sig], prices={"AAPL": 183.5})  # at/below trailed stop 184
+
+        update_calls = mock_sb.table.return_value.update.call_args_list
+        assert len(update_calls) > 0
+        update_data = update_calls[0][0][0]
+        assert update_data.get("status") == "closed"
+        assert update_data.get("result") == "win"
 
     def test_short_sl_hit_closes_as_loss(self):
         sig = _signal(ticker="NVDA", direction="SHORT",
