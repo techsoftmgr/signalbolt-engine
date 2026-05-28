@@ -1734,6 +1734,24 @@ def _close_signals(sb: Client) -> None:
             try:
                 sb.table("signals").update(update).eq("id", sig["id"]).execute()
                 logger.info(f"[closer] CLOSED stock {sig['ticker']} [{strategy}] ({reason})")
+                # Log a close event so the signal history shows the exit price +
+                # time (the batch closer previously updated the row silently —
+                # SIDU stopped out with no 'stopped out @ $X' entry, 2026-05-28).
+                if close_price is not None:
+                    _pct = update.get("result_pct")
+                    _ptxt = f" ({_pct:+.1f}%)" if _pct is not None else ""
+                    if reason == "stop_hit":
+                        ev, emo, label = "closed_loss", "🛑", "Stopped out"
+                    elif reason == "target_hit":
+                        ev, emo, label = "closed_win", "✅", "Target hit"
+                    else:
+                        ev, emo, label = "expired", "⏳", "Expired"
+                    sb.table("signal_events").insert({
+                        "signal_id":  sig["id"],
+                        "event_type": ev,
+                        "price":      round(float(close_price), 4),
+                        "note":       f"{emo} {label} @ ${close_price:.2f}{_ptxt}",
+                    }).execute()
             except Exception as e:
                 logger.error(f"[closer] close failed for {sig['ticker']}: {e}")
 

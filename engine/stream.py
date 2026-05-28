@@ -1180,14 +1180,16 @@ def _warn_near_stop(sig: dict, price: float) -> None:
         sl      = float(sig["stop_loss"])
         is_long = sig["direction"] == "LONG"
 
-        pnl_pct   = ((price - entry) / entry * 100) if is_long else ((entry - price) / entry * 100)
-        stop_dist = abs(entry - sl)
+        pnl_pct    = ((price - entry) / entry * 100) if is_long else ((entry - price) / entry * 100)
         dist_to_sl = abs(price - sl)
-        pct_of_stop = (dist_to_sl / stop_dist * 100) if stop_dist > 0 else 100
+        dist_pct   = (dist_to_sl / price * 100) if price else 0   # true price distance
 
+        # Clear wording: dollar + true price distance to the stop (not "% of the
+        # stop buffer", which read as a price move and confused). No "act fast".
         note = (
-            f"⚠️ Near Stop — ${price:.2f} is {pct_of_stop:.0f}% away from "
-            f"stop ${sl:.2f} — P&L: {'+' if pnl_pct >= 0 else ''}{pnl_pct:.1f}% — Act fast"
+            f"⚠️ Near Stop — ${price:.2f} · stop ${sl:.2f} "
+            f"(${dist_to_sl:.2f} / {dist_pct:.1f}% away) · "
+            f"P&L {'+' if pnl_pct >= 0 else ''}{pnl_pct:.1f}%"
         )
 
         key = os.environ.get("SUPABASE_KEY") or os.environ["SUPABASE_SECRET_KEY"]
