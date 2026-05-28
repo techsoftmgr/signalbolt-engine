@@ -242,6 +242,49 @@ def clear_swing_zone(ticker: str) -> None:
         _swing_zones.pop(ticker, None)
 
 
+# ── Zone persistence across worker restarts ───────────────────────────────────
+# Staged zones live in worker memory; every deploy/restart wiped them, so the
+# per-tick detectors reset to zero (the "no signals all day" bug 2026-05-28
+# during heavy iteration). Persist the three zone dicts to Redis on stage and
+# reload on startup so zones survive restarts. Per-tick reads stay in-memory
+# (fast); Redis is only touched on stage (infrequent, scan cadence) + startup.
+_ZONE_REDIS_KEY = "stream:zones:v1"
+_ZONE_TTL_SEC   = 2 * 3600
+
+
+def _persist_zones() -> None:
+    """Write all three zone dicts to Redis (called after staging in a scan)."""
+    try:
+        from engine import cache
+        snap = {
+            "compression": {k: list(v) for k, v in _compression_zones.items()},
+            "pullback":    {k: list(v) for k, v in _pullback_zones.items()},
+            "swing":       {k: list(v) for k, v in _swing_zones.items()},
+        }
+        cache.kv.set_json(_ZONE_REDIS_KEY, snap, ttl_sec=_ZONE_TTL_SEC)
+    except Exception as e:
+        logger.debug(f"[stream] zone persist failed: {e}")
+
+
+def load_zones_from_redis() -> None:
+    """Restore staged zones from Redis on worker startup (survives restarts)."""
+    try:
+        from engine import cache
+        snap = cache.kv.get_json(_ZONE_REDIS_KEY)
+        if not snap:
+            return
+        with _compression_lock:
+            _compression_zones.update({k: tuple(v) for k, v in (snap.get("compression") or {}).items()})
+        with _pullback_lock:
+            _pullback_zones.update({k: tuple(v) for k, v in (snap.get("pullback") or {}).items()})
+        with _swing_lock:
+            _swing_zones.update({k: tuple(v) for k, v in (snap.get("swing") or {}).items()})
+        logger.info(f"[stream] Restored zones from Redis — "
+                    f"comp={len(_compression_zones)} pb={len(_pullback_zones)} swing={len(_swing_zones)}")
+    except Exception as e:
+        logger.debug(f"[stream] zone restore failed: {e}")
+
+
 def _check_swing_breakout(ticker: str, price: float) -> None:
     """Called every tick. Fire when price breaks the staged swing high/low."""
     import time as _t
@@ -1302,6 +1345,10 @@ async def run_stream() -> None:
         logger.warning(f"[stream] Could not load active-signal tickers on startup: {_e}")
 
     _subscribed_tickers = set(all_subscribe)           # track base set for dynamic subs
+
+    # Restore per-tick detector zones that were staged before this restart,
+    # so a deploy doesn't reset compression/pullback/swing to zero.
+    load_zones_from_redis()
 
     logger.info(
         f"[stream] Starting event-driven stream — feed={feed.value.upper()} | "

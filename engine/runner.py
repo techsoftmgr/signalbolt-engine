@@ -1295,6 +1295,8 @@ def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
             _stream.stage_swing_zone(ticker, sz.swing_high, sz.swing_low, sz.atr)
         else:
             _stream.clear_swing_zone(ticker)
+        # Persist all staged zones to Redis so they survive worker restarts
+        _stream._persist_zones()
     except Exception:
         pass
 
