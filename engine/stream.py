@@ -173,6 +173,48 @@ def _is_strong_close(direction: str, close: float,
     return pos >= _STRONG_CLOSE_FRAC if direction == "LONG" else pos <= (1.0 - _STRONG_CLOSE_FRAC)
 
 
+# ── Volume-surge confirmation ─────────────────────────────────────────────────
+# The slow-bleed losers (NKE/MARA/SNOW/NOW, 2026-05-28) broke a level with no
+# participation and just faded. Require the confirming 1m bar's volume to beat a
+# trailing average — real breakouts have buyers. Fail-open until we have history.
+_vol_buffer: dict[str, list] = {}
+_VOL_SURGE_MULT  = 1.5
+_VOL_MIN_HISTORY = 6
+
+
+def _record_volume(ticker: str, vol) -> None:
+    if not vol or vol <= 0:
+        return
+    b = _vol_buffer.setdefault(ticker, [])
+    b.append(float(vol))
+    if len(b) > 20:
+        del b[0]
+
+
+def _vol_surge(ticker: str, vol) -> bool:
+    b = _vol_buffer.get(ticker, [])
+    if len(b) < _VOL_MIN_HISTORY or not vol:
+        return True                                  # not enough history → allow
+    avg = sum(b) / len(b)
+    return avg <= 0 or vol >= _VOL_SURGE_MULT * avg
+
+
+# ── Market-regime alignment ───────────────────────────────────────────────────
+# 6 of 7 predictive losers were LONG, fired into a weak tape. The predictive path
+# had no market awareness. Block LONGs in a bearish regime / SHORTs in a bullish
+# one (coarse SPY/VIX/200MA regime, already cached — zero extra cost).
+def _market_allows(direction: str) -> bool:
+    try:
+        rt = (_get_regime() or {}).get("regime_type", "RANGING")
+    except Exception:
+        return True
+    if direction == "LONG"  and rt in ("TRENDING_BEAR", "RISK_OFF", "PANIC"):
+        return False
+    if direction == "SHORT" and rt == "TRENDING_BULL":
+        return False
+    return True
+
+
 # ── Breakout RETEST entry ─────────────────────────────────────────────────────
 # Don't chase the breakout candle (BKNG bought the spike, faded to a 0.2% stop,
 # 2026-05-28). On a confirmed swing/compression break, arm a "retest pending":
@@ -272,7 +314,8 @@ def clear_pullback_zone(ticker: str) -> None:
 
 
 def _check_pullback_reclaim(ticker: str, price: float,
-                            bar_high: float | None = None, bar_low: float | None = None) -> None:
+                            bar_high: float | None = None, bar_low: float | None = None,
+                            bar_vol: float | None = None) -> None:
     """Called on 1m close. Fire when the bar closes across the reclaim level."""
     import time as _t
     zone = _pullback_zones.get(ticker)
@@ -293,6 +336,10 @@ def _check_pullback_reclaim(ticker: str, price: float,
         return
     if not _is_strong_close(direction, price, bar_high, bar_low):
         return   # rejection bar — weak close, skip
+    if not _vol_surge(ticker, bar_vol):
+        return   # no participation — low-volume reclaim tends to fade
+    if not _market_allows(direction):
+        return   # fighting the market regime
 
     with _pullback_lock:
         _pullback_fired[ticker] = now
@@ -432,7 +479,8 @@ def load_zones_from_db() -> set[str]:
 
 
 def _check_swing_breakout(ticker: str, price: float,
-                          bar_high: float | None = None, bar_low: float | None = None) -> None:
+                          bar_high: float | None = None, bar_low: float | None = None,
+                          bar_vol: float | None = None) -> None:
     """Called on 1m close. Fire when the bar closes beyond the staged swing high/low."""
     import time as _t
     zone = _swing_zones.get(ticker)
@@ -456,6 +504,10 @@ def _check_swing_breakout(ticker: str, price: float,
         return
     if not _is_strong_close(direction, price, bar_high, bar_low):
         return   # rejection bar — weak close, skip (MARA bull-trap guard)
+    if not _vol_surge(ticker, bar_vol):
+        return   # no participation — low-volume break tends to fade
+    if not _market_allows(direction):
+        return   # fighting the market regime
 
     level = swing_high if direction == "LONG" else swing_low
     with _swing_lock:
@@ -466,7 +518,8 @@ def _check_swing_breakout(ticker: str, price: float,
 
 
 def _check_compression_breakout(ticker: str, price: float,
-                                bar_high: float | None = None, bar_low: float | None = None) -> None:
+                                bar_high: float | None = None, bar_low: float | None = None,
+                                bar_vol: float | None = None) -> None:
     """
     Called on 1m close. If `ticker` has a staged compression zone and the bar
     closed beyond an edge (with a strong close), fire a breakout signal via
@@ -501,6 +554,10 @@ def _check_compression_breakout(ticker: str, price: float,
         return
     if not _is_strong_close(direction, price, bar_high, bar_low):
         return   # rejection bar — weak close, skip
+    if not _vol_surge(ticker, bar_vol):
+        return   # no participation — low-volume break tends to fade
+    if not _market_allows(direction):
+        return   # fighting the market regime
 
     level = range_high if direction == "LONG" else range_low
     with _compression_lock:
@@ -1580,15 +1637,15 @@ async def run_stream() -> None:
                 # longer triggers a false breakout. `close` is the bar body, not
                 # an intrabar high/low.
                 try:
-                    _check_compression_breakout(symbol, close, bar_high, bar_low)
+                    _check_compression_breakout(symbol, close, bar_high, bar_low, volume)
                 except Exception:
                     pass
                 try:
-                    _check_pullback_reclaim(symbol, close, bar_high, bar_low)
+                    _check_pullback_reclaim(symbol, close, bar_high, bar_low, volume)
                 except Exception:
                     pass
                 try:
-                    _check_swing_breakout(symbol, close, bar_high, bar_low)
+                    _check_swing_breakout(symbol, close, bar_high, bar_low, volume)
                 except Exception:
                     pass
                 # Retest fills for breakouts armed on a prior bar
@@ -1596,6 +1653,9 @@ async def run_stream() -> None:
                     _check_retest(symbol, close, bar_high, bar_low)
                 except Exception:
                     pass
+                # Record this bar's volume AFTER the checks (so the surge test
+                # compares the confirming bar against PRIOR bars, not itself).
+                _record_volume(symbol, volume)
 
                 # ── Scalping: every 5-min bar close, per ticker ───────────────
                 # Fires for each SCALP ticker individually as its bar arrives.
