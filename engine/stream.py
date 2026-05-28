@@ -245,60 +245,80 @@ def clear_swing_zone(ticker: str) -> None:
 
 # ── Zone persistence across worker restarts ───────────────────────────────────
 # Staged zones live in worker memory; every deploy/restart wiped them, so the
-# per-tick detectors reset to zero (the "no signals all day" bug 2026-05-28
-# during heavy iteration). Persist the three zone dicts to Redis on stage and
-# reload on startup so zones survive restarts. Per-tick reads stay in-memory
-# (fast); Redis is only touched on stage (infrequent, scan cadence) + startup.
-_ZONE_REDIS_KEY = "stream:zones:v1"
-_ZONE_TTL_SEC   = 2 * 3600
-_ZONE_PERSIST_MIN_INTERVAL_S = 15.0   # throttle Redis writes
+# per-tick detectors reset to zero (the "no signals all day" bug 2026-05-28).
+# Persist the three zone dicts to DURABLE Postgres (engine_kv) on stage and
+# reload on startup so zones survive restarts. Postgres replaced Redis here
+# (2026-05-28): Redis snapshot writes were timing out ('Timeout reading from
+# socket'), making restore + the admin display unreliable. Per-tick reads stay
+# in-memory (fast); Postgres is only touched on stage (throttled) + startup.
+_ZONE_KV_KEY    = "stream:zones:v1"
+_ZONE_PERSIST_MIN_INTERVAL_S = 15.0   # throttle writes (scan calls this ~40×/scan)
 _last_zone_persist_ts = 0.0
 
 
-def _persist_zones(force: bool = False) -> None:
-    """Write all three zone dicts to Redis (called after staging in a scan).
+def _zone_supabase():
+    """Service-role Supabase client for zone persistence (worker context)."""
+    import os
+    from supabase import create_client as _sc
+    key = os.environ.get("SUPABASE_KEY") or os.environ["SUPABASE_SECRET_KEY"]
+    return _sc(os.environ["SUPABASE_URL"], key)
 
-    Throttled to at most one write per _ZONE_PERSIST_MIN_INTERVAL_S: the
-    predictive scan calls this once per ticker (~40×/scan), which overwhelmed
-    Redis and caused 'Timeout reading from socket' (2026-05-28). The in-memory
-    zone dicts are always current; Redis lags by at most the throttle interval,
-    which only affects cross-restart restore + the admin armed-zone display.
+
+def _persist_zones(force: bool = False) -> None:
+    """Snapshot all three zone dicts to Postgres engine_kv (single-row upsert).
+
+    Throttled to one write per _ZONE_PERSIST_MIN_INTERVAL_S so a 40-ticker scan
+    doesn't hammer the DB. The in-memory dicts are always current; the durable
+    snapshot lags by at most the throttle interval — that only affects
+    cross-restart restore + the admin armed-zone display. Single-row JSONB
+    upsert is atomic, so readers never see a half-written snapshot.
     """
     global _last_zone_persist_ts
     import time as _t
+    from datetime import datetime, timezone
     now = _t.time()
     if not force and (now - _last_zone_persist_ts) < _ZONE_PERSIST_MIN_INTERVAL_S:
         return
     try:
-        from engine import cache
         snap = {
             "compression": {k: list(v) for k, v in _compression_zones.items()},
             "pullback":    {k: list(v) for k, v in _pullback_zones.items()},
             "swing":       {k: list(v) for k, v in _swing_zones.items()},
         }
-        cache.kv.set_json(_ZONE_REDIS_KEY, snap, ttl_sec=_ZONE_TTL_SEC)
+        _zone_supabase().table("engine_kv").upsert({
+            "key": _ZONE_KV_KEY, "value": snap,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
         _last_zone_persist_ts = now   # only advance on success so failures retry
     except Exception as e:
         logger.debug(f"[stream] zone persist failed: {e}")
 
 
-def load_zones_from_redis() -> None:
-    """Restore staged zones from Redis on worker startup (survives restarts)."""
+def load_zones_from_db() -> set[str]:
+    """Restore staged zones from Postgres on worker startup (survives restarts).
+
+    Returns the set of zone tickers so the caller can re-subscribe them to the
+    live stream — otherwise restored zones sit in memory but receive no bars
+    until the next scan re-arms them.
+    """
     try:
-        from engine import cache
-        snap = cache.kv.get_json(_ZONE_REDIS_KEY)
+        rows = (_zone_supabase().table("engine_kv")
+                .select("value").eq("key", _ZONE_KV_KEY).limit(1).execute().data) or []
+        snap = rows[0]["value"] if rows else None
         if not snap:
-            return
+            return set()
         with _compression_lock:
             _compression_zones.update({k: tuple(v) for k, v in (snap.get("compression") or {}).items()})
         with _pullback_lock:
             _pullback_zones.update({k: tuple(v) for k, v in (snap.get("pullback") or {}).items()})
         with _swing_lock:
             _swing_zones.update({k: tuple(v) for k, v in (snap.get("swing") or {}).items()})
-        logger.info(f"[stream] Restored zones from Redis — "
+        logger.info(f"[stream] Restored zones from DB — "
                     f"comp={len(_compression_zones)} pb={len(_pullback_zones)} swing={len(_swing_zones)}")
+        return set(_compression_zones) | set(_pullback_zones) | set(_swing_zones)
     except Exception as e:
         logger.debug(f"[stream] zone restore failed: {e}")
+        return set()
 
 
 def _check_swing_breakout(ticker: str, price: float) -> None:
@@ -1364,11 +1384,20 @@ async def run_stream() -> None:
     except Exception as _e:
         logger.warning(f"[stream] Could not load active-signal tickers on startup: {_e}")
 
-    _subscribed_tickers = set(all_subscribe)           # track base set for dynamic subs
+    # Restore per-tick detector zones staged before this restart so a deploy
+    # doesn't reset compression/pullback/swing to zero — AND re-subscribe their
+    # tickers so the restored zones are actually monitored (receive 1m bars),
+    # not just sitting in memory until the next scan re-arms them.
+    try:
+        zone_tickers = load_zones_from_db()
+        extra_z = [t for t in zone_tickers if t not in all_subscribe]
+        if extra_z:
+            all_subscribe.extend(extra_z)
+            logger.info(f"[stream] Re-subscribing {len(extra_z)} ticker(s) from restored zones")
+    except Exception as _ze:
+        logger.warning(f"[stream] zone restore/resubscribe failed: {_ze}")
 
-    # Restore per-tick detector zones that were staged before this restart,
-    # so a deploy doesn't reset compression/pullback/swing to zero.
-    load_zones_from_redis()
+    _subscribed_tickers = set(all_subscribe)           # track base set for dynamic subs
 
     logger.info(
         f"[stream] Starting event-driven stream — feed={feed.value.upper()} | "
