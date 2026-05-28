@@ -60,6 +60,16 @@ class PullbackSetup:
     setup_type:          str = "PULLBACK_CONTINUATION"
 
 
+@dataclass
+class PullbackZone:
+    """A staged pullback awaiting reclaim — detected on bar close, watched
+    per-tick. Direction is known; we fire when price crosses reclaim_level."""
+    direction:    str       # 'LONG' or 'SHORT'
+    reclaim_level: float     # swing high (LONG) / swing low (SHORT) to reclaim
+    stop_ref:     float      # pullback extreme (for context/SL)
+    atr:          float
+
+
 def _atr_hl(df: pd.DataFrame, period: int = 14) -> float:
     if df is None or len(df) < period:
         return 0.0
@@ -187,5 +197,89 @@ def detect(df: pd.DataFrame, current_price: float) -> Optional[PullbackSetup]:
                     pullback_bars        = pullback_bars,
                     retracement_pct      = round(retrace_pct, 3),
                 )
+
+    return None
+
+
+def detect_zone(df: pd.DataFrame, current_price: float) -> Optional[PullbackZone]:
+    """
+    Detect a pullback structure that has NOT yet reclaimed — used to stage a
+    ticker for per-tick reclaim watching. Returns the {direction, reclaim_level}
+    if a valid leg+pullback exists and price is still on the wrong side of the
+    reclaim level (so the fire happens later, on the tick that crosses it).
+
+    Staging half of the two-phase pullback flow:
+      1. detect_zone() on bar close → stage reclaim level in stream watch set
+      2. per-tick check in stream.on_trade → fire when price crosses it
+    """
+    if df is None or len(df) < 20:
+        return None
+    atr = _atr_hl(df, period=14)
+    if atr <= 0:
+        return None
+
+    opens  = df["open"].values.astype(float)
+    closes = df["close"].values.astype(float)
+    highs  = df["high"].values.astype(float)
+    lows   = df["low"].values.astype(float)
+    n = len(df) - 1
+
+    for pullback_bars in range(PULLBACK_BARS_MIN, PULLBACK_BARS_MAX + 1):
+        pb_start = n - pullback_bars + 1
+        if pb_start < LEG_BARS_MIN:
+            continue
+        pb_o = opens[pb_start: n + 1]
+        pb_c = closes[pb_start: n + 1]
+        all_red   = all(_is_red(o, c)   for o, c in zip(pb_o, pb_c))
+        all_green = all(_is_green(o, c) for o, c in zip(pb_o, pb_c))
+
+        # LONG pending: green leg + red pullback, price NOT yet reclaimed
+        if all_red:
+            leg_end_idx = pb_start - 1
+            leg_bars = 0
+            for i in range(leg_end_idx, -1, -1):
+                if _is_green(opens[i], closes[i]) and (highs[i] - lows[i]) >= LEG_RANGE_MULT * atr:
+                    leg_bars += 1
+                else:
+                    break
+            if leg_bars < LEG_BARS_MIN:
+                continue
+            leg_start  = float(opens[leg_end_idx - leg_bars + 1])
+            swing_high = float(highs[leg_end_idx])
+            leg_size   = swing_high - leg_start
+            if leg_size <= 0:
+                continue
+            pullback_low = float(min(lows[pb_start: n + 1]))
+            if (swing_high - pullback_low) / leg_size > MAX_PULLBACK_RETRACE:
+                continue
+            reclaim_level = swing_high * (1 + RECLAIM_BUFFER_PCT / 100)
+            # Only stage if reclaim hasn't happened yet (price still below)
+            if current_price < reclaim_level:
+                return PullbackZone(direction="LONG", reclaim_level=reclaim_level,
+                                    stop_ref=pullback_low, atr=atr)
+
+        # SHORT pending: red leg + green pullback, price NOT yet broken down
+        if all_green:
+            leg_end_idx = pb_start - 1
+            leg_bars = 0
+            for i in range(leg_end_idx, -1, -1):
+                if _is_red(opens[i], closes[i]) and (highs[i] - lows[i]) >= LEG_RANGE_MULT * atr:
+                    leg_bars += 1
+                else:
+                    break
+            if leg_bars < LEG_BARS_MIN:
+                continue
+            leg_start = float(opens[leg_end_idx - leg_bars + 1])
+            swing_low = float(lows[leg_end_idx])
+            leg_size  = leg_start - swing_low
+            if leg_size <= 0:
+                continue
+            pullback_high = float(max(highs[pb_start: n + 1]))
+            if (pullback_high - swing_low) / leg_size > MAX_PULLBACK_RETRACE:
+                continue
+            break_level = swing_low * (1 - RECLAIM_BUFFER_PCT / 100)
+            if current_price > break_level:
+                return PullbackZone(direction="SHORT", reclaim_level=break_level,
+                                    stop_ref=pullback_high, atr=atr)
 
     return None

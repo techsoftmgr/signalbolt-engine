@@ -171,6 +171,57 @@ def clear_compression_zone(ticker: str) -> None:
         _compression_zones.pop(ticker, None)
 
 
+# ── Pullback reclaim watch (per-tick firing) ──────────────────────────────────
+# Staged on bar close; fired the instant price crosses the reclaim level.
+# {ticker: (direction, reclaim_level, stop_ref, atr, staged_ts)}
+_pullback_zones: dict[str, tuple] = {}
+_pullback_lock = _threading.Lock()
+_pullback_fired: dict[str, float] = {}
+
+
+def stage_pullback_zone(ticker: str, direction: str, reclaim_level: float,
+                        stop_ref: float, atr: float) -> None:
+    """Register a pullback reclaim level for per-tick watching."""
+    import time as _t
+    with _pullback_lock:
+        _pullback_zones[ticker] = (direction, reclaim_level, stop_ref, atr, _t.time())
+
+
+def clear_pullback_zone(ticker: str) -> None:
+    with _pullback_lock:
+        _pullback_zones.pop(ticker, None)
+
+
+def _check_pullback_reclaim(ticker: str, price: float) -> None:
+    """Called every tick. Fire when price crosses the staged reclaim level."""
+    import time as _t
+    zone = _pullback_zones.get(ticker)
+    if zone is None:
+        return
+    direction, reclaim_level, stop_ref, atr, staged_ts = zone
+    now = _t.time()
+    if now - staged_ts > _COMPRESSION_ZONE_TTL:          # reuse 2h TTL
+        with _pullback_lock:
+            _pullback_zones.pop(ticker, None)
+        return
+    if now - _pullback_fired.get(ticker, 0) < _COMPRESSION_FIRE_THROTTLE:
+        return
+
+    crossed = (direction == "LONG"  and price >= reclaim_level) or \
+              (direction == "SHORT" and price <= reclaim_level)
+    if not crossed:
+        return
+
+    with _pullback_lock:
+        _pullback_fired[ticker] = now
+        _pullback_zones.pop(ticker, None)
+    try:
+        from engine.runner import fire_pullback_reclaim
+        _scan_executor.submit(fire_pullback_reclaim, ticker, direction, price)
+    except Exception as e:
+        logger.debug(f"[stream] pullback fire dispatch failed for {ticker}: {e}")
+
+
 def _check_compression_breakout(ticker: str, price: float) -> None:
     """
     Called on every tick. If `ticker` has a staged compression zone and price
@@ -1346,6 +1397,14 @@ async def run_stream() -> None:
                 #     next 15m scan. In-memory dict lookup, near-zero cost.
                 try:
                     _check_compression_breakout(ticker, price)
+                except Exception:
+                    pass
+
+                # 1d. Per-tick pullback reclaim check — fires when price crosses
+                #     a staged swing-reclaim level. Same repaint-safe price-cross
+                #     logic as compression. In-memory lookup, near-zero cost.
+                try:
+                    _check_pullback_reclaim(ticker, price)
                 except Exception:
                     pass
 

@@ -1294,12 +1294,18 @@ def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
     # edge — instead of waiting for the next 15m scan. This is the fix for
     # missing breakouts that happen mid-bar.
     try:
-        zone = compression_detector.detect_zone(df)
         from engine import stream as _stream
+        zone = compression_detector.detect_zone(df)
         if zone is not None:
             _stream.stage_compression_zone(ticker, zone.range_high, zone.range_low, zone.atr)
         else:
             _stream.clear_compression_zone(ticker)
+        # Stage pullback reclaim level too (per-tick fire when price reclaims)
+        pz = pullback_detector.detect_zone(df, current_price=price)
+        if pz is not None:
+            _stream.stage_pullback_zone(ticker, pz.direction, pz.reclaim_level, pz.stop_ref, pz.atr)
+        else:
+            _stream.clear_pullback_zone(ticker)
     except Exception:
         pass
 
@@ -1423,21 +1429,21 @@ def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
         pass
 
 
-def fire_compression_breakout(ticker: str, direction: str, price: float) -> None:
+def _fire_per_tick_predictive(ticker: str, direction: str, price: float,
+                              detector: str, setup_type: str, label: str) -> None:
     """
-    Fire a compression-breakout signal from a per-tick trigger (stream.on_trade).
-    Called the INSTANT price crosses a staged compression envelope — this is the
-    fast path that catches breakouts mid-bar instead of waiting for the next
-    15m scan.
+    Shared per-tick fire path for predictive detectors (compression / pullback).
+    Called the INSTANT price crosses a staged level from stream.on_trade — the
+    fast path that catches the move mid-bar instead of at the next 15m scan.
 
-    Self-contained: creates its own Supabase client, fetches bars for SL/TP,
-    runs the same entry_gate + risk checks as scan-fired signals. Deduped by
-    the active-signal check + DB unique index.
+    Self-contained: own Supabase client, fetches bars for SL/TP, runs the same
+    entry_gate + risk checks as scan-fired signals. Deduped by active-signal
+    check + DB unique index.
     """
     try:
         sb = create_client(os.environ["SUPABASE_URL"], _supabase_key())
     except Exception as e:
-        logger.debug(f"[runner] compression fire — supabase init failed: {e}")
+        logger.debug(f"[runner] {detector} fire — supabase init failed: {e}")
         return
 
     strategy_type = "day_trade"
@@ -1452,20 +1458,18 @@ def fire_compression_breakout(ticker: str, direction: str, price: float) -> None
     if df is None or df.empty:
         return
 
-    setup_reason = f"Compression breakout (per-tick) — {direction} @ ${price:.2f}"
-    logger.info(f"[runner] {ticker} COMPRESSION BREAKOUT (per-tick) {direction} @ ${price:.2f}")
+    setup_reason = f"{label} (per-tick) — {direction} @ ${price:.2f}"
+    logger.info(f"[runner] {ticker} {label.upper()} (per-tick) {direction} @ ${price:.2f}")
 
-    # SL/TP
     sltp = sl_tp_engine.calculate(
         direction=direction, entry=price, df=df,
         regime={}, session={}, gamma={"available": False},
         strategy_type=strategy_type, interval="15m",
     )
     if not sltp.get("valid"):
-        logger.info(f"[runner] {ticker} compression — R:R too low, skipping")
+        logger.info(f"[runner] {ticker} {detector} — R:R too low, skipping")
         return
 
-    # Entry gate (same stack as everything else)
     entry_gate_log: dict = {}
     try:
         gate = entry_gate.check(
@@ -1474,19 +1478,19 @@ def fire_compression_breakout(ticker: str, direction: str, price: float) -> None
         )
         entry_gate_log = dict(gate.gate_log)
         if not gate.allowed:
-            logger.info(f"[runner] {ticker} compression blocked by gate: {' | '.join(gate.reasons)}")
+            logger.info(f"[runner] {ticker} {detector} blocked by gate: {' | '.join(gate.reasons)}")
             entry_gate.log_rejection(
                 sb=sb, ticker=ticker, direction=direction, strategy_type=strategy_type,
                 price=price, confidence_score=75, gate=gate,
             )
             return
     except Exception as e:
-        logger.warning(f"[runner] {ticker} compression gate error (failing open): {e}")
+        logger.warning(f"[runner] {ticker} {detector} gate error (failing open): {e}")
         entry_gate_log = {"error": str(e)}
 
     risk = risk_manager.check(sb, ticker, 75)
     if not risk["allowed"]:
-        logger.info(f"[runner] {ticker} compression blocked — portfolio: {risk['block_reason']}")
+        logger.info(f"[runner] {ticker} {detector} blocked — portfolio: {risk['block_reason']}")
         return
 
     _tape_b = _tape_bonus(ticker)
@@ -1512,8 +1516,8 @@ def fire_compression_breakout(ticker: str, direction: str, price: float) -> None
         "sl_adjustments":     sltp.get("adjustments", []),
         "risk_reward":        sltp["risk_reward_1"],
         "score_breakdown":    {
-            "detector_source":   "COMPRESSION",
-            "predictive_setup":  "COMPRESSION_BREAKOUT",
+            "detector_source":   detector,
+            "predictive_setup":  setup_type,
             "predictive_reason": setup_reason,
             "fire_path":         "per_tick",
             "entry_gate":        entry_gate_log,
@@ -1522,7 +1526,7 @@ def fire_compression_breakout(ticker: str, direction: str, price: float) -> None
             "tape_bonus":        _tape_b,
         },
         "confidence_grade":   "B+",
-        "setup_type":         "COMPRESSION_BREAKOUT",
+        "setup_type":         setup_type,
     }
     new_sig_id = _write_signal(sb, signal_row)
     try:
@@ -1530,6 +1534,22 @@ def fire_compression_breakout(ticker: str, direction: str, price: float) -> None
                                signal_id=str(new_sig_id) if new_sig_id else None)
     except Exception:
         pass
+
+
+def fire_compression_breakout(ticker: str, direction: str, price: float) -> None:
+    """Per-tick compression breakout fire (called from stream.on_trade)."""
+    _fire_per_tick_predictive(ticker, direction, price,
+                              detector="COMPRESSION",
+                              setup_type="COMPRESSION_BREAKOUT",
+                              label="Compression breakout")
+
+
+def fire_pullback_reclaim(ticker: str, direction: str, price: float) -> None:
+    """Per-tick pullback reclaim fire (called from stream.on_trade)."""
+    _fire_per_tick_predictive(ticker, direction, price,
+                              detector="PULLBACK",
+                              setup_type="PULLBACK_CONTINUATION",
+                              label="Pullback reclaim")
 
 
 # ---------------------------------------------------------------------------
