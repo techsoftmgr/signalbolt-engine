@@ -251,7 +251,7 @@ def _has_active_signal(sb: Client, ticker: str, strategy_type: str) -> bool:
 
 
 
-def _ensure_stream_subscription(ticker: str) -> None:
+def _ensure_stream_subscription(ticker: str, cap: int | None = None) -> None:
     """
     Add `ticker` to the live Alpaca trade stream so on_trade ticks → real-time
     SL/TP checks (_check_rt_levels) fire as soon as price crosses a level.
@@ -261,12 +261,20 @@ def _ensure_stream_subscription(ticker: str) -> None:
     the 5-min signal_monitor to catch stop hits. User saw a 1% extra loss
     on AAL because of exactly this gap (stop crossed at 9:22, closed 9:27).
 
+    `cap`: if set and the ticker isn't already subscribed, skip when the live
+    subscription set has reached this size. Used by the predictive scan to bound
+    growth from pre-screened movers. Active signals call with cap=None so their
+    stops are always watched.
+
     Safe to call from sync context — schedules the async subscribe on the
     running event loop if there is one; queues otherwise.
     """
     try:
         import asyncio
         from engine import stream as _stream
+        if cap is not None and ticker not in _stream._subscribed_tickers \
+                and len(_stream._subscribed_tickers) >= cap:
+            return
         try:
             loop = asyncio.get_event_loop()
         except RuntimeError:
@@ -1278,24 +1286,38 @@ def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
     # missing breakouts that happen mid-bar.
     try:
         from engine import stream as _stream
+        zone_staged = False
         zone = compression_detector.detect_zone(df)
         if zone is not None:
             _stream.stage_compression_zone(ticker, zone.range_high, zone.range_low, zone.atr)
+            zone_staged = True
         else:
             _stream.clear_compression_zone(ticker)
         # Stage pullback reclaim level too (per-tick fire when price reclaims)
         pz = pullback_detector.detect_zone(df, current_price=price)
         if pz is not None:
             _stream.stage_pullback_zone(ticker, pz.direction, pz.reclaim_level, pz.stop_ref, pz.atr)
+            zone_staged = True
         else:
             _stream.clear_pullback_zone(ticker)
         # Stage swing-high breakout levels (per-tick fire on the break)
         sz = swing_breakout_detector.detect_zone(df, current_price=price)
         if sz is not None:
             _stream.stage_swing_zone(ticker, sz.swing_high, sz.swing_low, sz.atr)
+            zone_staged = True
         else:
             _stream.clear_swing_zone(ticker)
-        # Persist all staged zones to Redis so they survive worker restarts
+        # CRITICAL: a staged zone can ONLY fire from on_trade ticks, and Alpaca
+        # pushes ticks only for SUBSCRIBED tickers. The predictive scan runs over
+        # the dynamic pre-screened universe (movers), most of which are NOT in the
+        # base stream subscription — so without this, zones armed on movers never
+        # receive ticks and can never fire (root cause of "zones accumulate but
+        # never fire", 2026-05-28). Subscribe the instant we arm a zone. Capped so
+        # the live subscription can't grow without bound.
+        if zone_staged:
+            _ensure_stream_subscription(ticker, cap=200)
+        # Persist staged zones to Redis so they survive worker restarts
+        # (throttled inside _persist_zones to avoid hammering Redis per ticker).
         _stream._persist_zones()
     except Exception:
         pass
