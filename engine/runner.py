@@ -2043,6 +2043,20 @@ def _run_gate_validator() -> None:
         logger.error(f"[runner] Gate validator failed: {e}", exc_info=True)
 
 
+def _clear_zones_overnight() -> None:
+    """Wipe all armed per-tick zones overnight (12:30 AM ET). Zones are kept
+    through after-hours for admin analysis and cleared here so the next
+    session arms fresh."""
+    logger.info("[runner] ═══ Overnight armed-zone clear started ═══")
+    try:
+        from engine import stream as _stream
+        _stream.clear_all_zones()
+        logger.info("[runner] ═══ Overnight armed-zone clear done ═══")
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        logger.error(f"[runner] Overnight zone clear failed: {e}", exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # Scheduler
 # ---------------------------------------------------------------------------
@@ -2191,6 +2205,20 @@ def start_scheduler() -> BackgroundScheduler:
         replace_existing=True,
     )
     logger.info("[runner] Scheduled entry-gate validator (19:30 UTC / 2:30 PM CDT)")
+
+    # ── Overnight armed-zone clear — 12:30 AM ET ─────────────────────────
+    # Zones are no longer cleared at the 4PM close so the admin can analyze
+    # after-hours zone data in the app. This job wipes them ~half past
+    # midnight ET so the next session arms fresh. Uses ET timezone directly
+    # so it tracks DST without manual UTC offset bookkeeping.
+    scheduler.add_job(
+        _clear_zones_overnight,
+        trigger=CronTrigger(hour=0, minute=30, timezone="America/New_York"),
+        id="clear_zones_overnight",
+        name="SignalBolt overnight armed-zone clear",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled overnight armed-zone clear (12:30 AM ET)")
 
     scheduler.start()
     logger.info(
