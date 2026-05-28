@@ -2811,39 +2811,62 @@ async def admin_detector_stats(request: Request, days: int = 7):
         ).data or []
 
         det: dict[str, dict] = {}
+        # Cross-detector aggregate for entries allowed via the relaxed
+        # overextension cap (gate_log.momentum_relaxed) — so we can A/B their
+        # win-rate vs standard entries before trusting the wider cap.
+        mom = {"fires": 0, "active": 0, "wins": 0, "losses": 0,
+               "pnl_sum": 0.0, "pnl_n": 0, "signals": []}
         for r in rows:
-            src = (r.get("score_breakdown") or {}).get("detector_source") or "SMC"
+            sb_bd = r.get("score_breakdown") or {}
+            src = sb_bd.get("detector_source") or "SMC"
+            relaxed = bool((sb_bd.get("entry_gate") or {}).get("momentum_relaxed"))
             d = det.setdefault(src, {"fires": 0, "active": 0, "wins": 0, "losses": 0,
                                      "pending": 0, "pnl_sum": 0.0, "pnl_n": 0, "signals": []})
-            d["fires"] += 1
-            if r.get("status") == "active":
-                d["active"] += 1
             res = r.get("result")
-            if res == "win":   d["wins"]   += 1
-            elif res == "loss": d["losses"] += 1
-            elif res in ("pending", "expired", None) and r.get("status") == "closed":
-                d["pending"] += 1
             pct = r.get("result_pct")
-            if pct is not None:
-                d["pnl_sum"] += float(pct); d["pnl_n"] += 1
+
+            def _accumulate(bucket):
+                bucket["fires"] += 1
+                if r.get("status") == "active":
+                    bucket["active"] += 1
+                if res == "win":   bucket["wins"]   += 1
+                elif res == "loss": bucket["losses"] += 1
+                elif res in ("pending", "expired", None) and r.get("status") == "closed":
+                    bucket.setdefault("pending", 0)
+                    bucket["pending"] += 1
+                if pct is not None:
+                    bucket["pnl_sum"] += float(pct); bucket["pnl_n"] += 1
+
+            _accumulate(d)
+            if relaxed:
+                _accumulate(mom)
+
+            sig_row = {
+                "ticker":      r.get("ticker"),
+                "direction":   r.get("direction"),
+                "strategy":    r.get("strategy_type"),
+                "entry":       r.get("entry_price"),
+                "result":      r.get("result"),
+                "result_pct":  r.get("result_pct"),
+                "status":      r.get("status"),
+                "created_at":  r.get("created_at"),
+                "momentum_relaxed": relaxed,
+            }
             # Keep the individual signal (cap 25/detector to bound payload)
             if len(d["signals"]) < 25:
-                d["signals"].append({
-                    "ticker":      r.get("ticker"),
-                    "direction":   r.get("direction"),
-                    "strategy":    r.get("strategy_type"),
-                    "entry":       r.get("entry_price"),
-                    "result":      r.get("result"),
-                    "result_pct":  r.get("result_pct"),
-                    "status":      r.get("status"),
-                    "created_at":  r.get("created_at"),
-                })
+                d["signals"].append(sig_row)
+            if relaxed and len(mom["signals"]) < 25:
+                mom["signals"].append(sig_row)
+
+        def _finalize(b):
+            judged = b["wins"] + b["losses"]
+            b["win_rate"] = round(b["wins"] / judged * 100, 1) if judged else None
+            b["avg_pnl"]  = round(b["pnl_sum"] / b["pnl_n"], 3) if b["pnl_n"] else None
+            b.pop("pnl_sum", None); b.pop("pnl_n", None)
 
         for src, d in det.items():
-            judged = d["wins"] + d["losses"]
-            d["win_rate"] = round(d["wins"] / judged * 100, 1) if judged else None
-            d["avg_pnl"]  = round(d["pnl_sum"] / d["pnl_n"], 3) if d["pnl_n"] else None
-            d.pop("pnl_sum", None); d.pop("pnl_n", None)
+            _finalize(d)
+        _finalize(mom)
 
         # Currently-armed per-tick zones (durable engine_kv snapshot)
         armed = {"compression": 0, "pullback": 0, "swing": 0}
@@ -2856,7 +2879,8 @@ async def admin_detector_stats(request: Request, days: int = 7):
         except Exception:
             pass
 
-        return {"since": since, "by_detector": det, "armed_zones": armed}
+        return {"since": since, "by_detector": det, "armed_zones": armed,
+                "momentum_relaxed": mom}
     except HTTPException:
         raise
     except Exception as e:
