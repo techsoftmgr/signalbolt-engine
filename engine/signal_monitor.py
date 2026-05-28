@@ -38,6 +38,7 @@ from supabase import create_client, Client
 
 from engine import smc, push
 from engine import alpaca_client as _alpaca
+from engine import exit_intelligence
 
 logger = logging.getLogger("signalbolt.monitor")
 
@@ -736,6 +737,39 @@ def _monitor_stocks(sb: Client) -> None:
                 else:
                     _SWING_PEAK[sig_id] = min(_SWING_PEAK[sig_id], price)
                 peak = _SWING_PEAK[sig_id]
+
+                # ── Intelligent exit: close EARLY if multiple real-time signals
+                #    converge on a reversal (vs blindly riding to T2). The
+                #    trailing stop below remains the hard floor. Requires
+                #    convergence so a single indicator blip won't bail. ──
+                try:
+                    df_exit = smc.fetch_candles(ticker, period="2d", interval="15m")
+                    tape_sum = None
+                    try:
+                        from engine import trade_tape
+                        tape_sum = trade_tape.get_summary(ticker) or trade_tape.get_summary_redis(ticker)
+                    except Exception:
+                        pass
+                    decision = exit_intelligence.evaluate_exit(sig, price, df_exit, peak, tape_sum)
+                    if decision["action"] == "close":
+                        reasons_str = ", ".join(decision["reasons"][:3])
+                        logger.info(f"[monitor] {ticker} INTELLIGENT EXIT score={decision['score']} "
+                                    f"pnl={decision['pnl_pct']}% — {reasons_str}")
+                        _close_signal(sb, sig_id, "target_hit",
+                                      current_price=price, entry_price=entry, direction=direction)
+                        _log_event(sb, sig_id, "closed_win", price=price,
+                                   note=(f"🧠 Intelligent exit @ ${price:.2f} "
+                                         f"(+{decision['pnl_pct']}%) — {reasons_str}"))
+                        _SWING_PEAK.pop(sig_id, None)
+                        _STATUS_CACHE.pop(sig_id, None)
+                        try:
+                            _push_early_book(ticker, direction, decision["pnl_pct"],
+                                             f"Intelligent exit — {reasons_str}", signal_id=sig_id_str)
+                        except Exception:
+                            pass
+                        continue
+                except Exception as e:
+                    logger.debug(f"[monitor] intelligent exit error for {ticker}: {e}")
 
                 # Only trail once the move beyond T1 is meaningful (avoid noise)
                 move_beyond_t1 = (peak - t1) if is_long else (t1 - peak)
