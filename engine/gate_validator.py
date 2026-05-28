@@ -37,6 +37,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -64,6 +65,14 @@ _MAX_HOLD_HOURS = {
     "options_flow":   8.0,
     "dark_pool":      8.0,
 }
+
+# Intraday strategies get force-closed at the session end by the live engine
+# (EOD sweep ~3:50 PM ET) — they never hold into after-hours. So the forward
+# walk is capped at the 4 PM ET close, which also lets a post-close validator
+# run judge the FULL day instead of waiting on an 8h nominal window.
+_INTRADAY_STRATEGIES = {"scalping", "day_trade", "vwap_reclaim", "gap_fill",
+                        "pre_market", "options_flow", "dark_pool"}
+_ET = ZoneInfo("America/New_York")
 
 # Bar interval used for forward-walk simulation
 _SIM_INTERVAL = {
@@ -202,6 +211,13 @@ def _validate_one(row: dict) -> Optional[dict]:
 
     hold_hours = _MAX_HOLD_HOURS.get(strategy_type, 8.0)
     t_end      = t_reject + timedelta(hours=hold_hours)
+
+    # Intraday strategies never hold past the session — cap the forward walk to
+    # the 4 PM ET close of the rejection day (matches the live EOD sweep). This
+    # also makes a post-close run able to judge the whole day's rejections.
+    if strategy_type in _INTRADAY_STRATEGIES:
+        close_et = t_reject.astimezone(_ET).replace(hour=16, minute=0, second=0, microsecond=0)
+        t_end = min(t_end, close_et.astimezone(timezone.utc))
 
     # If the hold window hasn't fully elapsed yet, skip — premature to judge
     if t_end > datetime.now(timezone.utc) - timedelta(minutes=15):

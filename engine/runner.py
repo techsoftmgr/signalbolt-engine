@@ -2308,20 +2308,20 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled weekly weight optimization (Sunday 2:00 AM UTC)")
 
-    # ── Pre-close entry-gate rejection validator (19:30 UTC = 2:30 PM CDT) ─
-    # 30 min before market close so admin has time to review results and
-    # decide any tuning for tomorrow while the day is still fresh. Trade-offs:
-    # rejections from the last 30 min won't have hold windows elapsed yet
-    # (skipped, re-judged tomorrow); morning day_trade signals that closed
-    # via SL/TP intraday are fully judged.
+    # ── Post-close entry-gate rejection validator (4:15 PM ET / 3:15 PM CDT) ─
+    # Runs just AFTER the close so the full RTH session is available. Combined
+    # with the intraday forward-walk being capped at the 4 PM ET close
+    # (gate_validator), this judges the ENTIRE day's intraday rejections in one
+    # run instead of leaving the afternoon ones pending on an 8h window.
+    # Timezone is America/New_York so it tracks DST automatically.
     scheduler.add_job(
         _run_gate_validator,
-        trigger=CronTrigger(hour=19, minute=30, timezone="UTC"),
+        trigger=CronTrigger(hour=16, minute=15, timezone="America/New_York"),
         id="gate_validator",
         name="SignalBolt entry-gate rejection validator",
         replace_existing=True,
     )
-    logger.info("[runner] Scheduled entry-gate validator (19:30 UTC / 2:30 PM CDT)")
+    logger.info("[runner] Scheduled entry-gate validator (4:15 PM ET, post-close)")
 
     # ── Overnight armed-zone clear — 12:30 AM ET ─────────────────────────
     # Zones are no longer cleared at the 4PM close so the admin can analyze
