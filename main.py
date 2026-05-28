@@ -2955,6 +2955,91 @@ async def admin_zone_history(request: Request, days: int = 7):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/admin/gate-performance")
+async def admin_gate_performance(request: Request, days: int = 7):
+    """
+    Per-GATE rejection performance, mirroring /admin/detector-stats. Groups
+    rejections by which gate(s) failed and reports how many would have lost
+    (gate correct) vs won (gate killed a winner), plus avg P/L and up to 25
+    sample rows each carrying entry/stop/exit for the datewise card view.
+    Admin only.
+    """
+    _user_id, sb = _require_admin_jwt(request)
+    from datetime import datetime, timezone, timedelta
+    days  = max(1, min(days, 60))
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+    try:
+        rows = (
+            sb.table("entry_gate_rejections")
+              .select("id, ticker, direction, strategy_type, price, stop_loss, "
+                      "target_one, exit_price, exit_reason, would_have_won, "
+                      "realized_pnl_pct, gate_log, created_at")
+              .gte("created_at", since)
+              .order("created_at", desc=True)
+              .limit(2000)
+              .execute()
+        ).data or []
+
+        def _failed_gates(gl: dict) -> list[str]:
+            return [k for k, v in (gl or {}).items()
+                    if isinstance(v, str) and v.startswith("fail")]
+
+        by_gate: dict[str, dict] = {}
+        overall = {"rejections": 0, "would_won": 0, "would_lost": 0, "pending": 0}
+        for r in rows:
+            won = r.get("would_have_won")
+            overall["rejections"] += 1
+            if won is True:    overall["would_won"]  += 1
+            elif won is False: overall["would_lost"] += 1
+            else:              overall["pending"]    += 1
+
+            sig_row = {
+                "id":          r.get("id"),
+                "ticker":      r.get("ticker"),
+                "direction":   r.get("direction"),
+                "strategy":    r.get("strategy_type"),
+                "entry":       r.get("price"),
+                "stop":        r.get("stop_loss"),
+                "exit":        r.get("exit_price"),
+                "exit_reason": r.get("exit_reason"),
+                "would_have_won":   won,
+                "result_pct":  r.get("realized_pnl_pct"),
+                "created_at":  r.get("created_at"),
+            }
+            for g in _failed_gates(r.get("gate_log")):
+                b = by_gate.setdefault(g, {
+                    "rejections": 0, "would_won": 0, "would_lost": 0, "pending": 0,
+                    "pnl_sum": 0.0, "pnl_n": 0, "signals": []})
+                b["rejections"] += 1
+                if won is True:    b["would_won"]  += 1
+                elif won is False: b["would_lost"] += 1
+                else:              b["pending"]    += 1
+                pct = r.get("realized_pnl_pct")
+                if pct is not None:
+                    b["pnl_sum"] += float(pct); b["pnl_n"] += 1
+                if len(b["signals"]) < 25:
+                    b["signals"].append(sig_row)
+
+        for g, b in by_gate.items():
+            judged = b["would_won"] + b["would_lost"]
+            # "correct" = rejection that would have lost (gate did its job)
+            b["correct_pct"] = round(b["would_lost"] / judged * 100, 1) if judged else None
+            b["won_pct"]     = round(b["would_won"]  / judged * 100, 1) if judged else None
+            b["avg_pnl"]     = round(b["pnl_sum"] / b["pnl_n"], 3) if b["pnl_n"] else None
+            b.pop("pnl_sum", None); b.pop("pnl_n", None)
+
+        judged = overall["would_won"] + overall["would_lost"]
+        overall["correct_pct"] = round(overall["would_lost"] / judged * 100, 1) if judged else None
+
+        return {"since": since, "days": days, "by_gate": by_gate, "overall": overall}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GET /admin/gate-performance error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/admin/armed-zones")
 async def admin_armed_zones(request: Request):
     """
