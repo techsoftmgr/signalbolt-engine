@@ -63,6 +63,13 @@ INTRADAY_STRATEGIES = {"scalping", "day_trade", "options_flow"}
 # Scalping max hold in minutes (regardless of market hours)
 SCALP_MAX_HOLD_MINS = 30
 
+# ── Trailing stop (after T1) ──────────────────────────────────────────────────
+# After T1 hits, trail the visible stop up to lock in profit instead of
+# leaving it at breakeven. Locks TRAIL_LOCK_FRAC of the gain from entry→peak.
+# Ratchets up only. Activates once price is TRAIL_MIN_MOVE_PCT beyond T1.
+TRAIL_LOCK_FRAC    = 0.70   # lock 70% of the entry→peak gain
+TRAIL_MIN_MOVE_PCT = 0.005  # peak must be ≥0.5% beyond T1 before trailing starts
+
 # Market close stages for intraday signals
 # EOD_WARN  → push "N min to close, consider booking profit" (no auto-close)
 # FORCE_CLOSE → auto-close all intraday positions with accurate P&L
@@ -689,75 +696,57 @@ def _monitor_stocks(sb: Client) -> None:
         except Exception as e:
             logger.debug(f"[monitor] T1 check error for {ticker}: {e}")
 
-        # ── 4b. Swing trailing stop — ride the trend after T1 ─────────────────
+        # ── 4b. Visible trailing stop — ride the trend after T1 ───────────────
         #
-        # Problem this solves: swing signals were closing too early via early
-        # booking (RSI/MACD checks) when the trend had many more % to run.
-        # Example: VLO SHORT booked at +1.79% but continued to +4–5%.
+        # After T1 hits, the stop sits at breakeven (entry). That's safe but
+        # leaves the displayed stop far from price as the trade runs — and gives
+        # back the ENTIRE post-T1 gain on a reversal. This trails the VISIBLE
+        # stop_loss up to lock in profit, so:
+        #   • the card shows the real protected level (not stale breakeven)
+        #   • the real-time tick SL check (_check_rt_levels) closes at the
+        #     trailed stop automatically — no separate invisible mechanism
         #
-        # Logic:
-        #   • Only runs for swing_trade signals that have hit T1 (stop = breakeven)
-        #   • Tracks the BEST price seen since T1 (peak for LONG, trough for SHORT)
-        #   • When price RETRACES 40% of the peak move from T1 → close and lock profit
-        #   • Minimum move of 1% from T1 before trailing activates (avoid noise)
+        # Trail level locks TRAIL_LOCK_FRAC of the gain from entry to peak.
+        # Ratchets UP only (never loosens). Activates once peak is a minimum
+        # distance above T1 so we don't trail on noise right at T1.
         #
-        # Why 40% retrace? It catches genuine reversals while ignoring typical
-        # swing-trade pullbacks. A 40% retrace of a strong move indicates momentum
-        # is genuinely turning — not just a pause.
+        # Example (SMCI): entry 36.90, peak 39.79 →
+        #   trail = 36.90 + 0.70*(39.79-36.90) = $38.92  (locks +5.5%)
         try:
-            at_breakeven = abs(sl - entry) < 0.01   # T1 has been hit, stop at entry
-            if strategy == "swing_trade" and at_breakeven:
-                t2_hit = (is_long and price >= t2) or (not is_long and price <= t2)
-                if not t2_hit:
-                    # Update peak
-                    sig_id = sig["id"]
-                    if sig_id not in _SWING_PEAK:
-                        _SWING_PEAK[sig_id] = price
-                    elif is_long:
-                        _SWING_PEAK[sig_id] = max(_SWING_PEAK[sig_id], price)
+            past_t1 = (is_long and sl >= entry - 0.01) or (not is_long and sl <= entry + 0.01)
+            t2_hit  = (is_long and price >= t2) or (not is_long and price <= t2)
+            if past_t1 and not t2_hit:
+                sig_id = sig["id"]
+                # Track peak (best price since T1)
+                if sig_id not in _SWING_PEAK:
+                    _SWING_PEAK[sig_id] = price
+                elif is_long:
+                    _SWING_PEAK[sig_id] = max(_SWING_PEAK[sig_id], price)
+                else:
+                    _SWING_PEAK[sig_id] = min(_SWING_PEAK[sig_id], price)
+                peak = _SWING_PEAK[sig_id]
+
+                # Only trail once the move beyond T1 is meaningful (avoid noise)
+                move_beyond_t1 = (peak - t1) if is_long else (t1 - peak)
+                if move_beyond_t1 > 0 and move_beyond_t1 / entry >= TRAIL_MIN_MOVE_PCT:
+                    if is_long:
+                        trail = entry + TRAIL_LOCK_FRAC * (peak - entry)
+                        ratchet_up = trail > sl + 0.01
                     else:
-                        _SWING_PEAK[sig_id] = min(_SWING_PEAK[sig_id], price)
-
-                    peak = _SWING_PEAK[sig_id]
-
-                    # Move from T1 toward T2 (positive = in trader's direction)
-                    move_from_t1 = (peak - t1) if is_long else (t1 - peak)
-                    # Retrace from that peak (positive = against trader)
-                    retrace      = (peak - price) if is_long else (price - peak)
-
-                    if move_from_t1 > 0 and move_from_t1 / entry >= 0.01:
-                        retrace_pct = retrace / move_from_t1
-                        if retrace_pct >= 0.40:
-                            locked_pnl = ((price - entry) / entry * 100) if is_long \
-                                         else ((entry - price) / entry * 100)
-                            logger.info(
-                                f"[monitor] {ticker} swing trail close "
-                                f"peak={peak:.2f} retrace={retrace_pct:.0%} "
-                                f"pnl={locked_pnl:.1f}%"
-                            )
-                            _close_signal(sb, sig_id, "target_hit",
-                                          current_price=price, entry_price=entry,
-                                          direction=direction)
-                            _log_event(sb, sig_id, "closed_win", price=price,
-                                       note=(
-                                           f"🎯 Swing trail close @ ${price:.2f} "
-                                           f"(+{locked_pnl:.1f}%) — "
-                                           f"{retrace_pct:.0%} retrace from peak ${peak:.2f}"
-                                       ))
-                            _SWING_PEAK.pop(sig_id, None)
-                            _STATUS_CACHE.pop(sig_id, None)
-                            reason = (
-                                f"Swing trailing stop — {retrace_pct:.0%} retrace "
-                                f"from peak ${peak:.2f}"
-                            )
-                            try:
-                                _push_early_book(ticker, direction, locked_pnl,
-                                                 reason, signal_id=sig_id_str)
-                            except Exception:
-                                pass
-                            continue
+                        trail = entry - TRAIL_LOCK_FRAC * (entry - peak)
+                        ratchet_up = trail < sl - 0.01
+                    if ratchet_up:
+                        trail = round(trail, 2)
+                        locked = ((trail - entry) / entry * 100) if is_long \
+                                 else ((entry - trail) / entry * 100)
+                        _update_sl(sb, sig_id, trail)
+                        _log_event(sb, sig_id, "be_move", price=price,
+                                   note=(f"📈 Trailing stop → ${trail:.2f} "
+                                         f"(locks +{locked:.1f}%) · peak ${peak:.2f}"))
+                        logger.info(f"[monitor] {ticker} trailing stop → {trail:.2f} "
+                                    f"(peak {peak:.2f}, locks +{locked:.1f}%)")
         except Exception as e:
-            logger.debug(f"[monitor] Swing trail check error for {ticker}: {e}")
+            logger.debug(f"[monitor] Trailing stop error for {ticker}: {e}")
 
         # ── 5. Intelligent early booking (scalp + day_trade only) ─────────────
         #
