@@ -158,6 +158,20 @@ _COMPRESSION_ZONE_TTL   = 2 * 3600             # drop a staged zone after 2h
 _COMPRESSION_FIRE_THROTTLE = 1800              # don't re-fire same ticker within 30 min
 _COMPRESSION_BREAKOUT_PCT  = 0.10              # price must clear edge by this % (anti-wick)
 
+# Breakout-quality: the confirming 1m bar must close in the top fraction of its
+# range for a LONG break (bottom fraction for SHORT). Rejects "rejection" bars —
+# a red candle with a big upper wick that pokes the level then closes weak
+# (the MARA bull-trap pattern, 2026-05-28). Fail-open if the bar range is unknown.
+_STRONG_CLOSE_FRAC = 0.60
+
+
+def _is_strong_close(direction: str, close: float,
+                     bar_high: float | None, bar_low: float | None) -> bool:
+    if not bar_high or not bar_low or bar_high <= bar_low:
+        return True
+    pos = (close - bar_low) / (bar_high - bar_low)   # 0 = at low, 1 = at high
+    return pos >= _STRONG_CLOSE_FRAC if direction == "LONG" else pos <= (1.0 - _STRONG_CLOSE_FRAC)
+
 
 def stage_compression_zone(ticker: str, range_high: float, range_low: float, atr: float) -> None:
     """Register a compression envelope for per-tick breakout watching."""
@@ -193,8 +207,9 @@ def clear_pullback_zone(ticker: str) -> None:
         _pullback_zones.pop(ticker, None)
 
 
-def _check_pullback_reclaim(ticker: str, price: float) -> None:
-    """Called every tick. Fire when price crosses the staged reclaim level."""
+def _check_pullback_reclaim(ticker: str, price: float,
+                            bar_high: float | None = None, bar_low: float | None = None) -> None:
+    """Called on 1m close. Fire when the bar closes across the reclaim level."""
     import time as _t
     zone = _pullback_zones.get(ticker)
     if zone is None:
@@ -212,6 +227,8 @@ def _check_pullback_reclaim(ticker: str, price: float) -> None:
               (direction == "SHORT" and price <= reclaim_level)
     if not crossed:
         return
+    if not _is_strong_close(direction, price, bar_high, bar_low):
+        return   # rejection bar — weak close, skip
 
     with _pullback_lock:
         _pullback_fired[ticker] = now
@@ -295,17 +312,27 @@ def _persist_zones(force: bool = False) -> None:
     now = _t.time()
     if not force and (now - _last_zone_persist_ts) < _ZONE_PERSIST_MIN_INTERVAL_S:
         return
+    core = {
+        "compression": {k: list(v) for k, v in _compression_zones.items()},
+        "pullback":    {k: list(v) for k, v in _pullback_zones.items()},
+        "swing":       {k: list(v) for k, v in _swing_zones.items()},
+    }
     try:
-        snap = {
-            "compression": {k: list(v) for k, v in _compression_zones.items()},
-            "pullback":    {k: list(v) for k, v in _pullback_zones.items()},
-            "swing":       {k: list(v) for k, v in _swing_zones.items()},
-            "relaxed":     dict(_zone_relaxed),
-        }
-        _zone_supabase().table("engine_kv").upsert({
-            "key": _ZONE_KV_KEY, "value": snap,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }).execute()
+        snap = {**core, "relaxed": dict(_zone_relaxed)}
+        try:
+            _zone_supabase().table("engine_kv").upsert({
+                "key": _ZONE_KV_KEY, "value": snap,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+        except Exception as _re:
+            # Never let the optional `relaxed` payload (e.g. a non-JSON value)
+            # block the core zone snapshot — retry without it so the armed
+            # display + restore stay current.
+            logger.debug(f"[stream] zone persist w/ relaxed failed ({_re}); retrying core-only")
+            _zone_supabase().table("engine_kv").upsert({
+                "key": _ZONE_KV_KEY, "value": {**core, "relaxed": {}},
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
         _last_zone_persist_ts = now   # only advance on success so failures retry
     except Exception as e:
         logger.debug(f"[stream] zone persist failed: {e}")
@@ -340,8 +367,9 @@ def load_zones_from_db() -> set[str]:
         return set()
 
 
-def _check_swing_breakout(ticker: str, price: float) -> None:
-    """Called every tick. Fire when price breaks the staged swing high/low."""
+def _check_swing_breakout(ticker: str, price: float,
+                          bar_high: float | None = None, bar_low: float | None = None) -> None:
+    """Called on 1m close. Fire when the bar closes beyond the staged swing high/low."""
     import time as _t
     zone = _swing_zones.get(ticker)
     if zone is None:
@@ -362,6 +390,8 @@ def _check_swing_breakout(ticker: str, price: float) -> None:
         direction = "SHORT"
     if direction is None:
         return
+    if not _is_strong_close(direction, price, bar_high, bar_low):
+        return   # rejection bar — weak close, skip (MARA bull-trap guard)
 
     with _swing_lock:
         _swing_fired[ticker] = now
@@ -373,11 +403,12 @@ def _check_swing_breakout(ticker: str, price: float) -> None:
         logger.debug(f"[stream] swing fire dispatch failed for {ticker}: {e}")
 
 
-def _check_compression_breakout(ticker: str, price: float) -> None:
+def _check_compression_breakout(ticker: str, price: float,
+                                bar_high: float | None = None, bar_low: float | None = None) -> None:
     """
-    Called on every tick. If `ticker` has a staged compression zone and price
-    just crossed an edge, fire a breakout signal via runner (in the scan
-    executor so we don't block the event loop).
+    Called on 1m close. If `ticker` has a staged compression zone and the bar
+    closed beyond an edge (with a strong close), fire a breakout signal via
+    runner (in the scan executor so we don't block the event loop).
     """
     import time as _t
     zone = _compression_zones.get(ticker)
@@ -406,6 +437,8 @@ def _check_compression_breakout(ticker: str, price: float) -> None:
         direction = "SHORT"
     if direction is None:
         return
+    if not _is_strong_close(direction, price, bar_high, bar_low):
+        return   # rejection bar — weak close, skip
 
     # Mark fired + remove zone (one breakout per staging) before dispatching
     with _compression_lock:
@@ -1490,15 +1523,15 @@ async def run_stream() -> None:
                 # longer triggers a false breakout. `close` is the bar body, not
                 # an intrabar high/low.
                 try:
-                    _check_compression_breakout(symbol, close)
+                    _check_compression_breakout(symbol, close, bar_high, bar_low)
                 except Exception:
                     pass
                 try:
-                    _check_pullback_reclaim(symbol, close)
+                    _check_pullback_reclaim(symbol, close, bar_high, bar_low)
                 except Exception:
                     pass
                 try:
-                    _check_swing_breakout(symbol, close)
+                    _check_swing_breakout(symbol, close, bar_high, bar_low)
                 except Exception:
                     pass
 
