@@ -252,7 +252,7 @@ def momentum_relaxed_state(df_entry: pd.DataFrame, price: float) -> dict:
     if atr <= 0:
         return out
     dev = (price - ema21) / atr
-    out["ext_atr"] = round(dev, 2)
+    out["ext_atr"] = float(round(dev, 2))   # plain float — numpy types break JSON upsert
     strong_vol = False
     if "volume" in df_entry.columns and len(df_entry) >= 11:
         rv = float(df_entry["volume"].iloc[-1])
