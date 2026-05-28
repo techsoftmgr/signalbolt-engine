@@ -88,6 +88,17 @@ TRAIL_MIN_MOVE_PCT = 0.005  # peak must be ≥0.5% beyond T1 before trailing sta
 # this we leave the stop alone so a clean trend isn't whipsawed.
 _BE_PROTECT_SCORE = 40
 
+# Pre-T1 peak trailing: start the peak-based trailing stop once peak profit has
+# covered this fraction of the entry->T1 distance — even before T1. Protects
+# swings that run most of the way then stall (DVN ran 84% to T1, then chopped
+# for 2 days and expired ~flat). Floored at breakeven, ratchets up only, uses
+# the loose per-strategy TRAIL_PEAK_PCT so swings aren't whipsawed.
+_TRAIL_ACTIVATE_FRAC = 0.6
+# Near-expiry profit backstop: within this many hours of max-hold, book a still-
+# green position at market rather than let it ride to a flat/near-flat expiry.
+_NEAR_EXPIRY_HRS        = 3.0
+_NEAR_EXPIRY_MIN_PROFIT = 0.8   # only backstop if at least this % in profit
+
 # Market close stages for intraday signals
 # EOD_WARN  → push "N min to close, consider booking profit" (no auto-close)
 # FORCE_CLOSE → auto-close all intraday positions with accurate P&L
@@ -697,20 +708,21 @@ def _monitor_stocks(sb: Client) -> None:
 
         # ── 4. T1 hit → move SL to breakeven ─────────────────────────────────
         try:
-            if sl != entry:   # not already at breakeven
-                t1_hit = (is_long and price >= t1) or (not is_long and price <= t1)
-                t2_hit = (is_long and price >= t2) or (not is_long and price <= t2)
-
-                if t1_hit and not t2_hit:
-                    pct = abs(price - entry) / entry * 100
-                    logger.info(f"[monitor] {ticker} T1 hit @ {price:.2f} — moving SL to breakeven")
-                    _update_sl(sb, sig["id"], entry)
-                    _log_event(sb, sig["id"], "t1_hit", price=price,
-                               note=f"🎯 T1 hit @ ${price:.2f} (+{pct:.1f}%) — stop moved to breakeven ${entry:.2f}")
-                    try:
-                        _push_t1_breakeven(ticker, direction, pct, signal_id=sig_id_str)
-                    except Exception:
-                        pass
+            t1_hit = (is_long and price >= t1) or (not is_long and price <= t1)
+            t2_hit = (is_long and price >= t2) or (not is_long and price <= t2)
+            # Only if the stop is still BELOW breakeven — never loosen a stop the
+            # pre-T1 peak trail (4b) may have already pushed into profit.
+            sl_worse_than_be = (is_long and sl < entry - 0.01) or (not is_long and sl > entry + 0.01)
+            if t1_hit and not t2_hit and sl_worse_than_be:
+                pct = abs(price - entry) / entry * 100
+                logger.info(f"[monitor] {ticker} T1 hit @ {price:.2f} — moving SL to breakeven")
+                _update_sl(sb, sig["id"], entry)
+                _log_event(sb, sig["id"], "t1_hit", price=price,
+                           note=f"🎯 T1 hit @ ${price:.2f} (+{pct:.1f}%) — stop moved to breakeven ${entry:.2f}")
+                try:
+                    _push_t1_breakeven(ticker, direction, pct, signal_id=sig_id_str)
+                except Exception:
+                    pass
         except Exception as e:
             logger.debug(f"[monitor] T1 check error for {ticker}: {e}")
 
@@ -731,11 +743,10 @@ def _monitor_stocks(sb: Client) -> None:
         # Example (SMCI): entry 36.90, peak 39.79 →
         #   trail = 36.90 + 0.70*(39.79-36.90) = $38.92  (locks +5.5%)
         try:
-            past_t1 = (is_long and sl >= entry - 0.01) or (not is_long and sl <= entry + 0.01)
             t2_hit  = (is_long and price >= t2) or (not is_long and price <= t2)
-            if past_t1 and not t2_hit:
+            if not t2_hit:
                 sig_id = sig["id"]
-                # Track peak (best price since T1)
+                # Track peak (best price seen on the trade)
                 if sig_id not in _SWING_PEAK:
                     _SWING_PEAK[sig_id] = price
                 elif is_long:
@@ -744,42 +755,48 @@ def _monitor_stocks(sb: Client) -> None:
                     _SWING_PEAK[sig_id] = min(_SWING_PEAK[sig_id], price)
                 peak = _SWING_PEAK[sig_id]
 
-                # ── Intelligent exit: close EARLY if multiple real-time signals
-                #    converge on a reversal (vs blindly riding to T2). The
-                #    trailing stop below remains the hard floor. Requires
-                #    convergence so a single indicator blip won't bail. ──
-                try:
-                    df_exit = smc.fetch_candles(ticker, period="2d", interval="15m")
-                    tape_sum = None
+                # Activate trailing/intelligent-exit once T1 is hit OR peak has
+                # covered _TRAIL_ACTIVATE_FRAC of the way to T1 (pre-T1 protection
+                # for runners that stall before tagging the target — DVN).
+                _denom   = (t1 - entry) if is_long else (entry - t1)
+                progress = (((peak - entry) if is_long else (entry - peak)) / _denom) if _denom else 0.0
+                t1_hit   = (is_long and price >= t1) or (not is_long and price <= t1)
+                if t1_hit or progress >= _TRAIL_ACTIVATE_FRAC:
+                    # ── Intelligent exit: close EARLY if multiple real-time
+                    #    signals converge on a reversal (vs blindly riding to T2).
+                    #    Requires convergence so a single indicator can't bail. ──
                     try:
-                        from engine import trade_tape
-                        tape_sum = trade_tape.get_summary(ticker) or trade_tape.get_summary_redis(ticker)
-                    except Exception:
-                        pass
-                    decision = exit_intelligence.evaluate_exit(sig, price, df_exit, peak, tape_sum)
-                    if decision["action"] == "close":
-                        reasons_str = ", ".join(decision["reasons"][:3])
-                        logger.info(f"[monitor] {ticker} INTELLIGENT EXIT score={decision['score']} "
-                                    f"pnl={decision['pnl_pct']}% — {reasons_str}")
-                        _close_signal(sb, sig_id, "target_hit",
-                                      current_price=price, entry_price=entry, direction=direction)
-                        _log_event(sb, sig_id, "closed_win", price=price,
-                                   note=(f"🧠 Intelligent exit @ ${price:.2f} "
-                                         f"(+{decision['pnl_pct']}%) — {reasons_str}"))
-                        _SWING_PEAK.pop(sig_id, None)
-                        _STATUS_CACHE.pop(sig_id, None)
+                        df_exit = smc.fetch_candles(ticker, period="2d", interval="15m")
+                        tape_sum = None
                         try:
-                            _push_early_book(ticker, direction, decision["pnl_pct"],
-                                             f"Intelligent exit — {reasons_str}", signal_id=sig_id_str)
+                            from engine import trade_tape
+                            tape_sum = trade_tape.get_summary(ticker) or trade_tape.get_summary_redis(ticker)
                         except Exception:
                             pass
-                        continue
-                except Exception as e:
-                    logger.debug(f"[monitor] intelligent exit error for {ticker}: {e}")
+                        decision = exit_intelligence.evaluate_exit(sig, price, df_exit, peak, tape_sum)
+                        if decision["action"] == "close":
+                            reasons_str = ", ".join(decision["reasons"][:3])
+                            logger.info(f"[monitor] {ticker} INTELLIGENT EXIT score={decision['score']} "
+                                        f"pnl={decision['pnl_pct']}% — {reasons_str}")
+                            _close_signal(sb, sig_id, "target_hit",
+                                          current_price=price, entry_price=entry, direction=direction)
+                            _log_event(sb, sig_id, "closed_win", price=price,
+                                       note=(f"🧠 Intelligent exit @ ${price:.2f} "
+                                             f"(+{decision['pnl_pct']}%) — {reasons_str}"))
+                            _SWING_PEAK.pop(sig_id, None)
+                            _STATUS_CACHE.pop(sig_id, None)
+                            try:
+                                _push_early_book(ticker, direction, decision["pnl_pct"],
+                                                 f"Intelligent exit — {reasons_str}", signal_id=sig_id_str)
+                            except Exception:
+                                pass
+                            continue
+                    except Exception as e:
+                        logger.debug(f"[monitor] intelligent exit error for {ticker}: {e}")
 
-                # Only trail once the move beyond T1 is meaningful (avoid noise)
-                move_beyond_t1 = (peak - t1) if is_long else (t1 - peak)
-                if move_beyond_t1 > 0 and move_beyond_t1 / entry >= TRAIL_MIN_MOVE_PCT:
+                    # Peak trailing: lock a fraction of the peak gain, floored at
+                    # breakeven, ratchets UP only. Loose per-strategy % so swings
+                    # (2% below peak) aren't whipsawed.
                     trail_pct = TRAIL_PEAK_PCT.get(strategy, TRAIL_DEFAULT_PCT)
                     if is_long:
                         trail = max(entry, peak * (1 - trail_pct))   # floor at breakeven
@@ -800,6 +817,34 @@ def _monitor_stocks(sb: Client) -> None:
                                     f"(peak {peak:.2f}, locks +{locked:.1f}%)")
         except Exception as e:
             logger.debug(f"[monitor] Trailing stop error for {ticker}: {e}")
+
+        # ── 4c. Near-expiry profit backstop (all strategies) ──────────────────
+        # A position that chops in profit but never tags T1 (or trips the trail)
+        # would otherwise expire near flat — DVN rode 2 days at +2-3% then expired.
+        # Within the last _NEAR_EXPIRY_HRS of its max-hold, if still green, book it.
+        try:
+            from engine.runner import STRATEGY_MAX_HOLD_HOURS as _HOLD
+            from datetime import datetime as _dtm, timezone as _tz
+            _created = _dtm.fromisoformat(sig["created_at"].replace("Z", "+00:00"))
+            _age_h   = (_dtm.now(_tz.utc) - _created).total_seconds() / 3600.0
+            _hold_h  = _HOLD.get(strategy, 48.0)
+            _t2_hit  = (is_long and price >= t2) or (not is_long and price <= t2)
+            if (not _t2_hit) and _age_h >= (_hold_h - _NEAR_EXPIRY_HRS) and pnl_pct >= _NEAR_EXPIRY_MIN_PROFIT:
+                logger.info(f"[monitor] {ticker} near-expiry profit book +{pnl_pct:.1f}% "
+                            f"(age {_age_h:.1f}/{_hold_h}h)")
+                _close_signal(sb, sig["id"], "target_hit",
+                              current_price=price, entry_price=entry, direction=direction)
+                _log_event(sb, sig["id"], "closed_win", price=price,
+                           note=f"⏳ Near-expiry book @ ${price:.2f} (+{pnl_pct:.1f}%) — banked before expiry")
+                _STATUS_CACHE.pop(sig["id"], None)
+                _SWING_PEAK.pop(sig["id"], None)
+                try:
+                    _push_early_book(ticker, direction, pnl_pct, "Near-expiry profit book", signal_id=sig_id_str)
+                except Exception:
+                    pass
+                continue
+        except Exception as e:
+            logger.debug(f"[monitor] near-expiry backstop error for {ticker}: {e}")
 
         # ── 5. Intelligent early booking (scalp + day_trade only) ─────────────
         #
