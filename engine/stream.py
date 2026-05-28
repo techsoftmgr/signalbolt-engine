@@ -293,11 +293,16 @@ def _check_retest(ticker: str, close: float,
         logger.debug(f"[stream] retest fire dispatch failed for {ticker}: {e}")
 
 
-def stage_compression_zone(ticker: str, range_high: float, range_low: float, atr: float) -> None:
-    """Register a compression envelope for per-tick breakout watching."""
+def stage_compression_zone(ticker: str, range_high: float, range_low: float, atr: float) -> bool:
+    """Register a compression envelope for per-tick breakout watching.
+    Returns True if this is a FRESH arm (ticker wasn't already staged), so the
+    caller can log the arming once; re-stages preserve the original arm time."""
     import time as _t
     with _compression_lock:
-        _compression_zones[ticker] = (range_high, range_low, atr, _t.time())
+        prev = _compression_zones.get(ticker)
+        armed_ts = prev[3] if prev else _t.time()   # preserve original arm time
+        _compression_zones[ticker] = (range_high, range_low, atr, armed_ts)
+        return prev is None
 
 
 def clear_compression_zone(ticker: str) -> None:
@@ -315,11 +320,15 @@ _pullback_fired: dict[str, float] = {}
 
 
 def stage_pullback_zone(ticker: str, direction: str, reclaim_level: float,
-                        stop_ref: float, atr: float) -> None:
-    """Register a pullback reclaim level for per-tick watching."""
+                        stop_ref: float, atr: float) -> bool:
+    """Register a pullback reclaim level for per-tick watching. Returns True on
+    a fresh arm (preserves original arm time across re-stages)."""
     import time as _t
     with _pullback_lock:
-        _pullback_zones[ticker] = (direction, reclaim_level, stop_ref, atr, _t.time())
+        prev = _pullback_zones.get(ticker)
+        armed_ts = prev[4] if prev else _t.time()
+        _pullback_zones[ticker] = (direction, reclaim_level, stop_ref, atr, armed_ts)
+        return prev is None
 
 
 def clear_pullback_zone(ticker: str) -> None:
@@ -373,10 +382,14 @@ _swing_fired: dict[str, float] = {}
 _SWING_BREAKOUT_PCT = 0.05   # price must clear the level by this % (anti-wick)
 
 
-def stage_swing_zone(ticker: str, swing_high: float, swing_low: float, atr: float) -> None:
+def stage_swing_zone(ticker: str, swing_high: float, swing_low: float, atr: float) -> bool:
+    """Returns True on a fresh arm (preserves original arm time across re-stages)."""
     import time as _t
     with _swing_lock:
-        _swing_zones[ticker] = (swing_high, swing_low, atr, _t.time())
+        prev = _swing_zones.get(ticker)
+        armed_ts = prev[3] if prev else _t.time()
+        _swing_zones[ticker] = (swing_high, swing_low, atr, armed_ts)
+        return prev is None
 
 
 def clear_swing_zone(ticker: str) -> None:

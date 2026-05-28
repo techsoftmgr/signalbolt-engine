@@ -1291,27 +1291,55 @@ def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
     # missing breakouts that happen mid-bar.
     try:
         from engine import stream as _stream
+        from engine import zone_history as _zh
         zone_staged = False
+        # Track fresh arms so we log each arming exactly once to history.
+        _armed_new: list[dict] = []
+        # Relaxed-eligible state (computed once, reused for the history rows).
+        try:
+            _relaxed = entry_gate.momentum_relaxed_state(df, price) or {}
+        except Exception:
+            _relaxed = {}
+        _is_relaxed = bool(_relaxed.get("eligible"))
+        _ext_atr    = _relaxed.get("ext_atr")
+
         zone = compression_detector.detect_zone(df)
         if zone is not None:
-            _stream.stage_compression_zone(ticker, zone.range_high, zone.range_low, zone.atr)
+            if _stream.stage_compression_zone(ticker, zone.range_high, zone.range_low, zone.atr):
+                _armed_new.append({"detector": "COMPRESSION", "direction": None,
+                                   "armed_level": None,
+                                   "range_high": zone.range_high, "range_low": zone.range_low,
+                                   "atr": zone.atr})
             zone_staged = True
         else:
             _stream.clear_compression_zone(ticker)
         # Stage pullback reclaim level too (per-tick fire when price reclaims)
         pz = pullback_detector.detect_zone(df, current_price=price)
         if pz is not None:
-            _stream.stage_pullback_zone(ticker, pz.direction, pz.reclaim_level, pz.stop_ref, pz.atr)
+            if _stream.stage_pullback_zone(ticker, pz.direction, pz.reclaim_level, pz.stop_ref, pz.atr):
+                _armed_new.append({"detector": "PULLBACK", "direction": pz.direction,
+                                   "armed_level": pz.reclaim_level,
+                                   "range_high": None, "range_low": None, "atr": pz.atr})
             zone_staged = True
         else:
             _stream.clear_pullback_zone(ticker)
         # Stage swing-high breakout levels (per-tick fire on the break)
         sz = swing_breakout_detector.detect_zone(df, current_price=price)
         if sz is not None:
-            _stream.stage_swing_zone(ticker, sz.swing_high, sz.swing_low, sz.atr)
+            if _stream.stage_swing_zone(ticker, sz.swing_high, sz.swing_low, sz.atr):
+                _armed_new.append({"detector": "SWING_BREAKOUT", "direction": None,
+                                   "armed_level": sz.swing_high, "range_high": sz.swing_high,
+                                   "range_low": sz.swing_low, "atr": sz.atr})
             zone_staged = True
         else:
             _stream.clear_swing_zone(ticker)
+
+        # Log fresh arms to lifecycle history (best-effort, off the hot path).
+        for _a in _armed_new:
+            _zh.log_armed(sb, ticker=ticker, detector=_a["detector"],
+                          direction=_a["direction"], armed_level=_a["armed_level"],
+                          range_high=_a["range_high"], range_low=_a["range_low"],
+                          atr=_a["atr"], relaxed=_is_relaxed, ext_atr=_ext_atr)
         # CRITICAL: a staged zone can ONLY fire from on_trade ticks, and Alpaca
         # pushes ticks only for SUBSCRIBED tickers. The predictive scan runs over
         # the dynamic pre-screened universe (movers), most of which are NOT in the
@@ -1325,7 +1353,7 @@ def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
             # past the standard cap with trend+volume confirming) so the Armed
             # Zones view can badge it. Cleared automatically when not eligible.
             try:
-                _stream.set_zone_relaxed(ticker, entry_gate.momentum_relaxed_state(df, price))
+                _stream.set_zone_relaxed(ticker, _relaxed or None)
             except Exception:
                 pass
         else:
@@ -1593,6 +1621,11 @@ def _fire_per_tick_predictive(ticker: str, direction: str, price: float,
         "setup_type":         setup_type,
     }
     new_sig_id = _write_signal(sb, signal_row)
+    try:
+        from engine import zone_history as _zh
+        _zh.mark_fired(sb, ticker=ticker, detector=detector, fired_signal_id=new_sig_id)
+    except Exception:
+        pass
     try:
         push.send_signal_alert(ticker, direction, adjusted_score, "stock",
                                signal_id=str(new_sig_id) if new_sig_id else None)
@@ -2049,6 +2082,14 @@ def _clear_zones_overnight() -> None:
     session arms fresh."""
     logger.info("[runner] ═══ Overnight armed-zone clear started ═══")
     try:
+        # Close out any zones that armed but never fired before wiping memory,
+        # so the history table reflects their 'expired' outcome.
+        try:
+            from engine import zone_history as _zh
+            sb = create_client(os.environ["SUPABASE_URL"], _supabase_key())
+            _zh.expire_stale(sb)
+        except Exception as e:
+            logger.debug(f"[runner] zone_history expire_stale skipped: {e}")
         from engine import stream as _stream
         _stream.clear_all_zones()
         logger.info("[runner] ═══ Overnight armed-zone clear done ═══")

@@ -2891,6 +2891,70 @@ async def admin_detector_stats(request: Request, days: int = 7):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/admin/zone-history")
+async def admin_zone_history(request: Request, days: int = 7):
+    """
+    Armed-zone lifecycle analytics from armed_zone_history. Per detector:
+    how many zones armed, how many converted to fired signals (conversion %),
+    and the win-rate of those fired signals. Lets us judge whether a detector
+    is arming useful setups vs noise. Admin only.
+    """
+    _user_id, sb = _require_admin_jwt(request)
+    from datetime import datetime, timezone, timedelta
+    days  = max(1, min(days, 90))
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+
+    try:
+        rows = (
+            sb.table("armed_zone_history")
+              .select("detector, outcome, relaxed, fired_signal_id, session_date")
+              .gte("session_date", since)
+              .limit(20000)
+              .execute()
+        ).data or []
+
+        # Win-rate of fired zones needs the signal results — batch-fetch them.
+        fired_ids = [r["fired_signal_id"] for r in rows
+                     if r.get("outcome") == "fired" and r.get("fired_signal_id")]
+        result_by_id: dict[str, str] = {}
+        if fired_ids:
+            sig_rows = (
+                sb.table("signals").select("id, result")
+                  .in_("id", fired_ids).limit(len(fired_ids)).execute()
+            ).data or []
+            result_by_id = {s["id"]: s.get("result") for s in sig_rows}
+
+        det: dict[str, dict] = {}
+        for r in rows:
+            d = det.setdefault(r["detector"], {
+                "armed": 0, "fired": 0, "expired": 0, "relaxed_armed": 0,
+                "fired_wins": 0, "fired_losses": 0})
+            outcome = r.get("outcome")
+            d["armed"] += 1
+            if r.get("relaxed"):
+                d["relaxed_armed"] += 1
+            if outcome == "fired":
+                d["fired"] += 1
+                res = result_by_id.get(r.get("fired_signal_id"))
+                if res == "win":   d["fired_wins"]   += 1
+                elif res == "loss": d["fired_losses"] += 1
+            elif outcome == "expired":
+                d["expired"] += 1
+
+        for s in det.values():
+            s["conversion_pct"] = round(s["fired"] / s["armed"] * 100, 1) if s["armed"] else None
+            judged = s["fired_wins"] + s["fired_losses"]
+            s["fired_win_rate"] = round(s["fired_wins"] / judged * 100, 1) if judged else None
+
+        return {"since": since, "days": days, "by_detector": det,
+                "total_armed": len(rows)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GET /admin/zone-history error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/admin/armed-zones")
 async def admin_armed_zones(request: Request):
     """
