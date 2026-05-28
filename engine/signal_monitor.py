@@ -815,32 +815,47 @@ def _monitor_stocks(sb: Client) -> None:
         if strategy != "swing_trade":
             try:
                 current_status = _STATUS_CACHE.get(sig["id"], "")
-                should_assess  = current_status in ("building_profit", "strong_profit") and pnl_pct > 0.5
+                # Pre-T1 only — once past T1, step 4b above owns the exit decision
+                # (convergence engine + trailing stop). Avoids double-evaluation.
+                past_t1 = (is_long and sl >= entry - 0.01) or (not is_long and sl <= entry + 0.01)
+                should_assess = (current_status in ("building_profit", "strong_profit")
+                                 and pnl_pct >= 1.0 and not past_t1)
 
                 if should_assess:
-                    book_now, reason = _momentum_check(ticker, direction)
+                    # CONVERGENCE-BASED early book (same engine as step 4b). A
+                    # single RSI/MACD reading no longer books profit — it needs
+                    # 2+ real-time factors to agree (pressure >= 55). SHOP was
+                    # closed below T1 on "RSI overbought (74)" ALONE, then ran on
+                    # toward T2 — exactly the over-booking this prevents
+                    # (fixed 2026-05-28). _momentum_check (single-indicator) is
+                    # retained only for advisory pushes, not for closing.
+                    df_exit = smc.fetch_candles(ticker, period="2d", interval="15m")
+                    tape_sum = None
+                    try:
+                        from engine import trade_tape
+                        tape_sum = trade_tape.get_summary(ticker) or trade_tape.get_summary_redis(ticker)
+                    except Exception:
+                        pass
+                    decision = exit_intelligence.evaluate_exit(sig, price, df_exit, price, tape_sum)
 
-                    # Book early if signal has been stalling for >3h with no progress
-                    if not book_now and age_mins > 180 and current_status == "building_profit":
-                        book_now = True
-                        reason   = f"Signal stalling after {age_mins:.0f} min — booking profit to protect gains"
+                    # Time-based safety: a position stalling >3h with no progress
+                    # still books to protect the gain (not a momentum call).
+                    stalling = age_mins > 180 and current_status == "building_profit"
 
-                    if book_now:
-                        # Only auto-close if profit is meaningful (≥1.0%)
-                        if pnl_pct >= 1.0:
-                            logger.info(f"[monitor] {ticker} EARLY BOOK — {reason} pnl={pnl_pct:.1f}%")
-                            _close_signal(sb, sig["id"], "target_hit",
-                                          current_price=price, entry_price=entry, direction=direction)
-                            _log_event(sb, sig["id"], "closed_win", price=price,
-                                       note=f"💡 Profit booked @ ${price:.2f} (+{pnl_pct:.1f}%) — {reason}")
-                            _STATUS_CACHE.pop(sig["id"], None)
-                            try:
-                                _push_early_book(ticker, direction, pnl_pct, reason, signal_id=sig_id_str)
-                            except Exception:
-                                pass
-                            continue   # signal is now closed
-                        else:
-                            logger.debug(f"[monitor] {ticker} early book skipped — pnl {pnl_pct:.1f}% < 1.0% minimum")
+                    if decision["action"] == "close" or stalling:
+                        reason = (", ".join(decision["reasons"][:3]) if decision["action"] == "close"
+                                  else f"stalling {age_mins:.0f} min — protecting gains")
+                        logger.info(f"[monitor] {ticker} EARLY BOOK (convergence) — {reason} pnl={pnl_pct:.1f}%")
+                        _close_signal(sb, sig["id"], "target_hit",
+                                      current_price=price, entry_price=entry, direction=direction)
+                        _log_event(sb, sig["id"], "closed_win", price=price,
+                                   note=f"💡 Profit booked @ ${price:.2f} (+{pnl_pct:.1f}%) — {reason}")
+                        _STATUS_CACHE.pop(sig["id"], None)
+                        try:
+                            _push_early_book(ticker, direction, pnl_pct, reason, signal_id=sig_id_str)
+                        except Exception:
+                            pass
+                        continue   # signal is now closed
             except Exception as e:
                 logger.debug(f"[monitor] Early booking check error for {ticker}: {e}")
 
