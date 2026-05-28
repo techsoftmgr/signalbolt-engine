@@ -38,6 +38,7 @@ from engine import mean_reversion
 from engine import gap_engine
 from engine import entry_gate
 from engine import trade_tape
+from engine import compression_detector, pullback_detector
 
 
 def _tape_bonus(ticker: str) -> dict:
@@ -1242,6 +1243,163 @@ def _process_ticker(sb: Client, ticker: str, config: dict,
                 return
 
         _process_smc_ticker(sb, ticker, config, **ctx)
+
+        # ── Predictive setup detectors (Compression + Pullback) ────────────
+        # Run AFTER SMC so they only add NEW signals on tickers SMC missed.
+        # day_trade only — scalping window too short for compression patterns,
+        # swing operates on a different timescale.
+        if strategy_type == "day_trade":
+            try:
+                _process_predictive_ticker(sb, ticker, config, **ctx)
+            except Exception as e:
+                logger.debug(f"[runner] {ticker} predictive error: {e}")
+
+
+def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
+                                regime: dict = None, session: dict = None) -> None:
+    """
+    Parallel predictive pipeline: compression breakout + pullback continuation.
+    Aims to fire at the START of moves (vs SMC which fires after confirmation).
+
+    Uses fixed confidence_score (75) — these are structural setups, not
+    multi-layer scored. Still flows through entry_gate + sl_tp_engine for
+    consistent risk handling.
+    """
+    strategy_type = config["type"]
+    regime  = regime or {}
+    session = session or {}
+
+    # Avoid duplicate fires
+    if _has_active_signal(sb, ticker, strategy_type):
+        return
+
+    # Fetch bars + latest price
+    try:
+        from engine import alpaca_client as _alpaca
+        df    = _alpaca.get_bars(ticker, timeframe=config.get("interval", "15m"), days=5)
+        price = _alpaca.get_latest_price(ticker)
+    except Exception:
+        return
+    if df is None or df.empty or not price:
+        return
+
+    # Try compression breakout first
+    setup_name: str  = ""
+    setup_reason: str = ""
+    direction:    Optional[str] = None
+    try:
+        comp_setup = compression_detector.detect(df, current_price=price)
+    except Exception:
+        comp_setup = None
+    if comp_setup is not None:
+        direction    = comp_setup.direction
+        setup_name   = comp_setup.setup_type
+        setup_reason = (f"Compression breakout — range ${comp_setup.range_low:.2f}-"
+                        f"${comp_setup.range_high:.2f}, breakout +{comp_setup.breakout_pct:.2f}%")
+
+    # Else try pullback completion
+    if direction is None:
+        try:
+            pb_setup = pullback_detector.detect(df, current_price=price)
+        except Exception:
+            pb_setup = None
+        if pb_setup is not None:
+            direction    = pb_setup.direction
+            setup_name   = pb_setup.setup_type
+            setup_reason = (f"Pullback reclaim — leg {pb_setup.leg_bars}b + pullback "
+                            f"{pb_setup.pullback_bars}b ({pb_setup.retracement_pct:.0%} retrace), "
+                            f"reclaim ${pb_setup.swing_level:.2f}")
+
+    if direction is None:
+        return   # no predictive setup on this ticker right now
+
+    logger.info(f"[runner] {ticker} [{strategy_type}] PREDICTIVE setup: {setup_name} {direction} @ ${price:.2f}")
+
+    # ── Compute SL/TP using the standard engine for consistent risk ─────
+    sltp = sl_tp_engine.calculate(
+        direction     = direction,
+        entry         = price,
+        df            = df,
+        regime        = regime,
+        session       = session,
+        gamma         = {"available": False},
+        strategy_type = strategy_type,
+        interval      = config.get("interval", "15m"),
+    )
+    if not sltp.get("valid"):
+        logger.info(f"[runner] {ticker} [{strategy_type}] PREDICTIVE blocked — R:R={sltp.get('risk_reward_1', 0):.2f}")
+        return
+
+    # ── Run the same entry gates as SMC for consistency ─────────────────
+    entry_gate_log: dict = {}
+    try:
+        gate = entry_gate.check(
+            ticker        = ticker, direction = direction,
+            strategy_type = strategy_type,
+            df_entry      = df, price = price,
+            entry_tf      = config.get("interval", "15m"),
+        )
+        entry_gate_log = dict(gate.gate_log)
+        if not gate.allowed:
+            logger.info(f"[runner] {ticker} [{strategy_type}] PREDICTIVE blocked by gate: {' | '.join(gate.reasons)}")
+            entry_gate.log_rejection(
+                sb=sb, ticker=ticker, direction=direction,
+                strategy_type=strategy_type, price=price,
+                confidence_score=75, gate=gate,
+            )
+            return
+    except Exception as e:
+        logger.warning(f"[runner] {ticker} PREDICTIVE entry_gate error (failing open): {e}")
+        entry_gate_log = {"error": str(e)}
+
+    # ── Portfolio risk ──────────────────────────────────────────────────
+    risk = risk_manager.check(sb, ticker, 75)
+    if not risk["allowed"]:
+        logger.info(f"[runner] {ticker} [{strategy_type}] PREDICTIVE blocked — portfolio: {risk['block_reason']}")
+        return
+
+    _tape_b = _tape_bonus(ticker)
+    adjusted_score = max(0, min(100, 75 + _tape_b.get("bonus", 0)))
+
+    signal_row = {
+        "ticker":             ticker,
+        "direction":          direction,
+        "entry_price":        round(price, 2),
+        "stop_loss":          sltp["stop_loss"],
+        "target_one":         sltp["target_one"],
+        "target_two":         sltp["target_two"],
+        "confidence_score":   adjusted_score,
+        "confidence_factors": [setup_reason] + _tape_b.get("reasons", []),
+        "timeframe":          config["interval"],
+        "strategy_type":      strategy_type,
+        "status":             "active",
+        "ai_explanation":     setup_reason,
+        "regime_type":        regime.get("regime_type", ""),
+        "session_mode":       session.get("mode", ""),
+        "confidence_tier":    risk["confidence_tier"],
+        "position_multiplier": risk["position_mult"],
+        "sl_adjustments":     sltp.get("adjustments", []),
+        "risk_reward":        sltp["risk_reward_1"],
+        "score_breakdown":    {
+            "predictive_setup": setup_name,
+            "predictive_reason": setup_reason,
+            "entry_gate":      entry_gate_log,
+            "sl_width_pct":    round(abs(price - sltp["stop_loss"]) / price * 100, 3),
+            "atr_used":        round(sltp.get("atr", 0), 4),
+            "adr_used":        round(sltp.get("adr", 0), 4),
+            "tape_bonus":      _tape_b,
+        },
+        "confidence_grade":   "B+",   # predictive setups default tier
+        "setup_type":         setup_name,
+    }
+    new_sig_id = _write_signal(sb, signal_row)
+    try:
+        push.send_signal_alert(
+            ticker, direction, adjusted_score, "stock",
+            signal_id=str(new_sig_id) if new_sig_id else None,
+        )
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
