@@ -227,6 +227,14 @@ def _gate_spread(ticker: str) -> tuple[bool, str, Optional[float]]:
     return True, f"spread ok {spread_pct:.2f}%", spread_pct
 
 
+# Overextension caps (ATRs from EMA21). The momentum cap is used only when
+# trend + volume strongly confirm — so clean runners (HOOD/SOFI-class momentum
+# days) aren't blocked as "chasing", while weak low-volume drift past the level
+# still is. Tagged in gate_log as momentum_relaxed for A/B vs the standard cap.
+_STD_MAX_ATR      = 2.5
+_MOMENTUM_MAX_ATR = 4.0
+
+
 def _gate_patterns(direction: str, df_entry: pd.DataFrame, price: float) -> tuple[bool, str]:
     """Reject obvious bad-entry patterns on the entry timeframe."""
     if df_entry is None or len(df_entry) < 22:
@@ -241,15 +249,35 @@ def _gate_patterns(direction: str, df_entry: pd.DataFrame, price: float) -> tupl
     if direction == "SHORT" and all(closes > opens):
         return False, "3 consecutive green bars on entry tf (chasing pullback)"
 
-    # 2. Overextended from EMA21 (mean-reversion risk too high)
+    # 2. Overextended from EMA21 (mean-reversion risk too high).
+    #    Momentum-continuation: when the trend (EMA9 vs EMA21) agrees with the
+    #    signal AND the entry bar has real participation (volume ≥ recent avg),
+    #    allow a wider extension — a strong runner shouldn't be rejected as a
+    #    chase. Weak/low-volume extension still uses the tight standard cap.
+    ema9  = float(_ema(df_entry["close"], 9).iloc[-1])
     ema21 = float(_ema(df_entry["close"], 21).iloc[-1])
     atr   = _atr(df_entry, 14)
+
+    trend_agrees = (ema9 > ema21) if direction == "LONG" else (ema9 < ema21)
+    strong_vol = False
+    if "volume" in df_entry.columns and len(df_entry) >= 11:
+        _rv = float(df_entry["volume"].iloc[-1])
+        _av = float(df_entry["volume"].iloc[-11:-1].mean())
+        strong_vol = _av > 0 and _rv >= _av
+    momentum_ok = trend_agrees and strong_vol
+    max_atr = _MOMENTUM_MAX_ATR if momentum_ok else _STD_MAX_ATR
+
     if atr > 0:
         deviation = (price - ema21) / atr
-        if direction == "LONG" and deviation > 2.5:
-            return False, f"overextended above EMA21 ({deviation:+.1f} ATRs)"
-        if direction == "SHORT" and deviation < -2.5:
-            return False, f"overextended below EMA21 ({deviation:+.1f} ATRs)"
+        if direction == "LONG" and deviation > max_atr:
+            return False, f"overextended above EMA21 ({deviation:+.1f} ATRs > {max_atr})"
+        if direction == "SHORT" and deviation < -max_atr:
+            return False, f"overextended below EMA21 ({deviation:+.1f} ATRs > {max_atr})"
+        if momentum_ok and abs(deviation) > _STD_MAX_ATR:
+            # Passed only because of the relaxed cap — flag it for A/B telemetry.
+            # (strong_vol is required for momentum_ok, so the volume-drop check
+            # below can't trigger anyway — safe to short-circuit here.)
+            return True, f"momentum_relaxed (ext {deviation:+.1f} ATR <= {max_atr}, vol+trend ok)"
 
     # 3. Volume drop into entry (last bar < 50% of avg of prior 10 bars)
     if "volume" in df_entry.columns and len(df_entry) >= 11:
@@ -338,7 +366,13 @@ def check(
     # Gate 4: Pattern rejectors (uses entry-tf df, no extra fetch)
     if not _maybe_skip("patterns"):
         ok, reason = _gate_patterns(direction, df_entry, price)
-        result.gate_log["patterns"] = "pass" if ok else f"fail: {reason}"
+        if ok and reason.startswith("momentum_relaxed"):
+            # Allowed via the relaxed overextension cap — record for A/B so we
+            # can compare win-rate of momentum-relaxed entries vs standard ones.
+            result.gate_log["patterns"] = "pass"
+            result.gate_log["momentum_relaxed"] = reason
+        else:
+            result.gate_log["patterns"] = "pass" if ok else f"fail: {reason}"
         if not ok:
             result.allowed = False
             result.reasons.append(reason)
