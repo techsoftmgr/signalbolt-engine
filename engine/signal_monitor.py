@@ -558,6 +558,12 @@ def _monitor_stocks(sb: Client) -> None:
     now_utc     = datetime.now(timezone.utc)
 
     for sig in rows:
+        # TREND_MOMENTUM signals are fully owned by engine.momentum_monitor
+        # (chandelier trail, daily-close trend-break exit, no fixed targets /
+        # breakeven / EOD). Skip them here so the two managers don't conflict.
+        if ((sig.get("score_breakdown") or {}).get("detector_source")) == "TREND_MOMENTUM":
+            continue
+
         ticker    = sig["ticker"]
         strategy  = sig.get("strategy_type") or "day_trade"
         direction = sig["direction"]
