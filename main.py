@@ -2864,6 +2864,132 @@ async def admin_detector_stats(request: Request, days: int = 7):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/admin/armed-zones")
+async def admin_armed_zones(request: Request):
+    """
+    Detailed view of every per-tick zone currently armed (compression /
+    pullback / swing breakout). For each: ticker, when it was staged, the
+    trigger level(s) it's waiting to cross, the direction watched, plus live
+    price + distance to the nearest trigger. Powers the admin diagnostic
+    screen (tap a zone → 15m chart with the trigger levels overlaid).
+
+    Admin only.
+    """
+    _user_id, _sb = _require_admin_jwt(request)
+    from datetime import datetime, timezone
+
+    # Breakout clearance % — MUST match engine/stream.py
+    SWING_PCT = 0.05
+    COMP_PCT  = 0.10
+
+    try:
+        from engine import cache
+        snap = cache.kv.get_json("stream:zones:v1") or {}
+    except Exception:
+        snap = {}
+
+    comp  = snap.get("compression") or {}
+    pull  = snap.get("pullback")    or {}
+    swing = snap.get("swing")       or {}
+
+    now_ts = datetime.now(timezone.utc).timestamp()
+
+    def _staged(staged_ts):
+        try:
+            iso = datetime.fromtimestamp(float(staged_ts), tz=timezone.utc).isoformat()
+            age = max(0, int((now_ts - float(staged_ts)) / 60))
+        except Exception:
+            iso, age = None, None
+        return iso, age
+
+    zones: list[dict] = []
+
+    # Compression: [range_high, range_low, atr, staged_ts] — watches BOTH sides
+    for tk, v in comp.items():
+        try:
+            range_high, range_low, atr, staged_ts = float(v[0]), float(v[1]), float(v[2]), v[3]
+        except Exception:
+            continue
+        iso, age = _staged(staged_ts)
+        tl = round(range_high * (1 + COMP_PCT / 100), 4)
+        ts = round(range_low  * (1 - COMP_PCT / 100), 4)
+        zones.append({
+            "detector": "COMPRESSION", "ticker": tk, "staged_at": iso, "age_min": age,
+            "atr": round(atr, 4), "watch": "BOTH",
+            "trigger_long": tl, "trigger_short": ts,
+            "levels": {"range_high": round(range_high, 4), "range_low": round(range_low, 4)},
+            "waiting_for": f"Break above ${tl:.2f} (LONG) or below ${ts:.2f} (SHORT)",
+        })
+
+    # Swing: [swing_high, swing_low, atr, staged_ts] — 0.0 = that side not watched
+    for tk, v in swing.items():
+        try:
+            swing_high, swing_low, atr, staged_ts = float(v[0]), float(v[1]), float(v[2]), v[3]
+        except Exception:
+            continue
+        iso, age = _staged(staged_ts)
+        tl = round(swing_high * (1 + SWING_PCT / 100), 4) if swing_high > 0 else None
+        ts = round(swing_low  * (1 - SWING_PCT / 100), 4) if swing_low  > 0 else None
+        watch = "BOTH" if (tl and ts) else ("LONG" if tl else "SHORT")
+        parts = []
+        if tl: parts.append(f"break above ${tl:.2f} (LONG)")
+        if ts: parts.append(f"break below ${ts:.2f} (SHORT)")
+        zones.append({
+            "detector": "SWING_BREAKOUT", "ticker": tk, "staged_at": iso, "age_min": age,
+            "atr": round(atr, 4), "watch": watch,
+            "trigger_long": tl, "trigger_short": ts,
+            "levels": {"swing_high": round(swing_high, 4) if swing_high > 0 else None,
+                       "swing_low":  round(swing_low, 4)  if swing_low  > 0 else None},
+            "waiting_for": ("Waiting to " + " or ".join(parts)) if parts else "—",
+        })
+
+    # Pullback: [direction, reclaim_level, stop_ref, atr, staged_ts]
+    for tk, v in pull.items():
+        try:
+            direction = str(v[0]).upper()
+            reclaim_level, stop_ref, atr, staged_ts = float(v[1]), float(v[2]), float(v[3]), v[4]
+        except Exception:
+            continue
+        iso, age = _staged(staged_ts)
+        is_long = direction == "LONG"
+        zones.append({
+            "detector": "PULLBACK", "ticker": tk, "staged_at": iso, "age_min": age,
+            "atr": round(atr, 4), "watch": direction,
+            "trigger_long":  round(reclaim_level, 4) if is_long else None,
+            "trigger_short": round(reclaim_level, 4) if not is_long else None,
+            "levels": {"reclaim_level": round(reclaim_level, 4), "stop_ref": round(stop_ref, 4)},
+            "waiting_for": f"Reclaim ${reclaim_level:.2f} ({direction})",
+        })
+
+    # Enrich with live price + nearest-trigger distance (one bulk snapshot call)
+    tickers = sorted({z["ticker"] for z in zones})
+    try:
+        snaps = _polygon_stock_snapshots(tickers)
+        prices = {k: v.get("price") for k, v in (snaps or {}).items()}
+    except Exception:
+        prices = {}
+
+    for z in zones:
+        px = prices.get(z["ticker"])
+        z["current_price"] = px
+        nearest = None
+        if px:
+            cands = [t for t in (z.get("trigger_long"), z.get("trigger_short")) if t]
+            if cands:
+                nearest = round(min(abs(px - t) / px * 100 for t in cands), 2)
+        z["nearest_trigger_pct"] = nearest
+
+    # Closest-to-triggering first; unknown distance (no price) last
+    zones.sort(key=lambda z: (z["nearest_trigger_pct"] is None,
+                              z["nearest_trigger_pct"] if z["nearest_trigger_pct"] is not None else 1e9))
+
+    return {
+        "as_of":  datetime.now(timezone.utc).isoformat(),
+        "counts": {"compression": len(comp), "pullback": len(pull), "swing": len(swing)},
+        "zones":  zones,
+    }
+
+
 @app.get("/admin/tape/{ticker}")
 async def admin_tape_detail(ticker: str, request: Request):
     """Trade-tape snapshot for a single ticker. JWT-gated to admin.
