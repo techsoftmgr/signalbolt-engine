@@ -283,14 +283,17 @@ def _validate_one(row: dict) -> Optional[dict]:
 
 def validate_batch(sb, limit: int = 200) -> dict:
     """
-    Pull `limit` un-validated rejections and backfill their outcomes.
-    Returns a summary dict for logging / reporting.
+    Pull `limit` rejections needing backfill and record their outcomes.
+    Picks rows that are unjudged (would_have_won IS NULL) OR judged before the
+    lifecycle columns existed (exit_price IS NULL) so the trade geometry
+    (stop/target/exit) gets filled in on the existing backbook too. Once a row
+    has exit_price set it's no longer re-processed.
     """
     try:
         rows = (
             sb.table("entry_gate_rejections")
               .select("id, created_at, ticker, direction, strategy_type, price")
-              .is_("would_have_won", "null")
+              .or_("would_have_won.is.null,exit_price.is.null")
               .order("created_at", desc=True)
               .limit(max(1, min(limit, 1000)))
               .execute()
