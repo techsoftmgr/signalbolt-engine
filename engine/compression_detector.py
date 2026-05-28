@@ -41,7 +41,9 @@ logger = logging.getLogger("signalbolt.compression")
 # ── Tunables ────────────────────────────────────────────────────────────────
 
 COMPRESSION_BARS  = 4       # consecutive bars required in tight range
-COMPRESSION_RATIO = 0.55    # bar range must be ≤ this × ATR(14)
+COMPRESSION_RATIO = 0.80    # bar range must be ≤ this × ATR(14) — loosened from
+                            # 0.55 (was 0/12 on liquid names; real consolidations
+                            # often run 0.6-0.8× ATR per bar, not ultra-tight)
 MIN_BREAKOUT_PCT  = 0.10    # current price must be at least this much past
                             # the envelope edge (avoid 1-tick wicks)
 MAX_BREAKOUT_PCT  = 1.20    # if it's already ≥this % beyond the envelope,
@@ -165,7 +167,7 @@ def detect_zone(df: pd.DataFrame) -> Optional[CompressionZone]:
 
     range_high = float(comp_window["high"].max())
     range_low  = float(comp_window["low"].min())
-    if (range_high - range_low) > 1.0 * atr:
+    if (range_high - range_low) > 1.5 * atr:   # loosened from 1.0× (see above)
         return None
 
     return CompressionZone(range_high=range_high, range_low=range_low, atr=atr)
