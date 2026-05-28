@@ -3381,6 +3381,26 @@ async def admin_run_gate_validator(request: Request, limit: int = 200):
             "note": "Validation running in the background — refresh in ~1-2 min."}
 
 
+@app.post("/admin/run-momentum-scan")
+async def admin_run_momentum_scan(request: Request):
+    """Manually trigger the systematic momentum scan (on-demand testing). Runs
+    in the background (universe of daily-bar fetches + ranking) and returns
+    immediately."""
+    _user_id, _sb = _require_admin_jwt(request)
+    import threading
+
+    def _job():
+        try:
+            from engine import runner
+            runner._run_momentum_scan()
+        except Exception as e:
+            logger.error(f"[run-momentum-scan bg] failed: {e}", exc_info=True)
+
+    threading.Thread(target=_job, daemon=True, name="manual-momentum").start()
+    return {"status": "started",
+            "note": "Momentum scan running in the background — check Signals in ~1-2 min."}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ── Premium Feature Endpoints ─────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════

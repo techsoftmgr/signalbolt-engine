@@ -1740,6 +1740,142 @@ def fire_ema_reclaim(ticker: str, direction: str, price: float,
 
 
 # ---------------------------------------------------------------------------
+# Systematic momentum / trend-following (cross-sectional, daily bars)
+# ---------------------------------------------------------------------------
+_MOMENTUM_MAX_LONGS  = 8
+_MOMENTUM_MAX_SHORTS = 4
+_MOMENTUM_ATR_STOP   = 1.5    # stop = entry ∓ 1.5 × daily ATR (room for a multi-day hold)
+_MOMENTUM_RR         = 2.0    # target_one at 2R, target_two at 3.5R
+
+
+def _fire_momentum(sb: Client, ms, direction: str) -> None:
+    """Fire a swing momentum signal (detector_source=TREND_MOMENTUM)."""
+    strategy_type = "swing_trade"
+    if _has_active_signal(sb, ms.ticker, strategy_type):
+        return
+    price, atr = ms.last_price, ms.atr
+    if not price or atr <= 0:
+        return
+
+    if direction == "LONG":
+        stop = round(price - _MOMENTUM_ATR_STOP * atr, 2)
+        risk = price - stop
+        t1, t2 = round(price + _MOMENTUM_RR * risk, 2), round(price + 3.5 * risk, 2)
+    else:
+        stop = round(price + _MOMENTUM_ATR_STOP * atr, 2)
+        risk = stop - price
+        t1, t2 = round(price - _MOMENTUM_RR * risk, 2), round(price - 3.5 * risk, 2)
+    if risk <= 0:
+        return
+
+    entry_gate_log: dict = {}
+    try:
+        from engine import alpaca_client as _alpaca
+        df_e = _alpaca.get_bars(ms.ticker, timeframe="1Hour", days=10)
+        gate = entry_gate.check(ticker=ms.ticker, direction=direction,
+                                strategy_type=strategy_type, df_entry=df_e,
+                                price=price, entry_tf="1h", detector="TREND_MOMENTUM")
+        entry_gate_log = dict(gate.gate_log)
+        if not gate.allowed:
+            logger.info(f"[runner] {ms.ticker} TREND_MOMENTUM blocked: {' | '.join(gate.reasons)}")
+            entry_gate.log_rejection(sb=sb, ticker=ms.ticker, direction=direction,
+                                     strategy_type=strategy_type, price=price,
+                                     confidence_score=75, gate=gate, detector="TREND_MOMENTUM")
+            return
+    except Exception as e:
+        logger.warning(f"[runner] {ms.ticker} TREND_MOMENTUM gate error (failing open): {e}")
+
+    risk_chk = risk_manager.check(sb, ms.ticker, 75)
+    if not risk_chk["allowed"]:
+        logger.info(f"[runner] {ms.ticker} TREND_MOMENTUM blocked — portfolio: {risk_chk['block_reason']}")
+        return
+
+    setup_reason = (f"Trend momentum — {direction} (rank z={ms.score:+.2f}, "
+                    f"6m-blend {ms.raw_return * 100:+.1f}% @ {ms.ann_vol * 100:.0f}% vol)")
+    logger.info(f"[runner] {ms.ticker} TREND_MOMENTUM {direction} @ ${price:.2f}  z={ms.score:+.2f}")
+    signal_row = {
+        "ticker":             ms.ticker,
+        "direction":          direction,
+        "entry_price":        round(price, 2),
+        "stop_loss":          stop,
+        "target_one":         t1,
+        "target_two":         t2,
+        "confidence_score":   75,
+        "confidence_factors": [setup_reason],
+        "timeframe":          "1d",
+        "strategy_type":      strategy_type,
+        "status":             "active",
+        "ai_explanation":     setup_reason,
+        "regime_type":        "",
+        "session_mode":       "",
+        "confidence_tier":    risk_chk["confidence_tier"],
+        "position_multiplier": risk_chk["position_mult"],
+        "risk_reward":        _MOMENTUM_RR,
+        "score_breakdown":    {
+            "detector_source":   "TREND_MOMENTUM",
+            "predictive_setup":  "TREND_MOMENTUM",
+            "predictive_reason": setup_reason,
+            "mom_score":         ms.score,
+            "blended_return":    ms.raw_return,
+            "ann_vol":           ms.ann_vol,
+            "sma_fast":          ms.sma_fast,
+            "sma_slow":          ms.sma_slow,
+            "entry_gate":        entry_gate_log,
+        },
+        "confidence_grade":   "B+",
+        "setup_type":         "TREND_MOMENTUM",
+    }
+    new_id = _write_signal(sb, signal_row)
+    try:
+        push.send_signal_alert(ms.ticker, direction, 75, "stock",
+                               signal_id=str(new_id) if new_id else None)
+    except Exception:
+        pass
+
+
+def _run_momentum_scan() -> None:
+    """Daily cross-sectional momentum scan: rank the universe by vol-adjusted
+    trend momentum, fire the strongest uptrend names LONG (and the weakest
+    downtrend names SHORT only in a bearish regime). Scheduled ~10 AM ET."""
+    from engine.session_classifier import is_market_open_today
+    if not is_market_open_today():
+        logger.info("[runner] Momentum scan skipped — market closed today")
+        return
+    logger.info("[runner] ═══ Momentum scan started ═══")
+    try:
+        from engine import momentum_detector as md, alpaca_client as _alpaca
+        sb = _supabase()
+        try:
+            regime = regime_detector.detect()
+        except Exception:
+            regime = {"regime_type": "RANGING"}
+        bearish = regime.get("regime_type") in ("TRENDING_BEAR", "RISK_OFF", "PANIC")
+
+        scores = []
+        for tk in md.UNIVERSE:
+            try:
+                df = _alpaca.get_bars(tk, timeframe="1Day", days=400)
+                ms = md.score(tk, df)
+                if ms and ms.bias != "NONE":
+                    scores.append(ms)
+            except Exception:
+                continue
+
+        longs  = sorted([s for s in scores if s.bias == "LONG"],  key=lambda x: -x.score)[:_MOMENTUM_MAX_LONGS]
+        shorts = (sorted([s for s in scores if s.bias == "SHORT"], key=lambda x: x.score)[:_MOMENTUM_MAX_SHORTS]
+                  if bearish else [])
+        for s in longs:
+            _fire_momentum(sb, s, "LONG")
+        for s in shorts:
+            _fire_momentum(sb, s, "SHORT")
+        logger.info(f"[runner] ═══ Momentum scan done — {len(scores)} qualified, "
+                    f"fired {len(longs)} longs / {len(shorts)} shorts (regime={regime.get('regime_type')}) ═══")
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        logger.error(f"[runner] Momentum scan failed: {e}", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # Auto-close logic
 # ---------------------------------------------------------------------------
 
@@ -2348,6 +2484,19 @@ def start_scheduler() -> BackgroundScheduler:
         replace_existing=True,
     )
     logger.info("[runner] Scheduled overnight armed-zone clear (12:30 AM ET)")
+
+    # ── Systematic momentum / trend scan — 10:00 AM ET weekdays ──────────
+    # Cross-sectional momentum is a slow (daily) signal; run once after the
+    # open settles. Fires swing signals tagged TREND_MOMENTUM, side-by-side
+    # with SMC so the scorecard can compare realized edge.
+    scheduler.add_job(
+        _run_momentum_scan,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=10, minute=0, timezone="America/New_York"),
+        id="momentum_scan",
+        name="SignalBolt systematic momentum scan",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled momentum scan (10:00 AM ET, Mon-Fri)")
 
     scheduler.start()
     logger.info(
