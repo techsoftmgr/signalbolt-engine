@@ -2802,7 +2802,8 @@ async def admin_detector_stats(request: Request, days: int = 7):
     try:
         rows = (
             sb.table("signals")
-              .select("status, result, result_pct, score_breakdown, created_at")
+              .select("ticker, direction, strategy_type, entry_price, result, result_pct, "
+                      "status, score_breakdown, created_at")
               .gte("created_at", since)
               .order("created_at", desc=True)
               .limit(1000)
@@ -2813,7 +2814,7 @@ async def admin_detector_stats(request: Request, days: int = 7):
         for r in rows:
             src = (r.get("score_breakdown") or {}).get("detector_source") or "SMC"
             d = det.setdefault(src, {"fires": 0, "active": 0, "wins": 0, "losses": 0,
-                                     "pending": 0, "pnl_sum": 0.0, "pnl_n": 0})
+                                     "pending": 0, "pnl_sum": 0.0, "pnl_n": 0, "signals": []})
             d["fires"] += 1
             if r.get("status") == "active":
                 d["active"] += 1
@@ -2825,6 +2826,18 @@ async def admin_detector_stats(request: Request, days: int = 7):
             pct = r.get("result_pct")
             if pct is not None:
                 d["pnl_sum"] += float(pct); d["pnl_n"] += 1
+            # Keep the individual signal (cap 25/detector to bound payload)
+            if len(d["signals"]) < 25:
+                d["signals"].append({
+                    "ticker":      r.get("ticker"),
+                    "direction":   r.get("direction"),
+                    "strategy":    r.get("strategy_type"),
+                    "entry":       r.get("entry_price"),
+                    "result":      r.get("result"),
+                    "result_pct":  r.get("result_pct"),
+                    "status":      r.get("status"),
+                    "created_at":  r.get("created_at"),
+                })
 
         for src, d in det.items():
             judged = d["wins"] + d["losses"]
