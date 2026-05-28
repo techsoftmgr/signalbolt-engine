@@ -2972,7 +2972,7 @@ async def admin_gate_performance(request: Request, days: int = 7):
     try:
         rows = (
             sb.table("entry_gate_rejections")
-              .select("id, ticker, direction, strategy_type, price, stop_loss, "
+              .select("id, ticker, direction, strategy_type, detector, price, stop_loss, "
                       "target_one, exit_price, exit_reason, would_have_won, "
                       "realized_pnl_pct, gate_log, created_at")
               .gte("created_at", since)
@@ -2999,6 +2999,7 @@ async def admin_gate_performance(request: Request, days: int = 7):
                 "ticker":      r.get("ticker"),
                 "direction":   r.get("direction"),
                 "strategy":    r.get("strategy_type"),
+                "detector":    r.get("detector") or "SMC",
                 "entry":       r.get("price"),
                 "stop":        r.get("stop_loss"),
                 "exit":        r.get("exit_price"),

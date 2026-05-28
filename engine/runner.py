@@ -698,6 +698,14 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
     regime  = regime or {}
     session = session or {}
 
+    # Late-session / after-hours guard for intraday strategies. Event-driven
+    # bar closes keep triggering scans after 16:00 ET (Alpaca EXTO bars), which
+    # produced after-hours LONG chases (e.g. CRWD @674 at 4:31–5:20 PM ET). A
+    # day_trade entered that late has no session left. Swing/position exempt.
+    if strategy_type in _INTRADAY_STRATEGIES and not _intraday_entry_window_open():
+        logger.debug(f"[runner] {ticker} [{strategy_type}] — outside intraday entry window, skipping")
+        return
+
     if _has_active_signal(sb, ticker, strategy_type):
         logger.debug(f"[runner] {ticker} [{strategy_type}]: active signal exists — skipping")
         return
@@ -1264,8 +1272,16 @@ _PREDICTIVE_ENTRY_OPEN_MIN  = 9 * 60 + 30   # 09:30 ET
 _PREDICTIVE_ENTRY_CLOSE_MIN = 15 * 60 + 45  # 15:45 ET
 
 
-def _predictive_entry_window_open() -> bool:
-    """True only during the predictive entry window (09:30–15:45 ET, weekday)."""
+# Intraday strategies that must not open new entries late / after hours.
+# Swing / position trades hold for days, so a late entry is fine for them.
+_INTRADAY_STRATEGIES = {"day_trade", "scalping", "options_flow", "dark_pool"}
+
+
+def _intraday_entry_window_open() -> bool:
+    """True only during the intraday entry window (09:30–15:45 ET, weekday).
+    Used to block day_trade/scalping entries late in or after the session —
+    event-driven bar closes still fire after 16:00 ET (e.g. CRWD after-hours
+    chases) so the schedule alone isn't enough."""
     try:
         from zoneinfo import ZoneInfo as _ZI
         now = datetime.now(_ZI("America/New_York"))
@@ -1275,6 +1291,11 @@ def _predictive_entry_window_open() -> bool:
         return _PREDICTIVE_ENTRY_OPEN_MIN <= mins < _PREDICTIVE_ENTRY_CLOSE_MIN
     except Exception:
         return True   # fail open — never worse than today's behavior
+
+
+# Backwards-compatible alias for the predictive fire path.
+def _predictive_entry_window_open() -> bool:
+    return _intraday_entry_window_open()
 
 
 def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
@@ -1387,6 +1408,20 @@ def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
     except Exception:
         pass
 
+    # ── EMA reclaim / trend-day continuation ─────────────────────────────
+    # Catches the high-momentum first-pullback-to-9EMA entry (HOOD/CRWD trend
+    # days) that SMC + generic gates were rejecting. Fires on the bar that
+    # completes the pullback-hold; rides on a 20-EMA trail (signal_monitor).
+    try:
+        from engine import ema_reclaim_detector
+        er = ema_reclaim_detector.detect(df, price)
+        if er is not None:
+            logger.info(f"[runner] {ticker} EMA_RECLAIM {er.direction} @ ${price:.2f} "
+                        f"(ema9={er.ema9:.2f} ema20={er.ema20:.2f} rsi={er.rsi:.0f})")
+            fire_ema_reclaim(ticker, er.direction, price, level=er.stop_ref)
+    except Exception as e:
+        logger.debug(f"[runner] {ticker} EMA_RECLAIM error: {e}")
+
     # Try compression breakout first
     setup_name: str  = ""
     setup_reason: str = ""
@@ -1457,7 +1492,7 @@ def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
             entry_gate.log_rejection(
                 sb=sb, ticker=ticker, direction=direction,
                 strategy_type=strategy_type, price=price,
-                confidence_score=75, gate=gate,
+                confidence_score=75, gate=gate, detector=detector,
             )
             return
     except Exception as e:
@@ -1600,7 +1635,7 @@ def _fire_per_tick_predictive(ticker: str, direction: str, price: float,
             logger.info(f"[runner] {ticker} {detector} blocked by gate: {' | '.join(gate.reasons)}")
             entry_gate.log_rejection(
                 sb=sb, ticker=ticker, direction=direction, strategy_type=strategy_type,
-                price=price, confidence_score=75, gate=gate,
+                price=price, confidence_score=75, gate=gate, detector=detector,
             )
             return
     except Exception as e:
@@ -1689,6 +1724,18 @@ def fire_swing_breakout(ticker: str, direction: str, price: float,
                               detector="SWING_BREAKOUT",
                               setup_type="SWING_BREAKOUT",
                               label="Swing-high breakout", armed_ts=armed_ts,
+                              breakout_level=level)
+
+
+def fire_ema_reclaim(ticker: str, direction: str, price: float,
+                     armed_ts: float | None = None, level: float | None = None) -> None:
+    """EMA reclaim / trend-continuation fire (first pullback to 9 EMA holds).
+    Rides on a 20-EMA trail — see signal_monitor 4b. `level` = pullback extreme
+    for the level-based stop."""
+    _fire_per_tick_predictive(ticker, direction, price,
+                              detector="EMA_RECLAIM",
+                              setup_type="EMA_RECLAIM",
+                              label="EMA reclaim", armed_ts=armed_ts,
                               breakout_level=level)
 
 

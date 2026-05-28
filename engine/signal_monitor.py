@@ -769,7 +769,41 @@ def _monitor_stocks(sb: Client) -> None:
                 _denom   = (t1 - entry) if is_long else (entry - t1)
                 progress = (((peak - entry) if is_long else (entry - peak)) / _denom) if _denom else 0.0
                 t1_hit   = (is_long and price >= t1) or (not is_long and price <= t1)
-                if t1_hit or progress >= _TRAIL_ACTIVATE_FRAC:
+                # EMA_RECLAIM trend-reclaim signals ride the move on a loose
+                # 20-EMA trail instead of the peak-% trail, and SKIP the
+                # convergence early-exit — the whole point is to not cut these
+                # winners early (HOOD/CRWD trend days). Stop trails just under
+                # the 20 EMA, floored at breakeven, ratchets up only; exit comes
+                # from the real-time SL check when price closes back under it.
+                _detector_src = ((sig.get("score_breakdown") or {}).get("detector_source") or "")
+                _is_ema_reclaim = _detector_src == "EMA_RECLAIM"
+
+                if _is_ema_reclaim and (t1_hit or progress >= _TRAIL_ACTIVATE_FRAC):
+                    try:
+                        df_t  = smc.fetch_candles(ticker, period="2d", interval="15m")
+                        ema20 = float(df_t["close"].ewm(span=20, adjust=False).mean().iloc[-1])
+                        rng   = (df_t["high"] - df_t["low"]).tail(14).mean()
+                        buf   = float(rng) * 0.25 if rng and rng > 0 else price * 0.003
+                        if is_long:
+                            trail = max(entry, ema20 - buf)     # floor at breakeven
+                            ratchet_up = trail > sl + 0.01
+                        else:
+                            trail = min(entry, ema20 + buf)
+                            ratchet_up = trail < sl - 0.01
+                        if ratchet_up:
+                            trail = round(trail, 2)
+                            locked = ((trail - entry) / entry * 100) if is_long \
+                                     else ((entry - trail) / entry * 100)
+                            _update_sl(sb, sig_id, trail)
+                            _log_event(sb, sig_id, "be_move", price=price,
+                                       note=(f"📈 20-EMA trail → ${trail:.2f} "
+                                             f"(rides trend, locks +{locked:.1f}%)"))
+                            logger.info(f"[monitor] {ticker} EMA_RECLAIM 20-EMA trail → {trail:.2f} "
+                                        f"(ema20 {ema20:.2f}, locks +{locked:.1f}%)")
+                    except Exception as e:
+                        logger.debug(f"[monitor] EMA trail error for {ticker}: {e}")
+
+                elif t1_hit or progress >= _TRAIL_ACTIVATE_FRAC:
                     # ── Intelligent exit: close EARLY if multiple real-time
                     #    signals converge on a reversal (vs blindly riding to T2).
                     #    Requires convergence so a single indicator can't bail. ──

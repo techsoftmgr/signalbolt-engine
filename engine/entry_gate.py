@@ -339,6 +339,16 @@ _SKIP_GATES_BY_STRATEGY: dict[str, set[str]] = {
 # would reject the early entry by design. These use the faster 5m trend instead.
 _BREAKOUT_DETECTORS = {"COMPRESSION", "SWING_BREAKOUT"}
 
+# Detector-specific gate skips. EMA_RECLAIM is a trend-continuation entry on the
+# first pullback to the 9 EMA — by design price sits extended above the EMAs and
+# there's no 1m reversal candle (it's continuation, not reversal). The detector's
+# own logic (EMA stack + RSI thrust + volume surge + pullback-hold) replaces those
+# gates, which would otherwise kill the early entry (the HOOD/CRWD miss). Keep
+# 15m_trend (must agree — it's a confirmed uptrend), spread + tape (liquidity).
+_SKIP_GATES_BY_DETECTOR: dict[str, set[str]] = {
+    "EMA_RECLAIM": {"1m_reversal", "patterns", "5m_macd"},
+}
+
 
 def check(
     ticker:        str,
@@ -360,7 +370,7 @@ def check(
     _SKIP_GATES_BY_STRATEGY.
     """
     result = GateResult(allowed=True)
-    skip = _SKIP_GATES_BY_STRATEGY.get(strategy_type, set())
+    skip = _SKIP_GATES_BY_STRATEGY.get(strategy_type, set()) | _SKIP_GATES_BY_DETECTOR.get(detector, set())
 
     def _maybe_skip(gate_name: str) -> bool:
         if gate_name in skip:
@@ -446,10 +456,15 @@ def log_rejection(
     price:            float,
     confidence_score: float,
     gate:             GateResult,
+    detector:         str = "SMC",
 ) -> None:
     """
     Insert a rejection row into entry_gate_rejections so we can later
     measure whether the gate is correctly rejecting losers.
+
+    `detector` tags which engine produced the blocked candidate (SMC /
+    PULLBACK / COMPRESSION / SWING_BREAKOUT / EMA_RECLAIM) so the Gate
+    Performance view can show the signal type.
 
     Schema in supabase-entry-gate-rejections.sql. Failures here are
     swallowed — telemetry must never break the scan loop.
@@ -459,6 +474,7 @@ def log_rejection(
             "ticker":           ticker,
             "direction":        direction,
             "strategy_type":    strategy_type,
+            "detector":         detector,
             "price":            round(float(price), 4) if price else None,
             "confidence_score": round(float(confidence_score), 2) if confidence_score else None,
             "gate_log":         gate.gate_log,
