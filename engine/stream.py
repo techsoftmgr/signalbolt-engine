@@ -173,6 +173,70 @@ def _is_strong_close(direction: str, close: float,
     return pos >= _STRONG_CLOSE_FRAC if direction == "LONG" else pos <= (1.0 - _STRONG_CLOSE_FRAC)
 
 
+# ── Breakout RETEST entry ─────────────────────────────────────────────────────
+# Don't chase the breakout candle (BKNG bought the spike, faded to a 0.2% stop,
+# 2026-05-28). On a confirmed swing/compression break, arm a "retest pending":
+# wait for price to pull back to the broken level and HOLD, then enter near the
+# level (better price + room for an ATR stop below it). Cancel if price breaks
+# back through the level (fake-out) or no retest within the window (don't chase).
+# {ticker: {"direction","level","atr","detector","break_ts"}}
+_retest_pending: dict[str, dict] = {}
+_retest_lock = _threading.Lock()
+_RETEST_WINDOW_SEC = 45 * 60     # give up waiting for a retest after 45 min
+_RETEST_BAND_PCT   = 0.25        # pullback must come within this % of the level
+
+
+def _arm_retest(ticker: str, direction: str, level: float, atr: float, detector: str) -> None:
+    import time as _t
+    with _retest_lock:
+        _retest_pending[ticker] = {"direction": direction, "level": float(level),
+                                   "atr": float(atr), "detector": detector, "break_ts": _t.time()}
+    logger.info(f"[stream] {ticker} {detector} broke {direction} @ {level:.2f} — awaiting retest")
+
+
+def _check_retest(ticker: str, close: float,
+                  bar_high: float | None = None, bar_low: float | None = None) -> None:
+    """On 1m close: fire a breakout once price retests the broken level and holds."""
+    import time as _t
+    p = _retest_pending.get(ticker)
+    if p is None:
+        return
+    now = _t.time()
+    if now - p["break_ts"] > _RETEST_WINDOW_SEC:
+        with _retest_lock:
+            _retest_pending.pop(ticker, None)        # ran away / never retested — skip
+        return
+
+    level, direction, atr, detector = p["level"], p["direction"], p["atr"], p["detector"]
+    band = level * (_RETEST_BAND_PCT / 100)
+
+    if direction == "LONG":
+        broke_back = close < level                    # lost the level → fake-out
+        retested   = (bar_low is not None and bar_low <= level + band) and close >= level
+    else:  # SHORT
+        broke_back = close > level
+        retested   = (bar_high is not None and bar_high >= level - band) and close <= level
+
+    if broke_back:
+        with _retest_lock:
+            _retest_pending.pop(ticker, None)
+        logger.info(f"[stream] {ticker} {detector} retest FAILED (lost {level:.2f}) — cancelled")
+        return
+    if not retested:
+        return
+
+    with _retest_lock:
+        _retest_pending.pop(ticker, None)
+    try:
+        from engine import runner as _runner
+        fire = {"SWING_BREAKOUT": _runner.fire_swing_breakout,
+                "COMPRESSION":    _runner.fire_compression_breakout}.get(detector)
+        if fire:
+            _scan_executor.submit(fire, ticker, direction, close, None, level)
+    except Exception as e:
+        logger.debug(f"[stream] retest fire dispatch failed for {ticker}: {e}")
+
+
 def stage_compression_zone(ticker: str, range_high: float, range_low: float, atr: float) -> None:
     """Register a compression envelope for per-tick breakout watching."""
     import time as _t
@@ -393,14 +457,12 @@ def _check_swing_breakout(ticker: str, price: float,
     if not _is_strong_close(direction, price, bar_high, bar_low):
         return   # rejection bar — weak close, skip (MARA bull-trap guard)
 
+    level = swing_high if direction == "LONG" else swing_low
     with _swing_lock:
         _swing_fired[ticker] = now
         _swing_zones.pop(ticker, None)
-    try:
-        from engine.runner import fire_swing_breakout
-        _scan_executor.submit(fire_swing_breakout, ticker, direction, price, staged_ts)
-    except Exception as e:
-        logger.debug(f"[stream] swing fire dispatch failed for {ticker}: {e}")
+    # Don't fire at the spike — wait for a retest of the broken level.
+    _arm_retest(ticker, direction, level, atr, "SWING_BREAKOUT")
 
 
 def _check_compression_breakout(ticker: str, price: float,
@@ -440,17 +502,12 @@ def _check_compression_breakout(ticker: str, price: float,
     if not _is_strong_close(direction, price, bar_high, bar_low):
         return   # rejection bar — weak close, skip
 
-    # Mark fired + remove zone (one breakout per staging) before dispatching
+    level = range_high if direction == "LONG" else range_low
     with _compression_lock:
         _compression_fired[ticker] = now
         _compression_zones.pop(ticker, None)
-
-    # Dispatch the fire on the scan executor — never block the event loop
-    try:
-        from engine.runner import fire_compression_breakout
-        _scan_executor.submit(fire_compression_breakout, ticker, direction, price, staged_ts)
-    except Exception as e:
-        logger.debug(f"[stream] compression fire dispatch failed for {ticker}: {e}")
+    # Don't fire at the spike — wait for a retest of the broken edge.
+    _arm_retest(ticker, direction, level, atr, "COMPRESSION")
 
 
 async def subscribe_extra_tickers(tickers: list[str]) -> None:
@@ -1532,6 +1589,11 @@ async def run_stream() -> None:
                     pass
                 try:
                     _check_swing_breakout(symbol, close, bar_high, bar_low)
+                except Exception:
+                    pass
+                # Retest fills for breakouts armed on a prior bar
+                try:
+                    _check_retest(symbol, close, bar_high, bar_low)
                 except Exception:
                     pass
 

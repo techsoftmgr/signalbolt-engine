@@ -1459,7 +1459,8 @@ def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
 
 def _fire_per_tick_predictive(ticker: str, direction: str, price: float,
                               detector: str, setup_type: str, label: str,
-                              armed_ts: float | None = None) -> None:
+                              armed_ts: float | None = None,
+                              breakout_level: float | None = None) -> None:
     """
     Shared fire path for predictive detectors (compression / pullback / swing).
     Called from stream.on_bar when a 1-minute bar CLOSES beyond a staged level
@@ -1501,6 +1502,21 @@ def _fire_per_tick_predictive(ticker: str, direction: str, price: float,
     if not sltp.get("valid"):
         logger.info(f"[runner] {ticker} {detector} — R:R too low, skipping")
         return
+
+    # Retest entry: place the stop just BELOW the broken level (LONG) / ABOVE it
+    # (SHORT) with an ATR buffer, instead of a tight % off the entry. Entry sits
+    # near the level on the retest, so this gives a sane, level-based stop that a
+    # normal pullback won't trip (fixes the BKNG 0.2%-stop fade, 2026-05-28).
+    if breakout_level:
+        _atr = float(sltp.get("atr", 0) or 0)
+        buf  = _atr * 0.5 if _atr > 0 else price * 0.003
+        if direction == "LONG":
+            sltp["stop_loss"] = round(breakout_level - buf, 2)
+        else:
+            sltp["stop_loss"] = round(breakout_level + buf, 2)
+        risk = abs(price - sltp["stop_loss"])
+        if risk > 0:
+            sltp["risk_reward_1"] = round(abs(sltp["target_one"] - price) / risk, 2)
 
     entry_gate_log: dict = {}
     try:
@@ -1571,30 +1587,33 @@ def _fire_per_tick_predictive(ticker: str, direction: str, price: float,
 
 
 def fire_compression_breakout(ticker: str, direction: str, price: float,
-                              armed_ts: float | None = None) -> None:
-    """1m-close compression breakout fire (called from stream.on_bar)."""
+                              armed_ts: float | None = None, level: float | None = None) -> None:
+    """Compression breakout fire on retest (called from stream.on_bar)."""
     _fire_per_tick_predictive(ticker, direction, price,
                               detector="COMPRESSION",
                               setup_type="COMPRESSION_BREAKOUT",
-                              label="Compression breakout", armed_ts=armed_ts)
+                              label="Compression breakout", armed_ts=armed_ts,
+                              breakout_level=level)
 
 
 def fire_pullback_reclaim(ticker: str, direction: str, price: float,
-                          armed_ts: float | None = None) -> None:
+                          armed_ts: float | None = None, level: float | None = None) -> None:
     """1m-close pullback reclaim fire (called from stream.on_bar)."""
     _fire_per_tick_predictive(ticker, direction, price,
                               detector="PULLBACK",
                               setup_type="PULLBACK_CONTINUATION",
-                              label="Pullback reclaim", armed_ts=armed_ts)
+                              label="Pullback reclaim", armed_ts=armed_ts,
+                              breakout_level=level)
 
 
 def fire_swing_breakout(ticker: str, direction: str, price: float,
-                        armed_ts: float | None = None) -> None:
-    """1m-close swing-high breakout fire (called from stream.on_bar)."""
+                        armed_ts: float | None = None, level: float | None = None) -> None:
+    """Swing-high breakout fire on retest (called from stream.on_bar)."""
     _fire_per_tick_predictive(ticker, direction, price,
                               detector="SWING_BREAKOUT",
                               setup_type="SWING_BREAKOUT",
-                              label="Swing-high breakout", armed_ts=armed_ts)
+                              label="Swing-high breakout", armed_ts=armed_ts,
+                              breakout_level=level)
 
 
 # ---------------------------------------------------------------------------
