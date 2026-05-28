@@ -63,11 +63,22 @@ INTRADAY_STRATEGIES = {"scalping", "day_trade", "options_flow"}
 # Scalping max hold in minutes (regardless of market hours)
 SCALP_MAX_HOLD_MINS = 30
 
-# ── Trailing stop (after T1) ──────────────────────────────────────────────────
-# After T1 hits, trail the visible stop up to lock in profit instead of
-# leaving it at breakeven. Locks TRAIL_LOCK_FRAC of the gain from entry→peak.
-# Ratchets up only. Activates once price is TRAIL_MIN_MOVE_PCT beyond T1.
-TRAIL_LOCK_FRAC    = 0.70   # lock 70% of the entry→peak gain
+# ── Dynamic trailing stop (after T1) ──────────────────────────────────────────
+# After T1 hits, trail the visible stop up — staying a fixed % BELOW the
+# running peak so it tracks price closely and locks in profit as the move
+# extends. Ratchets up only, never below breakeven. Activates once price is
+# TRAIL_MIN_MOVE_PCT beyond T1.
+#
+# % below peak is per-strategy (wider for slower timeframes that breathe more):
+TRAIL_PEAK_PCT = {
+    "scalping":     0.004,   # 0.4% below peak — tight, fast exits
+    "day_trade":    0.010,   # 1.0% below peak
+    "options_flow": 0.010,
+    "dark_pool":    0.010,
+    "swing_trade":  0.020,   # 2.0% below peak — room for multi-day breathing
+    "vwap_reclaim": 0.010,
+}
+TRAIL_DEFAULT_PCT  = 0.012
 TRAIL_MIN_MOVE_PCT = 0.005  # peak must be ≥0.5% beyond T1 before trailing starts
 
 # Market close stages for intraday signals
@@ -729,11 +740,12 @@ def _monitor_stocks(sb: Client) -> None:
                 # Only trail once the move beyond T1 is meaningful (avoid noise)
                 move_beyond_t1 = (peak - t1) if is_long else (t1 - peak)
                 if move_beyond_t1 > 0 and move_beyond_t1 / entry >= TRAIL_MIN_MOVE_PCT:
+                    trail_pct = TRAIL_PEAK_PCT.get(strategy, TRAIL_DEFAULT_PCT)
                     if is_long:
-                        trail = entry + TRAIL_LOCK_FRAC * (peak - entry)
+                        trail = max(entry, peak * (1 - trail_pct))   # floor at breakeven
                         ratchet_up = trail > sl + 0.01
                     else:
-                        trail = entry - TRAIL_LOCK_FRAC * (entry - peak)
+                        trail = min(entry, peak * (1 + trail_pct))
                         ratchet_up = trail < sl - 0.01
                     if ratchet_up:
                         trail = round(trail, 2)
@@ -742,7 +754,8 @@ def _monitor_stocks(sb: Client) -> None:
                         _update_sl(sb, sig_id, trail)
                         _log_event(sb, sig_id, "be_move", price=price,
                                    note=(f"📈 Trailing stop → ${trail:.2f} "
-                                         f"(locks +{locked:.1f}%) · peak ${peak:.2f}"))
+                                         f"({trail_pct*100:.1f}% below peak ${peak:.2f}, "
+                                         f"locks +{locked:.1f}%)"))
                         logger.info(f"[monitor] {ticker} trailing stop → {trail:.2f} "
                                     f"(peak {peak:.2f}, locks +{locked:.1f}%)")
         except Exception as e:
