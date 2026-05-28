@@ -250,10 +250,24 @@ def clear_swing_zone(ticker: str) -> None:
 # (fast); Redis is only touched on stage (infrequent, scan cadence) + startup.
 _ZONE_REDIS_KEY = "stream:zones:v1"
 _ZONE_TTL_SEC   = 2 * 3600
+_ZONE_PERSIST_MIN_INTERVAL_S = 15.0   # throttle Redis writes
+_last_zone_persist_ts = 0.0
 
 
-def _persist_zones() -> None:
-    """Write all three zone dicts to Redis (called after staging in a scan)."""
+def _persist_zones(force: bool = False) -> None:
+    """Write all three zone dicts to Redis (called after staging in a scan).
+
+    Throttled to at most one write per _ZONE_PERSIST_MIN_INTERVAL_S: the
+    predictive scan calls this once per ticker (~40×/scan), which overwhelmed
+    Redis and caused 'Timeout reading from socket' (2026-05-28). The in-memory
+    zone dicts are always current; Redis lags by at most the throttle interval,
+    which only affects cross-restart restore + the admin armed-zone display.
+    """
+    global _last_zone_persist_ts
+    import time as _t
+    now = _t.time()
+    if not force and (now - _last_zone_persist_ts) < _ZONE_PERSIST_MIN_INTERVAL_S:
+        return
     try:
         from engine import cache
         snap = {
@@ -262,6 +276,7 @@ def _persist_zones() -> None:
             "swing":       {k: list(v) for k, v in _swing_zones.items()},
         }
         cache.kv.set_json(_ZONE_REDIS_KEY, snap, ttl_sec=_ZONE_TTL_SEC)
+        _last_zone_persist_ts = now   # only advance on success so failures retry
     except Exception as e:
         logger.debug(f"[stream] zone persist failed: {e}")
 
