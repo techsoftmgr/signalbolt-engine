@@ -769,12 +769,18 @@ def _monitor_stocks(sb: Client) -> None:
                 _denom   = (t1 - entry) if is_long else (entry - t1)
                 progress = (((peak - entry) if is_long else (entry - peak)) / _denom) if _denom else 0.0
                 t1_hit   = (is_long and price >= t1) or (not is_long and price <= t1)
-                # EMA_RECLAIM trend-reclaim signals ride the move on a loose
-                # 20-EMA trail instead of the peak-% trail, and SKIP the
-                # convergence early-exit — the whole point is to not cut these
-                # winners early (HOOD/CRWD trend days). Stop trails just under
-                # the 20 EMA, floored at breakeven, ratchets up only; exit comes
-                # from the real-time SL check when price closes back under it.
+                # EMA_RECLAIM trend-reclaim signals ride the move on the 15m
+                # 20-EMA and SKIP the convergence early-exit — the point is to
+                # not cut these winners early (HOOD/CRWD trend days).
+                #
+                # CRITICAL (per chart review): the ride ends on a CONFIRMED 15m
+                # CLOSE below the 20 EMA — NOT on a wick. On 5m/1m the candles
+                # routinely dip below the 9 EMA and wick under the 20 EMA mid-bar
+                # while the 15m bar still closes above; a stop sitting at the
+                # 20 EMA would get wicked out and cut the winner. So:
+                #   • trend exit = last completed 15m close beyond the 20 EMA
+                #   • the visible/tick stop is kept BELOW the recent 15m swing
+                #     lows (not at the 20 EMA) so intrabar wicks don't trip it
                 _detector_src = ((sig.get("score_breakdown") or {}).get("detector_source") or "")
                 _is_ema_reclaim = _detector_src == "EMA_RECLAIM"
 
@@ -782,13 +788,42 @@ def _monitor_stocks(sb: Client) -> None:
                     try:
                         df_t  = smc.fetch_candles(ticker, period="2d", interval="15m")
                         ema20 = float(df_t["close"].ewm(span=20, adjust=False).mean().iloc[-1])
+                        last_close = float(df_t["close"].iloc[-1])
                         rng   = (df_t["high"] - df_t["low"]).tail(14).mean()
                         buf   = float(rng) * 0.25 if rng and rng > 0 else price * 0.003
+                        in_profit = (price > entry) if is_long else (price < entry)
+
+                        # ── Trend break: confirmed 15m close beyond the 20 EMA ──
+                        trend_broken = (is_long and last_close < ema20) or \
+                                       (not is_long and last_close > ema20)
+                        if trend_broken and in_profit:
+                            pnl_x = ((price - entry) / entry * 100) if is_long \
+                                    else ((entry - price) / entry * 100)
+                            logger.info(f"[monitor] {ticker} EMA_RECLAIM trend exit — 15m close "
+                                        f"{last_close:.2f} {'<' if is_long else '>'} 20-EMA {ema20:.2f}")
+                            _close_signal(sb, sig_id, "target_hit",
+                                          current_price=price, entry_price=entry, direction=direction)
+                            _log_event(sb, sig_id, "closed_win", price=price,
+                                       note=(f"📉 20-EMA close lost @ ${price:.2f} (+{pnl_x:.1f}%) — "
+                                             f"trend exit, rode the move"))
+                            _SWING_PEAK.pop(sig_id, None)
+                            _STATUS_CACHE.pop(sig_id, None)
+                            try:
+                                _push_early_book(ticker, direction, round(pnl_x, 1),
+                                                 "20-EMA close lost — trend exit", signal_id=sig_id_str)
+                            except Exception:
+                                pass
+                            continue
+
+                        # ── Ratchet the visible stop below recent swing lows ──
+                        # (kept well under the 20 EMA so wicks don't trip it)
+                        swing = float(df_t["low"].tail(3).min()) if is_long \
+                                else float(df_t["high"].tail(3).max())
                         if is_long:
-                            trail = max(entry, ema20 - buf)     # floor at breakeven
+                            trail = max(entry, swing - buf)     # floor at breakeven
                             ratchet_up = trail > sl + 0.01
                         else:
-                            trail = min(entry, ema20 + buf)
+                            trail = min(entry, swing + buf)
                             ratchet_up = trail < sl - 0.01
                         if ratchet_up:
                             trail = round(trail, 2)
@@ -796,10 +831,10 @@ def _monitor_stocks(sb: Client) -> None:
                                      else ((entry - trail) / entry * 100)
                             _update_sl(sb, sig_id, trail)
                             _log_event(sb, sig_id, "be_move", price=price,
-                                       note=(f"📈 20-EMA trail → ${trail:.2f} "
-                                             f"(rides trend, locks +{locked:.1f}%)"))
-                            logger.info(f"[monitor] {ticker} EMA_RECLAIM 20-EMA trail → {trail:.2f} "
-                                        f"(ema20 {ema20:.2f}, locks +{locked:.1f}%)")
+                                       note=(f"📈 Trail → ${trail:.2f} (below 15m swing, "
+                                             f"rides 20-EMA, locks +{locked:.1f}%)"))
+                            logger.info(f"[monitor] {ticker} EMA_RECLAIM trail → {trail:.2f} "
+                                        f"(swing-based, ema20 {ema20:.2f}, locks +{locked:.1f}%)")
                     except Exception as e:
                         logger.debug(f"[monitor] EMA trail error for {ticker}: {e}")
 
