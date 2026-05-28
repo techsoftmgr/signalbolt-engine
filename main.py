@@ -2869,13 +2869,16 @@ async def admin_detector_stats(request: Request, days: int = 7):
         _finalize(mom)
 
         # Currently-armed per-tick zones (durable engine_kv snapshot)
-        armed = {"compression": 0, "pullback": 0, "swing": 0}
+        armed = {"compression": 0, "pullback": 0, "swing": 0, "relaxed": 0}
         try:
             _zrows = sb.table("engine_kv").select("value").eq("key", "stream:zones:v1").limit(1).execute().data or []
             z = (_zrows[0]["value"] if _zrows else {}) or {}
             armed = {"compression": len(z.get("compression", {})),
                      "pullback":    len(z.get("pullback", {})),
-                     "swing":       len(z.get("swing", {}))}
+                     "swing":       len(z.get("swing", {})),
+                     # momentum-relaxed-eligible armed zones (a tag across the
+                     # three types, not a 4th zone pool)
+                     "relaxed":     len(z.get("relaxed", {}))}
         except Exception:
             pass
 
