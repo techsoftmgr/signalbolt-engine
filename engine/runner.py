@@ -678,7 +678,8 @@ def _process_mr_ticker(sb: Client, ticker: str, config: dict,
             "setup_type":          "VWAP_MEAN_REVERSION",
             "confidence_grade":    "B+" if mr.score >= 74 else "B",
             "chop_score":          0.0,   # MR signals trade IN chop — no chop penalty
-            "score_breakdown":     {"mr_score": mr.score, "mr_passes": list(mr.passes)},
+            "score_breakdown":     {"detector_source": "MEAN_REVERSION",
+                                    "mr_score": mr.score, "mr_passes": list(mr.passes)},
         })
         signal_row["ai_explanation"] = explainer.generate(signal_row, signal_row["score_breakdown"])
         _write_signal(sb, signal_row)
@@ -964,6 +965,10 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
         # entry_gate_log + sl_width_pct + tape_bonus nested in here (no schema
         # change needed) so we can later correlate everything vs realized outcome.
         "score_breakdown":    {
+            # Explicit tag so every signal carries the methodology that
+            # produced it. Lets us A/B SMC vs predictive vs gap-engine vs MR
+            # vs flow/dark_pool from a single DB query.
+            "detector_source": "GAP_ENGINE" if _from_gap_engine else "SMC",
             **scored.get("breakdown", {}),
             "entry_gate":    entry_gate_log,
             "sl_width_pct":  round(abs(price - final_sl) / price * 100, 3) if price else None,
@@ -1107,7 +1112,7 @@ def _process_dark_pool_ticker(sb: Client, ticker: str, config: dict,
         "manipulation_flags": manipulation.get("flags", []),
         "sl_adjustments":     sltp.get("adjustments", []),
         "risk_reward":        sltp["risk_reward_1"],
-        "score_breakdown":    scored.get("breakdown", {}),
+        "score_breakdown":    {"detector_source": "DARK_POOL", **scored.get("breakdown", {})},
     }
     signal_row["ai_explanation"] = explainer.generate(signal_row, scored["breakdown"])
     dark_sig_id = _write_signal(sb, signal_row)
@@ -1207,7 +1212,7 @@ def _process_options_flow_ticker(sb: Client, ticker: str, config: dict,
         "manipulation_flags": manipulation.get("flags", []),
         "sl_adjustments":     sltp.get("adjustments", []),
         "risk_reward":        sltp["risk_reward_1"],
-        "score_breakdown":    scored.get("breakdown", {}),
+        "score_breakdown":    {"detector_source": "OPTIONS_FLOW", **scored.get("breakdown", {})},
     }
     signal_row["ai_explanation"] = explainer.generate(signal_row, scored["breakdown"])
     flow_sig_id = _write_signal(sb, signal_row)
@@ -1381,6 +1386,7 @@ def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
         "sl_adjustments":     sltp.get("adjustments", []),
         "risk_reward":        sltp["risk_reward_1"],
         "score_breakdown":    {
+            "detector_source": "COMPRESSION" if setup_name == "COMPRESSION_BREAKOUT" else "PULLBACK",
             "predictive_setup": setup_name,
             "predictive_reason": setup_reason,
             "entry_gate":      entry_gate_log,
