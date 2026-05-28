@@ -242,20 +242,41 @@ def _validate_one(row: dict) -> Optional[dict]:
     if not sltp.get("valid"):
         # R:R below threshold — would have been blocked downstream too. Mark
         # as not-won (consistent with how the live engine would have handled it).
-        return {"would_have_won": False, "realized_pnl_pct": 0.0}
+        return {"would_have_won": False, "realized_pnl_pct": 0.0,
+                "stop_loss": None, "target_one": None,
+                "exit_price": None, "exit_reason": "rr_too_low"}
 
+    stop_loss  = sltp["stop_loss"]
+    target_one = sltp["target_one"]
     won, pnl = _simulate(
         direction   = direction,
         entry       = entry,
-        stop_loss   = sltp["stop_loss"],
-        target_one  = sltp["target_one"],
+        stop_loss   = stop_loss,
+        target_one  = target_one,
         forward_bars= forward_bars,
     )
 
+    # Derive the exit price from realized P/L (vs entry) and the reason.
+    pnl_val = round(pnl, 4) if pnl is not None else 0.0
+    if won is True:
+        exit_price, exit_reason = target_one, "target_hit"
+    elif won is False and pnl is not None and pnl <= 0:
+        # Closed in the red within the window — treat as stop/timeout loss.
+        exit_price = round(entry * (1 + pnl_val / 100) if direction == "LONG"
+                           else entry * (1 - pnl_val / 100), 4)
+        exit_reason = "stop_hit" if abs(entry - stop_loss) > 0 and \
+            abs(exit_price - stop_loss) <= abs(entry - stop_loss) * 0.15 else "window_end"
+    else:
+        exit_price = round(entry * (1 + pnl_val / 100) if direction == "LONG"
+                           else entry * (1 - pnl_val / 100), 4) if pnl is not None else None
+        exit_reason = "window_end"
+
+    geom = {"stop_loss": round(stop_loss, 4), "target_one": round(target_one, 4),
+            "exit_price": exit_price, "exit_reason": exit_reason}
     if won is None:
         # Inconclusive — count as "didn't win" but record the drift
-        return {"would_have_won": False, "realized_pnl_pct": round(pnl, 4) if pnl is not None else 0.0}
-    return {"would_have_won": won, "realized_pnl_pct": round(pnl, 4) if pnl is not None else 0.0}
+        return {"would_have_won": False, "realized_pnl_pct": pnl_val, **geom}
+    return {"would_have_won": won, "realized_pnl_pct": pnl_val, **geom}
 
 
 # ── Public entry point ──────────────────────────────────────────────────────
