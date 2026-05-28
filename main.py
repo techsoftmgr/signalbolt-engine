@@ -3274,16 +3274,26 @@ async def admin_inject_test_rejection(request: Request, ticker: str = "NVDA"):
 
 @app.post("/admin/run-gate-validator")
 async def admin_run_gate_validator(request: Request, limit: int = 200):
-    """Manually trigger the entry-gate rejection validator (for testing / on-demand backfill)."""
+    """Manually trigger the gate-rejection + armed-zone validators. Runs in the
+    background and returns immediately — each validator walks many rows doing
+    per-row Alpaca fetches, which exceeds the HTTP timeout if awaited. Refresh
+    the screen in ~1-2 min to see updated stats."""
     _user_id, sb = _require_admin_jwt(request)
-    try:
-        from engine import gate_validator
-        import anyio
-        result = await anyio.to_thread.run_sync(lambda: gate_validator.validate_batch(sb, limit=limit))
-        return result
-    except Exception as e:
-        logger.error(f"POST /admin/run-gate-validator error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    import threading
+
+    def _job():
+        try:
+            from engine import gate_validator, zone_validator
+            gr = gate_validator.validate_batch(sb, limit=limit)
+            logger.info(f"[run-gate-validator bg] gate: {gr}")
+            zr = zone_validator.validate_batch(sb, limit=limit)
+            logger.info(f"[run-gate-validator bg] zone: {zr}")
+        except Exception as e:
+            logger.error(f"[run-gate-validator bg] failed: {e}", exc_info=True)
+
+    threading.Thread(target=_job, daemon=True, name="manual-validator").start()
+    return {"status": "started",
+            "note": "Validation running in the background — refresh in ~1-2 min."}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
