@@ -1653,19 +1653,16 @@ def _close_signals(sb: Client) -> None:
         logger.error(f"[closer] fetch signals failed: {e}")
         rows = []
 
-    # ── Batch price fetch: one Alpaca call for all active tickers ─────────────
-    non_expired_tickers = []
-    for sig in rows:
-        created   = datetime.fromisoformat(sig["created_at"].replace("Z", "+00:00"))
-        strategy  = sig.get("strategy_type") or "day_trade"
-        hold_hours = STRATEGY_MAX_HOLD_HOURS.get(strategy, 48.0)
-        if created >= now - timedelta(hours=hold_hours):
-            non_expired_tickers.append(sig["ticker"])
+    # ── Batch price fetch: one Alpaca call for ALL active tickers ─────────────
+    # Include EXPIRED tickers too, so we can record the expiry close price + P/L
+    # (an expired signal was previously closed with no price/result — DVN showed
+    # grey at +2.5% with no info, 2026-05-28).
+    all_tickers = [sig["ticker"] for sig in rows]
 
     price_map: dict[str, float] = {}
-    if non_expired_tickers:
+    if all_tickers:
         # Deduplicate
-        unique_tickers = list(dict.fromkeys(non_expired_tickers))
+        unique_tickers = list(dict.fromkeys(all_tickers))
         price_map = _alpaca.get_latest_prices(unique_tickers)
         # yfinance fallback for any ticker Alpaca missed
         missing = [t for t in unique_tickers if t not in price_map]
@@ -1689,6 +1686,7 @@ def _close_signals(sb: Client) -> None:
 
         if created < cutoff:
             reason = "expired"
+            close_price = price_map.get(sig["ticker"])   # record P/L at expiry
         else:
             close_price = price_map.get(sig["ticker"])
             if close_price:
@@ -1707,6 +1705,16 @@ def _close_signals(sb: Client) -> None:
             }
             if reason == "expired":
                 update["result"] = "expired"
+                # Record the close price + P/L even on expiry so the card isn't
+                # a blank grey close (DVN expired at +2.5% with no info).
+                if close_price is not None:
+                    entry   = float(sig["entry_price"])
+                    is_long = sig["direction"] == "LONG"
+                    raw_pct = ((close_price - entry) / entry) * 100 if is_long \
+                              else ((entry - close_price) / entry) * 100
+                    update["result_pct"] = round(raw_pct, 4)
+                    update["result_pnl"] = round((close_price - entry) if is_long
+                                                  else (entry - close_price), 4)
             elif close_price is not None:
                 entry   = float(sig["entry_price"])
                 is_long = sig["direction"] == "LONG"
