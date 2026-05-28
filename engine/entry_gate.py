@@ -326,8 +326,13 @@ def _gate_patterns(direction: str, df_entry: pd.DataFrame, price: float) -> tupl
 # reversal, and 5-min tape activity are noise at that timescale. We keep
 # the structurally meaningful gates (15m trend, patterns, spread).
 _SKIP_GATES_BY_STRATEGY: dict[str, set[str]] = {
-    "swing_trade":   {"5m_macd", "1m_reversal", "tape"},
-    "position_trade":{"5m_macd", "1m_reversal", "tape", "15m_trend"},  # even longer hold
+    # Swing also skips the PATTERNS gate (overextended / volume-drop / 3-bar
+    # chase) — those are intraday concepts that mis-fit a multi-day hold and were
+    # 15 of 16 swing rejections (2026-05-28). Keep 15m_trend + spread: trend
+    # alignment and slippage protection apply at any timeframe and rarely reject
+    # swings anyway.
+    "swing_trade":   {"5m_macd", "1m_reversal", "tape", "patterns"},
+    "position_trade":{"5m_macd", "1m_reversal", "tape", "15m_trend", "patterns"},  # even longer hold
 }
 
 # Breakout detectors fire AT the trend inflection, so a 15m-trend confirmation
