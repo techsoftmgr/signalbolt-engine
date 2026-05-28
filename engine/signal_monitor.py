@@ -99,6 +99,14 @@ _TRAIL_ACTIVATE_FRAC = 0.6
 _NEAR_EXPIRY_HRS        = 3.0
 _NEAR_EXPIRY_MIN_PROFIT = 0.8   # only backstop if at least this % in profit
 
+# Time-stop (intraday): SMC winners resolved fast (~31m median) while losers
+# dragged ~90m+ to a full stop (May 27-28 analysis). If an intraday signal hasn't
+# made meaningful progress (this % in profit) by _TIME_STOP_MINS, cut it now —
+# turns slow -1.5% bleeders into small scratches. Intraday strategies only.
+_TIME_STOP_MINS         = 45
+_TIME_STOP_MIN_PROGRESS = 0.2
+_TIME_STOP_STRATEGIES   = {"day_trade", "scalping"}
+
 # Market close stages for intraday signals
 # EOD_WARN  → push "N min to close, consider booking profit" (no auto-close)
 # FORCE_CLOSE → auto-close all intraday positions with accurate P&L
@@ -845,6 +853,30 @@ def _monitor_stocks(sb: Client) -> None:
                 continue
         except Exception as e:
             logger.debug(f"[monitor] near-expiry backstop error for {ticker}: {e}")
+
+        # ── 4d. Time-stop: cut stale intraday trades that aren't working ──────
+        # Winners resolve fast; losers drag to a full stop. If an intraday signal
+        # hasn't made meaningful progress by _TIME_STOP_MINS, cut it (small loss/
+        # scratch) instead of bleeding to the full stop.
+        try:
+            if strategy in _TIME_STOP_STRATEGIES:
+                from datetime import datetime as _dts, timezone as _tzs
+                _cd = _dts.fromisoformat(sig["created_at"].replace("Z", "+00:00"))
+                _age_m = (_dts.now(_tzs.utc) - _cd).total_seconds() / 60.0
+                _t2_hit = (is_long and price >= t2) or (not is_long and price <= t2)
+                if (not _t2_hit) and _age_m >= _TIME_STOP_MINS and pnl_pct < _TIME_STOP_MIN_PROGRESS:
+                    logger.info(f"[monitor] {ticker} TIME-STOP — no progress in {_age_m:.0f}m "
+                                f"@ {price:.2f} ({pnl_pct:+.1f}%)")
+                    _close_signal(sb, sig["id"], "time_limit",
+                                  current_price=price, entry_price=entry, direction=direction)
+                    _log_event(sb, sig["id"], "closed_loss" if pnl_pct < 0 else "closed_win", price=price,
+                               note=(f"⏳ Time-stop @ ${price:.2f} ({pnl_pct:+.1f}%) — no progress "
+                                     f"in {_age_m:.0f} min, cut to limit the drag"))
+                    _STATUS_CACHE.pop(sig["id"], None)
+                    _SWING_PEAK.pop(sig["id"], None)
+                    continue
+        except Exception as e:
+            logger.debug(f"[monitor] time-stop error for {ticker}: {e}")
 
         # ── 5. Intelligent early booking (scalp + day_trade only) ─────────────
         #
