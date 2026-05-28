@@ -1744,8 +1744,12 @@ def fire_ema_reclaim(ticker: str, direction: str, price: float,
 # ---------------------------------------------------------------------------
 _MOMENTUM_MAX_LONGS  = 8
 _MOMENTUM_MAX_SHORTS = 4
-_MOMENTUM_ATR_STOP   = 1.5    # stop = entry ∓ 1.5 × daily ATR (room for a multi-day hold)
-_MOMENTUM_RR         = 2.0    # target_one at 2R, target_two at 3.5R
+_MOMENTUM_ATR_STOP   = 1.5    # initial stop = entry ∓ 1.5 × daily ATR (chandelier takes over)
+# Targets are intentionally WIDE/aspirational — momentum_monitor exits on the
+# chandelier trail / trend break, NOT a fixed target. They exist only so the
+# card shows the let-it-run upside; nothing acts on them.
+_MOMENTUM_T1_R       = 4.0
+_MOMENTUM_T2_R       = 8.0
 
 
 def _fire_momentum(sb: Client, ms, direction: str) -> None:
@@ -1760,11 +1764,11 @@ def _fire_momentum(sb: Client, ms, direction: str) -> None:
     if direction == "LONG":
         stop = round(price - _MOMENTUM_ATR_STOP * atr, 2)
         risk = price - stop
-        t1, t2 = round(price + _MOMENTUM_RR * risk, 2), round(price + 3.5 * risk, 2)
+        t1, t2 = round(price + _MOMENTUM_T1_R * risk, 2), round(price + _MOMENTUM_T2_R * risk, 2)
     else:
         stop = round(price + _MOMENTUM_ATR_STOP * atr, 2)
         risk = stop - price
-        t1, t2 = round(price - _MOMENTUM_RR * risk, 2), round(price - 3.5 * risk, 2)
+        t1, t2 = round(price - _MOMENTUM_T1_R * risk, 2), round(price - _MOMENTUM_T2_R * risk, 2)
     if risk <= 0:
         return
 
@@ -1810,7 +1814,7 @@ def _fire_momentum(sb: Client, ms, direction: str) -> None:
         "session_mode":       "",
         "confidence_tier":    risk_chk["confidence_tier"],
         "position_multiplier": risk_chk["position_mult"],
-        "risk_reward":        _MOMENTUM_RR,
+        "risk_reward":        _MOMENTUM_T1_R,
         "score_breakdown":    {
             "detector_source":   "TREND_MOMENTUM",
             "predictive_setup":  "TREND_MOMENTUM",
@@ -2300,6 +2304,21 @@ def _run_gate_validator() -> None:
         logger.error(f"[runner] Zone validator failed: {e}", exc_info=True)
 
 
+def _run_momentum_monitor() -> None:
+    """Post-close manager for the systematic momentum model (chandelier trail +
+    daily-close trend-break exit). Self-contained — generic signal_monitor
+    skips TREND_MOMENTUM."""
+    logger.info("[runner] ═══ Momentum monitor started ═══")
+    try:
+        from engine import momentum_monitor
+        sb = create_client(os.environ["SUPABASE_URL"], _supabase_key())
+        result = momentum_monitor.manage(sb)
+        logger.info(f"[runner] ═══ Momentum monitor done — {result} ═══")
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        logger.error(f"[runner] Momentum monitor failed: {e}", exc_info=True)
+
+
 def _clear_zones_overnight() -> None:
     """Wipe all armed per-tick zones overnight (12:30 AM ET). Zones are kept
     through after-hours for admin analysis and cleared here so the next
@@ -2497,6 +2516,18 @@ def start_scheduler() -> BackgroundScheduler:
         replace_existing=True,
     )
     logger.info("[runner] Scheduled momentum scan (10:00 AM ET, Mon-Fri)")
+
+    # ── Momentum trade manager — 4:25 PM ET (after the daily bar settles) ──
+    # Self-contained chandelier trail + daily-close trend-break exit for the
+    # TREND_MOMENTUM model. Runs once daily (trend management is a daily event).
+    scheduler.add_job(
+        _run_momentum_monitor,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=16, minute=25, timezone="America/New_York"),
+        id="momentum_monitor",
+        name="SignalBolt momentum trade manager",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled momentum monitor (4:25 PM ET, Mon-Fri)")
 
     scheduler.start()
     logger.info(
