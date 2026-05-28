@@ -2785,6 +2785,72 @@ async def admin_engine_status(request: Request):
     return out
 
 
+@app.get("/admin/detector-stats")
+async def admin_detector_stats(request: Request, days: int = 7):
+    """
+    Per-detector accumulation + performance. Groups closed/active signals by
+    score_breakdown.detector_source (SMC / COMPRESSION / PULLBACK /
+    SWING_BREAKOUT / MEAN_REVERSION / etc.) and reports fires, WR, avg P/L.
+    Also returns currently-armed per-tick zone counts from Redis.
+
+    Admin only.
+    """
+    _user_id, sb = _require_admin_jwt(request)
+    from datetime import datetime, timezone, timedelta
+    since = (datetime.now(timezone.utc) - timedelta(days=max(1, min(days, 60)))).isoformat()
+
+    try:
+        rows = (
+            sb.table("signals")
+              .select("status, result, result_pct, score_breakdown, created_at")
+              .gte("created_at", since)
+              .order("created_at", desc=True)
+              .limit(1000)
+              .execute()
+        ).data or []
+
+        det: dict[str, dict] = {}
+        for r in rows:
+            src = (r.get("score_breakdown") or {}).get("detector_source") or "SMC"
+            d = det.setdefault(src, {"fires": 0, "active": 0, "wins": 0, "losses": 0,
+                                     "pending": 0, "pnl_sum": 0.0, "pnl_n": 0})
+            d["fires"] += 1
+            if r.get("status") == "active":
+                d["active"] += 1
+            res = r.get("result")
+            if res == "win":   d["wins"]   += 1
+            elif res == "loss": d["losses"] += 1
+            elif res in ("pending", "expired", None) and r.get("status") == "closed":
+                d["pending"] += 1
+            pct = r.get("result_pct")
+            if pct is not None:
+                d["pnl_sum"] += float(pct); d["pnl_n"] += 1
+
+        for src, d in det.items():
+            judged = d["wins"] + d["losses"]
+            d["win_rate"] = round(d["wins"] / judged * 100, 1) if judged else None
+            d["avg_pnl"]  = round(d["pnl_sum"] / d["pnl_n"], 3) if d["pnl_n"] else None
+            d.pop("pnl_sum", None); d.pop("pnl_n", None)
+
+        # Currently-armed per-tick zones (from Redis)
+        armed = {"compression": 0, "pullback": 0, "swing": 0}
+        try:
+            from engine import cache
+            z = cache.kv.get_json("stream:zones:v1") or {}
+            armed = {"compression": len(z.get("compression", {})),
+                     "pullback":    len(z.get("pullback", {})),
+                     "swing":       len(z.get("swing", {}))}
+        except Exception:
+            pass
+
+        return {"since": since, "by_detector": det, "armed_zones": armed}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GET /admin/detector-stats error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/admin/tape/{ticker}")
 async def admin_tape_detail(ticker: str, request: Request):
     """Trade-tape snapshot for a single ticker. JWT-gated to admin.
