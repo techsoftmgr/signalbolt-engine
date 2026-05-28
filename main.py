@@ -2845,11 +2845,11 @@ async def admin_detector_stats(request: Request, days: int = 7):
             d["avg_pnl"]  = round(d["pnl_sum"] / d["pnl_n"], 3) if d["pnl_n"] else None
             d.pop("pnl_sum", None); d.pop("pnl_n", None)
 
-        # Currently-armed per-tick zones (from Redis)
+        # Currently-armed per-tick zones (durable engine_kv snapshot)
         armed = {"compression": 0, "pullback": 0, "swing": 0}
         try:
-            from engine import cache
-            z = cache.kv.get_json("stream:zones:v1") or {}
+            _zrows = sb.table("engine_kv").select("value").eq("key", "stream:zones:v1").limit(1).execute().data or []
+            z = (_zrows[0]["value"] if _zrows else {}) or {}
             armed = {"compression": len(z.get("compression", {})),
                      "pullback":    len(z.get("pullback", {})),
                      "swing":       len(z.get("swing", {}))}
@@ -2883,8 +2883,8 @@ async def admin_armed_zones(request: Request):
     COMP_PCT  = 0.10
 
     try:
-        from engine import cache
-        snap = cache.kv.get_json("stream:zones:v1") or {}
+        _zrows = _sb.table("engine_kv").select("value").eq("key", "stream:zones:v1").limit(1).execute().data or []
+        snap = (_zrows[0]["value"] if _zrows else {}) or {}
     except Exception:
         snap = {}
 
