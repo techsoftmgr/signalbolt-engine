@@ -1255,6 +1255,27 @@ def _process_ticker(sb: Client, ticker: str, config: dict,
 # 1.5 R:R (BKNG, NKE), which can't survive a sub-50% hit rate. (2026-05-28)
 _MIN_PREDICTIVE_RR = 2.0
 
+# Per-tick predictive fires are day_trade (close same session). Don't open a
+# new entry in the last stretch of the session — there's no time left for the
+# move to work and EOD close sweeps it flat. The MSTR COMP SHORT that fired at
+# 4:01 PM ET (1 min AFTER the close) and closed at 4:03 PM flat exposed the
+# missing guard. RTH is 9:30–16:00 ET; block new fires from 15:45 ET on.
+_PREDICTIVE_ENTRY_OPEN_MIN  = 9 * 60 + 30   # 09:30 ET
+_PREDICTIVE_ENTRY_CLOSE_MIN = 15 * 60 + 45  # 15:45 ET
+
+
+def _predictive_entry_window_open() -> bool:
+    """True only during the predictive entry window (09:30–15:45 ET, weekday)."""
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        now = datetime.now(_ZI("America/New_York"))
+        if now.weekday() > 4:                       # Sat/Sun
+            return False
+        mins = now.hour * 60 + now.minute
+        return _PREDICTIVE_ENTRY_OPEN_MIN <= mins < _PREDICTIVE_ENTRY_CLOSE_MIN
+    except Exception:
+        return True   # fail open — never worse than today's behavior
+
 
 def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
                                 regime: dict = None, session: dict = None) -> None:
@@ -1517,6 +1538,14 @@ def _fire_per_tick_predictive(ticker: str, direction: str, price: float,
         return
 
     strategy_type = "day_trade"
+
+    # Late-session / RTH guard — a day_trade entry opened in the last 15 min
+    # (or after the close on a late-delivered bar) has no time to work and gets
+    # swept flat by EOD close. Block new fires outside 09:30–15:45 ET.
+    if not _predictive_entry_window_open():
+        logger.info(f"[runner] {ticker} {detector} — outside entry window (>=15:45 ET), skipping")
+        return
+
     if _has_active_signal(sb, ticker, strategy_type):
         return
 
