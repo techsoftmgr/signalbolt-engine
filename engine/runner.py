@@ -1363,6 +1363,9 @@ def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
         return
 
     # ── Run the same entry gates as SMC for consistency ─────────────────
+    # Compression uses the faster 5m trend gate (breakout = trend inflection);
+    # pullback keeps the 15m trend gate (it's trend-following, not inflection).
+    _detector = "COMPRESSION" if setup_name == "COMPRESSION_BREAKOUT" else "PULLBACK"
     entry_gate_log: dict = {}
     try:
         gate = entry_gate.check(
@@ -1370,6 +1373,7 @@ def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
             strategy_type = strategy_type,
             df_entry      = df, price = price,
             entry_tf      = config.get("interval", "15m"),
+            detector      = _detector,
         )
         entry_gate_log = dict(gate.gate_log)
         if not gate.allowed:
@@ -1480,7 +1484,7 @@ def _fire_per_tick_predictive(ticker: str, direction: str, price: float,
     try:
         gate = entry_gate.check(
             ticker=ticker, direction=direction, strategy_type=strategy_type,
-            df_entry=df, price=price, entry_tf="15m",
+            df_entry=df, price=price, entry_tf="15m", detector=detector,
         )
         entry_gate_log = dict(gate.gate_log)
         if not gate.allowed:
