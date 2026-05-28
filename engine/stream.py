@@ -222,6 +222,59 @@ def _check_pullback_reclaim(ticker: str, price: float) -> None:
         logger.debug(f"[stream] pullback fire dispatch failed for {ticker}: {e}")
 
 
+# ── Swing-high breakout watch (per-tick firing) ───────────────────────────────
+# Staged on bar close; fired when price crosses the recent swing high/low.
+# {ticker: (swing_high, swing_low, atr, staged_ts)}  (0.0 = side not watched)
+_swing_zones: dict[str, tuple] = {}
+_swing_lock = _threading.Lock()
+_swing_fired: dict[str, float] = {}
+_SWING_BREAKOUT_PCT = 0.05   # price must clear the level by this % (anti-wick)
+
+
+def stage_swing_zone(ticker: str, swing_high: float, swing_low: float, atr: float) -> None:
+    import time as _t
+    with _swing_lock:
+        _swing_zones[ticker] = (swing_high, swing_low, atr, _t.time())
+
+
+def clear_swing_zone(ticker: str) -> None:
+    with _swing_lock:
+        _swing_zones.pop(ticker, None)
+
+
+def _check_swing_breakout(ticker: str, price: float) -> None:
+    """Called every tick. Fire when price breaks the staged swing high/low."""
+    import time as _t
+    zone = _swing_zones.get(ticker)
+    if zone is None:
+        return
+    swing_high, swing_low, atr, staged_ts = zone
+    now = _t.time()
+    if now - staged_ts > _COMPRESSION_ZONE_TTL:
+        with _swing_lock:
+            _swing_zones.pop(ticker, None)
+        return
+    if now - _swing_fired.get(ticker, 0) < _COMPRESSION_FIRE_THROTTLE:
+        return
+
+    direction = None
+    if swing_high > 0 and price >= swing_high * (1 + _SWING_BREAKOUT_PCT / 100):
+        direction = "LONG"
+    elif swing_low > 0 and price <= swing_low * (1 - _SWING_BREAKOUT_PCT / 100):
+        direction = "SHORT"
+    if direction is None:
+        return
+
+    with _swing_lock:
+        _swing_fired[ticker] = now
+        _swing_zones.pop(ticker, None)
+    try:
+        from engine.runner import fire_swing_breakout
+        _scan_executor.submit(fire_swing_breakout, ticker, direction, price)
+    except Exception as e:
+        logger.debug(f"[stream] swing fire dispatch failed for {ticker}: {e}")
+
+
 def _check_compression_breakout(ticker: str, price: float) -> None:
     """
     Called on every tick. If `ticker` has a staged compression zone and price
@@ -1405,6 +1458,15 @@ async def run_stream() -> None:
                 #     logic as compression. In-memory lookup, near-zero cost.
                 try:
                     _check_pullback_reclaim(ticker, price)
+                except Exception:
+                    pass
+
+                # 1e. Per-tick swing-high breakout — fires when price breaks the
+                #     recent swing high/low. Broader than compression (catches
+                #     momentum breaks without a tight coil). Noisier — relies on
+                #     the gate stack to filter fakeouts.
+                try:
+                    _check_swing_breakout(ticker, price)
                 except Exception:
                     pass
 

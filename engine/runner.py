@@ -38,7 +38,7 @@ from engine import mean_reversion
 from engine import gap_engine
 from engine import entry_gate
 from engine import trade_tape
-from engine import compression_detector, pullback_detector
+from engine import compression_detector, pullback_detector, swing_breakout_detector
 
 
 def _tape_bonus(ticker: str) -> dict:
@@ -1306,6 +1306,12 @@ def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
             _stream.stage_pullback_zone(ticker, pz.direction, pz.reclaim_level, pz.stop_ref, pz.atr)
         else:
             _stream.clear_pullback_zone(ticker)
+        # Stage swing-high breakout levels (per-tick fire on the break)
+        sz = swing_breakout_detector.detect_zone(df, current_price=price)
+        if sz is not None:
+            _stream.stage_swing_zone(ticker, sz.swing_high, sz.swing_low, sz.atr)
+        else:
+            _stream.clear_swing_zone(ticker)
     except Exception:
         pass
 
@@ -1550,6 +1556,14 @@ def fire_pullback_reclaim(ticker: str, direction: str, price: float) -> None:
                               detector="PULLBACK",
                               setup_type="PULLBACK_CONTINUATION",
                               label="Pullback reclaim")
+
+
+def fire_swing_breakout(ticker: str, direction: str, price: float) -> None:
+    """Per-tick swing-high breakout fire (called from stream.on_trade)."""
+    _fire_per_tick_predictive(ticker, direction, price,
+                              detector="SWING_BREAKOUT",
+                              setup_type="SWING_BREAKOUT",
+                              label="Swing-high breakout")
 
 
 # ---------------------------------------------------------------------------
