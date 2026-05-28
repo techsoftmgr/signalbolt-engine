@@ -101,6 +101,36 @@ def _gate_15m_trend(ticker: str, direction: str, df_entry: pd.DataFrame, entry_t
     return False, f"15m trend against {direction} (ema9={ema9:.2f} vs ema21={ema21:.2f})"
 
 
+def _gate_5m_trend(ticker: str, direction: str, df_entry: pd.DataFrame, entry_tf: str) -> tuple[bool, str]:
+    """
+    Faster trend filter for BREAKOUT detectors (compression, swing-breakout).
+    Uses 5m EMA9 vs EMA21 instead of 15m — the 5m EMAs turn ~3× faster, so
+    they confirm a breakout's direction WITHOUT the 15m lag that would
+    otherwise reject the early entry (the breakout IS the trend change).
+
+    See the CCL 2026-05-28 analysis: at the breakout moment the 15m EMA9 was
+    still below EMA21 (old drift), so the 15m gate blocked the early entry and
+    forced us back to the late SMC entry. The 5m trend confirms in time.
+    """
+    if entry_tf in ("5m", "5Min") and df_entry is not None:
+        df5 = df_entry
+    else:
+        df5 = alpaca_client.get_bars(ticker, timeframe="5Min", days=2)
+
+    if df5 is None or len(df5) < 25:
+        return True, "skipped (insufficient 5m bars)"
+
+    close = df5["close"]
+    ema9  = _ema(close, 9).iloc[-1]
+    ema21 = _ema(close, 21).iloc[-1]
+
+    if direction == "LONG" and ema9 > ema21:
+        return True, f"5m trend up (ema9={ema9:.2f} > ema21={ema21:.2f})"
+    if direction == "SHORT" and ema9 < ema21:
+        return True, f"5m trend down (ema9={ema9:.2f} < ema21={ema21:.2f})"
+    return False, f"5m trend against {direction} (ema9={ema9:.2f} vs ema21={ema21:.2f})"
+
+
 def _gate_5m_macd(ticker: str, direction: str, df_entry: pd.DataFrame, entry_tf: str) -> tuple[bool, str]:
     """5m MACD histogram must lean in signal direction (last bar > 0 for LONG, < 0 for SHORT)."""
     if entry_tf in ("5m", "5Min") and df_entry is not None:
@@ -242,6 +272,10 @@ _SKIP_GATES_BY_STRATEGY: dict[str, set[str]] = {
     "position_trade":{"5m_macd", "1m_reversal", "tape", "15m_trend"},  # even longer hold
 }
 
+# Breakout detectors fire AT the trend inflection, so a 15m-trend confirmation
+# would reject the early entry by design. These use the faster 5m trend instead.
+_BREAKOUT_DETECTORS = {"COMPRESSION", "SWING_BREAKOUT"}
+
 
 def check(
     ticker:        str,
@@ -250,6 +284,7 @@ def check(
     df_entry:      Optional[pd.DataFrame],
     price:         float,
     entry_tf:      str = "15m",
+    detector:      str = "",
 ) -> GateResult:
     """
     Run all six gates. Returns GateResult with allowed=False if any fails.
@@ -270,10 +305,16 @@ def check(
             return True
         return False
 
-    # Gate 1: 15m trend
-    if not _maybe_skip("15m_trend"):
-        ok, reason = _gate_15m_trend(ticker, direction, df_entry, entry_tf)
-        result.gate_log["15m_trend"] = "pass" if ok else f"fail: {reason}"
+    # Gate 1: trend filter — 5m for breakout detectors (catch the inflection),
+    # 15m for everything else (confirmed trend-following).
+    is_breakout = detector in _BREAKOUT_DETECTORS
+    trend_key   = "5m_trend" if is_breakout else "15m_trend"
+    if not _maybe_skip(trend_key):
+        if is_breakout:
+            ok, reason = _gate_5m_trend(ticker, direction, df_entry, entry_tf)
+        else:
+            ok, reason = _gate_15m_trend(ticker, direction, df_entry, entry_tf)
+        result.gate_log[trend_key] = "pass" if ok else f"fail: {reason}"
         if not ok:
             result.allowed = False
             result.reasons.append(reason)
