@@ -276,7 +276,16 @@ def classify(has_premarket_catalyst: bool = False) -> dict:
             else "After hours: no signals after 4:00 PM ET"
         )
     elif mode == "BLOCKED":
-        block_reason = "FOMC active — signals paused 1:30–2:30 PM ET"
+        # BLOCKED has two distinct causes — don't always blame FOMC. The
+        # 9:30–9:45 catalyst-only window also lands here when no pre-market
+        # catalyst is present, and mislabeling it "FOMC" makes diagnosis a
+        # nightmare (looks like a macro halt when it's just the open guard).
+        if _fomc_active_now():
+            block_reason = "FOMC active — signals paused 1:30–2:30 PM ET"
+        elif et_mins < CATALYST_END:
+            block_reason = "9:30–9:45 AM: catalyst required — no pre-market sweep detected"
+        else:
+            block_reason = "Signals blocked for this session"
     elif mode == "CATALYST_ONLY" and not has_premarket_catalyst:
         block_reason = "9:30-9:45 AM: catalyst required — no pre-market sweep detected"
 
