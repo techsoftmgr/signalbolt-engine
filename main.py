@@ -3556,6 +3556,33 @@ async def quant_breakout_history(request: Request, days: int = 30, bucket: str =
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/quant/news/{ticker}")
+async def quant_ticker_news(request: Request, ticker: str, limit: int = 8):
+    """Latest headlines for ONE ticker (headline + source + url + time), for the
+    Quant card detail screen's news section. Pro/Pro+."""
+    if not ENABLE_QUANT_DASHBOARD:
+        raise HTTPException(status_code=503, detail="Quant dashboard is disabled")
+
+    _require_jwt(request)
+
+    try:
+        from engine.alpaca_client import get_news
+        raw = get_news(ticker.upper().strip(), limit=max(1, min(limit, 20))) or []
+        items = [{
+            "headline":  n.get("headline") or n.get("title") or "",
+            "source":    n.get("source") or "",
+            "url":       n.get("url") or "",
+            "createdAt": n.get("created_at") or n.get("createdAt") or "",
+            "summary":   (n.get("summary") or "")[:240],
+        } for n in raw if (n.get("headline") or n.get("title"))]
+        return {"ticker": ticker.upper().strip(), "items": items, "count": len(items)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GET /quant/news/{ticker} error: {e}")
+        return {"ticker": ticker.upper().strip(), "items": [], "count": 0}
+
+
 # ── News Reaction Feed ────────────────────────────────────────────────────────
 
 @app.get("/news/reaction")

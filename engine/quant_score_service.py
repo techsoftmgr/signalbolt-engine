@@ -345,6 +345,11 @@ def _score_ticker(
     dist_to_low_pct = (current - low_20) / low_20 * 100 if low_20 else 0.0  # positive = above the low
     breakdown_score = _normalize(-dist_to_low_pct, -5, 2)  # high when at/below the 20-day low
 
+    # Day change vs prior close — the DIRECTION of today's move. Critical for
+    # reading High Volume (up-vol = accumulation, down-vol = distribution).
+    prev_close = float(closes[-2]) if len(closes) >= 2 else current
+    day_change_pct = (current - prev_close) / prev_close * 100 if prev_close else 0.0
+
     # ── Mean Reversion Score (0-100) ──────────────────────────────────────────
     # RSI < 35 + price well below MA = oversold bounce candidate
     oversold_score = _normalize(100 - rsi, 0, 100)  # higher when RSI low
@@ -447,6 +452,7 @@ def _score_ticker(
     return {
         "ticker":              ticker,
         "price":               round(current, 2),
+        "dayChangePct":        round(day_change_pct, 2),   # today's move vs prior close (direction)
         "vwap":                vwap,
         "rsi":                 round(rsi, 1),
         "relativeVolume":      round(rel_vol, 2),
