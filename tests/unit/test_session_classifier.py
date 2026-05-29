@@ -49,15 +49,19 @@ class TestSessionModes:
         result = _classify(_dt(8, 0))
         assert result["mode"] == "PRE_MARKET"
 
-    def test_open_without_catalyst_is_blocked(self):
-        """9:30-9:45 without pre-market catalyst → BLOCKED (too risky to fire)."""
+    def test_open_is_opening_mode(self):
+        """9:30-9:45 → OPENING: we now scan the open (catalyst-agnostic) so we
+        don't miss the opening momentum move. Not blocked, but a high bar (80)."""
         result = _classify(_dt(9, 35), has_catalyst=False)
-        assert result["mode"] == "BLOCKED"
+        assert result["mode"] == "OPENING"
+        assert result["blocked"] is False
+        assert result["threshold"] == 80
 
-    def test_open_with_catalyst_is_catalyst_only(self):
-        """9:30-9:45 WITH pre-market catalyst → CATALYST_ONLY."""
+    def test_open_with_catalyst_is_opening_mode(self):
+        """A pre-market catalyst doesn't change the window — still OPENING (the
+        catalyst feeds the L7 volume bonus, not the gate)."""
         result = _classify(_dt(9, 35), has_catalyst=True)
-        assert result["mode"] == "CATALYST_ONLY"
+        assert result["mode"] == "OPENING"
 
     def test_orb_start(self):
         """9:45 ET = ORB begins."""

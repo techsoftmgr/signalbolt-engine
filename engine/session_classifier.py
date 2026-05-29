@@ -47,6 +47,7 @@ MARKET_CLOSE  = 16 * 60        # 16:00 = 960
 
 # Minimum composite score per session
 SESSION_THRESHOLDS = {
+    "OPENING":       80,   # 9:30–9:45 opening drive — selective but not blocked
     "CATALYST_ONLY": 85,
     "ORB":           80,
     "STANDARD":      70,
@@ -223,8 +224,12 @@ def _classify_mode(et_mins: int, has_catalyst: bool) -> str:
         return "STANDARD"
     if et_mins >= CATALYST_END:
         return "ORB"
-    # 9:30–9:45: only fire if pre-market catalyst exists
-    return "CATALYST_ONLY" if has_catalyst else "BLOCKED"
+    # 9:30–9:45 opening drive. Previously catalyst-only (BLOCKED without a
+    # pre-market catalyst), which missed the opening momentum move entirely.
+    # Now we scan the open in OPENING mode — a high conviction bar (80) + the
+    # entry gate (spread/MACD/1m-reversal/overextension) + a wider opening SL
+    # guard against the chop, instead of sitting out the bell.
+    return "OPENING"
 
 
 def classify(has_premarket_catalyst: bool = False) -> dict:
@@ -291,7 +296,7 @@ def classify(has_premarket_catalyst: bool = False) -> dict:
 
     # SL width adjustment
     sl_adj = 1.0
-    if mode == "CATALYST_ONLY": sl_adj = 1.20
+    if mode in ("OPENING", "CATALYST_ONLY"): sl_adj = 1.20   # opening volatility — wider stop
     elif mode == "ORB":         sl_adj = 1.10
     if opex_day:                sl_adj = max(sl_adj, 1.15)
     if quad_witch:              sl_adj = max(sl_adj, 1.20)
@@ -332,14 +337,16 @@ def score_for_signal(session: dict, has_catalyst: bool, vol_multiple: float) -> 
         return 0.0
 
     base = {
+        "OPENING":       74.0,
         "CATALYST_ONLY": 72.0 if has_catalyst else 20.0,
         "ORB":           74.0,
         "STANDARD":      87.0,
         "CLOSE_ONLY":    60.0,
     }.get(mode, 70.0)
 
-    # Volume bonus (catalyst sessions)
-    if mode == "CATALYST_ONLY":
+    # Volume bonus — opening drive & catalyst sessions reward a real volume surge
+    # (that surge IS the momentum we're trying to catch at the bell).
+    if mode in ("OPENING", "CATALYST_ONLY"):
         if vol_multiple >= 5: base += 15
         elif vol_multiple >= 3: base += 10
         elif vol_multiple >= 2: base += 5
