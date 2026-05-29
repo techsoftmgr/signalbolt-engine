@@ -20,12 +20,15 @@ from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger("signalbolt.breakout_validator")
 
-WIN_PCT   = 0.02     # +2% follow-through past the level counts as a win
-HOLD_DAYS = 3        # judge within 3 trading days of the trigger
+from engine.breakout_history import judge_path, HORIZON_DAYS, WIN_PCT  # single source of truth
+
+HOLD_DAYS = HORIZON_DAYS   # alias kept for readability; resolution window = HORIZON_DAYS
 _TABLE    = "breakout_watch_history"
 
 
 def _judge_one(row: dict):
+    """Path-dependent outcome (target-before-stop within HORIZON_DAYS), shared
+    with the track-record screen via breakout_history.judge_path."""
     from engine import alpaca_client
     state, exit_reason = row.get("state"), row.get("exit_reason")
 
@@ -44,26 +47,21 @@ def _judge_one(row: dict):
         t = t.replace(tzinfo=timezone.utc)
 
     # Window must have elapsed (unless the episode already exited) before judging.
-    if datetime.now(timezone.utc) - t < timedelta(days=HOLD_DAYS) and not row.get("exited_at"):
+    if datetime.now(timezone.utc) - t < timedelta(days=HORIZON_DAYS) and not row.get("exited_at"):
         return None
 
     entry = float(row.get("trigger_price") or row.get("breakout_level") or 0)
     if entry <= 0:
         return None
 
-    bars = alpaca_client.get_bars(row.get("ticker"), timeframe="1Day", days=HOLD_DAYS + 8)
+    bars = alpaca_client.get_bars(row.get("ticker"), timeframe="1Day", days=HORIZON_DAYS + 8)
     if bars is None or len(bars) < 2:
         return None
-    fwd = bars[bars.index > t]
-    if len(fwd) < 1:
-        return None  # no forward bars yet
-    fwd = fwd.head(HOLD_DAYS + 1)
 
-    hi   = float(fwd["high"].max())
-    last = float(fwd["close"].iloc[-1])
-    won  = hi >= entry * (1 + WIN_PCT)
-    realized = (hi - entry) / entry * 100 if won else (last - entry) / entry * 100
-    return {"outcome": "win" if won else "loss", "realized_pct": round(realized, 2)}
+    jp = judge_path(bars, t, entry, row.get("breakout_level"))
+    if jp.get("outcome") is None:
+        return None   # not yet resolved (insufficient forward bars)
+    return {"outcome": jp["outcome"], "realized_pct": jp["realizedPct"]}
 
 
 def judge_batch(sb, limit: int = 500) -> dict:
