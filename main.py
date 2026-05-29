@@ -3533,6 +3533,28 @@ async def quant_dashboard(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/quant/breakout-history")
+async def quant_breakout_history(request: Request, days: int = 30):
+    """
+    Breakout Watch track record — per-episode trajectory (daily curve, MFE/MAE,
+    total, days-to-target, SPY benchmark) + an aggregate scorecard.
+    Computed on the fly from daily bars; no extra persistence. Pro/Pro+.
+    """
+    if not ENABLE_QUANT_DASHBOARD:
+        raise HTTPException(status_code=503, detail="Quant dashboard is disabled")
+
+    _user_id, sb = _require_jwt(request)
+
+    try:
+        from engine import breakout_history
+        return breakout_history.build_history(sb, days=max(7, min(days, 90)))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GET /quant/breakout-history error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ── News Reaction Feed ────────────────────────────────────────────────────────
 
 @app.get("/news/reaction")
