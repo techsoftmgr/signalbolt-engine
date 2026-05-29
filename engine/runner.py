@@ -2475,6 +2475,38 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled day_trade scan every 10 min (9:30 AM–3:55 PM ET)")
 
+    # ── Breakout-watch lifecycle sync (every 5 min, RTH) ────────────────────
+    # Maintains breakout_watch_history episodes (enter / trigger / fade / expire)
+    # off the live Quant breakout bucket — gives the dashboard history + powers
+    # Watch Accuracy. One row per watch EPISODE, not per refresh.
+    def _run_breakout_watch():
+        from zoneinfo import ZoneInfo as _ZI
+        from datetime import datetime as _dt
+        _now = _dt.now(_ZI("America/New_York"))
+        _mins = _now.hour * 60 + _now.minute
+        if not (570 <= _mins <= 960 and _now.weekday() < 5):   # 9:30 AM–4:00 PM ET
+            return
+        try:
+            from engine import quant_score_service, breakout_watch
+            dash = quant_score_service.get_quant_dashboard() or {}
+            rows = [
+                {"ticker": r.get("ticker"), "price": r.get("price"),
+                 "level": r.get("breakoutLevel"), "score": r.get("breakoutScore")}
+                for r in (dash.get("breakouts") or [])
+            ]
+            breakout_watch.sync_watch(_supabase(), rows)
+        except Exception as _e:
+            logger.error(f"[runner] breakout-watch sync failed: {_e}")
+
+    scheduler.add_job(
+        _run_breakout_watch,
+        trigger=IntervalTrigger(minutes=5),
+        id="breakout_watch_sync",
+        name="Breakout-watch lifecycle sync (5-min, RTH)",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled breakout-watch lifecycle sync every 5 min (RTH)")
+
     # ── Pre-market scans — 8:00 AM ET (12:00 UTC) and 9:00 AM ET (13:00 UTC) ──
     from apscheduler.triggers.cron import CronTrigger
     scheduler.add_job(

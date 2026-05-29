@@ -344,6 +344,8 @@ def _score_ticker(
         "momentumScore":       round(momentum_score, 1),
         "volumeScore":         round(volume_score, 1),
         "breakoutScore":       round(breakout_score, 1),
+        "breakoutLevel":       round(high_20, 2),        # 20-day high being tested
+        "distToBreakoutPct":   round(dist_to_high_pct, 2),  # negative = below the high
         "meanReversionScore":  round(mean_reversion_score, 1),
         "riskScore":           round(risk_score, 1),
         "finalQuantScore":     round(final_score, 1),
