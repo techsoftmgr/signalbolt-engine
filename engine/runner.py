@@ -756,6 +756,30 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
     df        = analysis.get("candles")
     price     = analysis["current_price"]
 
+    # ── Market-regime alignment (was predictive-only; now SMC too) ───────
+    # SMC had NO regime gate — which is how SIDU fired a counter-trend SHORT
+    # into a TRENDING_BULL and lost the full move (2026-05-28). Block LONG in
+    # bear/risk-off/panic regimes and SHORT in a strong bull. Logged as a
+    # rejection (detector=SMC) so the scorecard can later confirm the filter
+    # is correctly skipping losers vs killing winners.
+    _rt = regime.get("regime_type", "RANGING")
+    _regime_blocks = (
+        (direction == "LONG"  and _rt in ("TRENDING_BEAR", "RISK_OFF", "PANIC")) or
+        (direction == "SHORT" and _rt == "TRENDING_BULL")
+    )
+    if _regime_blocks:
+        reason = f"market regime {_rt} against {direction}"
+        logger.info(f"[runner] {ticker} [{strategy_type}] BLOCKED — {reason}")
+        try:
+            _gr = entry_gate.GateResult(allowed=False, reasons=[reason],
+                                        gate_log={"market_regime": f"fail: {reason}"})
+            entry_gate.log_rejection(sb=sb, ticker=ticker, direction=direction,
+                                     strategy_type=strategy_type, price=price,
+                                     confidence_score=0, gate=_gr, detector="SMC")
+        except Exception:
+            pass
+        return
+
     # ── QUANT GATE 2b: Chop detection ────────────────────────
     # Run BEFORE manipulation/gamma to avoid wasting those calls on choppy bars.
     regime_type_str = regime.get("regime_type", "UNKNOWN")
