@@ -233,6 +233,11 @@ def _gate_spread(ticker: str) -> tuple[bool, str, Optional[float]]:
 # still is. Tagged in gate_log as momentum_relaxed for A/B vs the standard cap.
 _STD_MAX_ATR      = 2.5
 _MOMENTUM_MAX_ATR = 4.0
+# A confirmed NEWS CATALYST (+ trend & volume) justifies a wider extension than a
+# purely-technical runner — news-driven moves sustain past the usual mean-
+# reversion zone. The HOOD/Trump-account rip (2026-05-29) was rejected 3x as
+# "overextended" (all would have won) because a price-only gate can't see news.
+_CATALYST_MAX_ATR = 6.0
 
 
 def momentum_relaxed_state(df_entry: pd.DataFrame, price: float) -> dict:
@@ -265,7 +270,8 @@ def momentum_relaxed_state(df_entry: pd.DataFrame, price: float) -> dict:
     return out
 
 
-def _gate_patterns(direction: str, df_entry: pd.DataFrame, price: float) -> tuple[bool, str]:
+def _gate_patterns(direction: str, df_entry: pd.DataFrame, price: float,
+                   has_catalyst: bool = False) -> tuple[bool, str]:
     """Reject obvious bad-entry patterns on the entry timeframe."""
     if df_entry is None or len(df_entry) < 22:
         return True, "skipped (insufficient entry bars)"
@@ -295,7 +301,12 @@ def _gate_patterns(direction: str, df_entry: pd.DataFrame, price: float) -> tupl
         _av = float(df_entry["volume"].iloc[-11:-1].mean())
         strong_vol = _av > 0 and _rv >= _av
     momentum_ok = trend_agrees and strong_vol
-    max_atr = _MOMENTUM_MAX_ATR if momentum_ok else _STD_MAX_ATR
+    # Catalyst gets the widest cap (news justifies extension); a technical runner
+    # (trend+vol, no news) gets the momentum cap; everything else the tight cap.
+    catalyst_ok = has_catalyst and momentum_ok
+    if catalyst_ok:    max_atr = _CATALYST_MAX_ATR
+    elif momentum_ok:  max_atr = _MOMENTUM_MAX_ATR
+    else:              max_atr = _STD_MAX_ATR
 
     if atr > 0:
         deviation = (price - ema21) / atr
@@ -303,11 +314,13 @@ def _gate_patterns(direction: str, df_entry: pd.DataFrame, price: float) -> tupl
             return False, f"overextended above EMA21 ({deviation:+.1f} ATRs > {max_atr})"
         if direction == "SHORT" and deviation < -max_atr:
             return False, f"overextended below EMA21 ({deviation:+.1f} ATRs > {max_atr})"
-        if momentum_ok and abs(deviation) > _STD_MAX_ATR:
-            # Passed only because of the relaxed cap — flag it for A/B telemetry.
-            # (strong_vol is required for momentum_ok, so the volume-drop check
-            # below can't trigger anyway — safe to short-circuit here.)
-            return True, f"momentum_relaxed (ext {deviation:+.1f} ATR <= {max_atr}, vol+trend ok)"
+        if (catalyst_ok or momentum_ok) and abs(deviation) > _STD_MAX_ATR:
+            # Passed only because of a relaxed cap — flag it for A/B telemetry.
+            # (strong_vol is required either way, so the volume-drop check below
+            # can't trigger — safe to short-circuit here.)
+            tag = "catalyst_relaxed" if catalyst_ok else "momentum_relaxed"
+            news = "+news" if catalyst_ok else ""
+            return True, f"{tag} (ext {deviation:+.1f} ATR <= {max_atr}, vol+trend{news} ok)"
 
     # 3. Volume drop into entry (last bar < 50% of avg of prior 10 bars)
     if "volume" in df_entry.columns and len(df_entry) >= 11:
@@ -362,6 +375,7 @@ def check(
     price:         float,
     entry_tf:      str = "15m",
     detector:      str = "",
+    has_catalyst:  bool = False,   # confirmed breaking news → wider overextension cap
 ) -> GateResult:
     """
     Run all six gates. Returns GateResult with allowed=False if any fails.
@@ -414,8 +428,12 @@ def check(
 
     # Gate 4: Pattern rejectors (uses entry-tf df, no extra fetch)
     if not _maybe_skip("patterns"):
-        ok, reason = _gate_patterns(direction, df_entry, price)
-        if ok and reason.startswith("momentum_relaxed"):
+        ok, reason = _gate_patterns(direction, df_entry, price, has_catalyst=has_catalyst)
+        if ok and reason.startswith("catalyst_relaxed"):
+            # Allowed only because a news catalyst widened the cap — tag for A/B.
+            result.gate_log["patterns"] = "pass"
+            result.gate_log["catalyst_relaxed"] = reason
+        elif ok and reason.startswith("momentum_relaxed"):
             # Allowed via the relaxed overextension cap — record for A/B so we
             # can compare win-rate of momentum-relaxed entries vs standard ones.
             result.gate_log["patterns"] = "pass"
