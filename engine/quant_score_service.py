@@ -106,7 +106,7 @@ def _enrich_breakouts(result: dict) -> None:
     if sb is not None and rows:
         try:
             eps = (sb.table("breakout_watch_history")
-                     .select("ticker,state,entered_at")
+                     .select("ticker,state,entered_at,triggered_at,trigger_price,enter_price")
                      .eq("bucket", "breakouts")
                      .is_("exited_at", "null").execute().data) or []
             now = datetime.now(timezone.utc)
@@ -117,7 +117,11 @@ def _enrich_breakouts(result: dict) -> None:
                         e["entered_at"].replace("Z", "+00:00"))).total_seconds() // 60)
                 except Exception:
                     pass
-                state_by[e["ticker"]] = {"state": e.get("state"), "ageMin": age}
+                state_by[e["ticker"]] = {
+                    "state": e.get("state"), "ageMin": age,
+                    "enteredAt": e.get("entered_at"), "triggeredAt": e.get("triggered_at"),
+                    "triggerPrice": e.get("trigger_price"), "enterPrice": e.get("enter_price"),
+                }
         except Exception:
             pass
 
@@ -132,6 +136,10 @@ def _enrich_breakouts(result: dict) -> None:
         r["watchState"] = st.get("state") or (
             "TRIGGERED" if (lvl and px and px > lvl) else "WATCHING")
         r["watchAgeMin"] = st.get("ageMin")
+        # The point our watch MARKED the breakout (for a chart arrow): trigger
+        # if it broke out, else entry. Only present once an episode exists.
+        r["markedAt"]    = st.get("triggeredAt") or st.get("enteredAt")
+        r["markedPrice"] = st.get("triggerPrice") or st.get("enterPrice")
         try:
             r["catalyst"] = bool(_has_recent_news(tk))
         except Exception:
