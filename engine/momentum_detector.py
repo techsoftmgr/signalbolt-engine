@@ -35,6 +35,17 @@ _LOOKBACKS      = (21, 63, 126)   # 1 / 3 / 6 month (trading days)
 _MIN_BARS       = 150             # need enough history for a trend read
 _SMA_FAST       = 50
 _SMA_SLOW       = 200             # falls back to 100 if <200 bars
+
+# ── Chase-guard (entry timing) ────────────────────────────────────────────────
+# The cross-sectional rank can pick a top-decile name that's a poor ENTRY today:
+# either stretched into a blow-off, or already rolling over short-term (TXN fired
+# LONG at 314 as it printed a lower high and immediately bled -2%). We gate the
+# entry to a "sweet spot" around a short EMA: a healthy pullback that's still
+# holding, not an extended spike and not a fresh breakdown. ext_atr = (close −
+# EMA) / ATR; the scan skips fires outside [_CHASE_MIN_ATR, _CHASE_MAX_ATR].
+_CHASE_EMA      = 10              # short EMA the entry band is measured against
+_CHASE_MAX_ATR  = 4.0             # > this ATRs above EMA → chasing a blow-off
+_CHASE_MIN_ATR  = -0.5            # < this ATRs below EMA → rolling over (knife)
 _ATR_PERIOD     = 14
 _MIN_VOL_ADJ    = 0.5             # minimum vol-adjusted momentum to qualify
 
@@ -74,6 +85,7 @@ class MomentumScore:
     ann_vol:       float
     sma_fast:      float
     sma_slow:      float
+    ext_atr:       float = 0.0  # signed ATRs of last close vs the short EMA (chase-guard)
 
 
 def _atr(df: pd.DataFrame, period: int = _ATR_PERIOD) -> float:
@@ -127,9 +139,14 @@ def score(ticker: str, df_daily: pd.DataFrame) -> Optional[MomentumScore]:
     elif down_trend and vol_adj <= -_MIN_VOL_ADJ:
         bias = "SHORT"
 
+    # Chase-guard input: latest close's distance (in ATRs) from a short EMA.
+    atr_val   = _atr(df_daily)
+    ema_short = float(pd.Series(closes).ewm(span=_CHASE_EMA, adjust=False).mean().iloc[-1])
+    ext_atr   = round((last - ema_short) / atr_val, 2) if atr_val > 0 else 0.0
+
     return MomentumScore(
         ticker=ticker, bias=bias, score=round(vol_adj, 4), last_price=last,
-        atr=round(_atr(df_daily), 4), raw_return=round(raw_return, 4),
+        atr=round(atr_val, 4), raw_return=round(raw_return, 4),
         ann_vol=round(ann_vol, 4), sma_fast=round(sma_fast, 2),
-        sma_slow=round(sma_slow, 2),
+        sma_slow=round(sma_slow, 2), ext_atr=ext_atr,
     )
