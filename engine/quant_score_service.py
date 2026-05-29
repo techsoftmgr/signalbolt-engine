@@ -218,6 +218,11 @@ def _build_dashboard(tickers: list[str]) -> dict:
             if x["setupType"] == "breakout"
         ][:6]
 
+        breakdowns = [
+            x for x in scored
+            if x["setupType"] == "breakdown"
+        ][:6]
+
         high_volume = sorted(
             [x for x in scored if x["volumeScore"] >= 50],
             key=lambda x: x["volumeScore"], reverse=True,
@@ -242,6 +247,7 @@ def _build_dashboard(tickers: list[str]) -> dict:
             "topMomentum":    top_momentum,
             "pullbacks":      pullbacks,
             "breakouts":      breakouts,
+            "breakdowns":     breakdowns,
             "highVolume":     high_volume,
             "vwapReclaim":    vwap_reclaim,
             "oversoldBounce": oversold_bounce,
@@ -331,6 +337,13 @@ def _score_ticker(
     dist_to_high_pct = (current - high_20) / high_20 * 100  # negative = below high
     breakout_score = _normalize(dist_to_high_pct, -5, 2)
 
+    # ── Breakdown Score (0-100) — bearish mirror of the breakout ───────────────
+    # How close is price to its 20-day LOW? At/below = breakdown candidate (a
+    # risk/avoid heads-up, not a long setup).
+    low_20 = float(np.min(daily_df["low"].values[-20:])) if "low" in daily_df else float(np.min(closes[-20:]))
+    dist_to_low_pct = (current - low_20) / low_20 * 100 if low_20 else 0.0  # positive = above the low
+    breakdown_score = _normalize(-dist_to_low_pct, -5, 2)  # high when at/below the 20-day low
+
     # ── Mean Reversion Score (0-100) ──────────────────────────────────────────
     # RSI < 35 + price well below MA = oversold bounce candidate
     oversold_score = _normalize(100 - rsi, 0, 100)  # higher when RSI low
@@ -390,6 +403,7 @@ def _score_ticker(
     # ── Setup type classification ─────────────────────────────────────────────
     setup_type, setup_reason = _classify_setup(
         current, ma20, rsi, rel_vol, breakout_score, mean_reversion_score, vwap,
+        breakdown_score,
     )
 
     # ── Watch status ──────────────────────────────────────────────────────────
@@ -443,6 +457,9 @@ def _score_ticker(
         "breakoutLevel":       round(high_20, 2),        # 20-day high being tested
         "distToBreakoutPct":   round(dist_to_high_pct, 2),  # negative = below the high
         "breakoutQuality":     breakout_quality,         # breakout-specific 0-100 (no vol penalty)
+        "breakdownScore":      round(breakdown_score, 1),
+        "breakdownLevel":      round(low_20, 2),          # 20-day low being tested
+        "distToBelowPct":      round(dist_to_low_pct, 2), # positive = above the low
         "meanReversionScore":  round(mean_reversion_score, 1),
         "riskScore":           round(risk_score, 1),
         "finalQuantScore":     round(final_score, 1),
@@ -459,6 +476,7 @@ def _score_ticker(
 def _classify_setup(
     price: float, ma20: float, rsi: float, rel_vol: float,
     breakout_score: float, mean_rev_score: float, vwap: Optional[float],
+    breakdown_score: float = 0.0,
 ) -> tuple[str, str]:
     """Return (setup_type, plain-English reason)."""
 
@@ -471,6 +489,12 @@ def _classify_setup(
     # for the same reason as momentum.
     if breakout_score >= 60 and rel_vol >= 1.0:
         return "breakout", "Price approaching 20-day high — breakout candidate"
+
+    # Breakdown (risk/avoid): breaking BELOW the 20-day low. Checked before the
+    # oversold-bounce branch so a name making fresh lows reads as a breakdown to
+    # avoid, not a dip to buy.
+    if breakdown_score >= 60 and rel_vol >= 1.0:
+        return "breakdown", "Price breaking below its 20-day low — breakdown (consider avoiding / exiting longs)"
 
     # VWAP reclaim: price just crossed back above VWAP
     if vwap and price > vwap and price < vwap * 1.005:
