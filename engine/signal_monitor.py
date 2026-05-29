@@ -694,6 +694,42 @@ def _monitor_stocks(sb: Client) -> None:
         is_long  = direction == "LONG"
         pnl_pct  = ((price - entry) / entry * 100) if is_long else ((entry - price) / entry * 100)
 
+        # ── 2b. Stop / target BACKSTOP close (tick-independent) ───────────────
+        # The real-time exit (stream._check_rt_levels) is the fast path, but it
+        # only fires for tickers in the worker's live trade subscription. An
+        # active signal on a non-subscribed ticker (not a core name / current
+        # mover) would otherwise NEVER have its stop or target enforced — the
+        # trade hangs open even after the level is crossed (MSTR LONG sat past
+        # its trailed stop at +1.3% and never booked, 2026-05-29). This 5-min
+        # pass already holds a fresh real-time price, so enforce here as a
+        # guaranteed backstop. Mirrors _check_rt_levels:
+        #   T2 crossed → close (full target)
+        #   SL crossed → close (win OR loss — result is by realized P&L, so a
+        #                trailed stop above entry books the locked profit)
+        # T1 → breakeven is handled by section 4 below; price between T1 and T2
+        # falls through untouched.
+        try:
+            t2_cross = (price >= t2) if is_long else (price <= t2)
+            sl_cross = (price <= sl) if is_long else (price >= sl)
+            if t2_cross or sl_cross:
+                won = pnl_pct >= 0
+                _close_signal(sb, sig["id"], "target_hit" if t2_cross else "stop_hit",
+                              current_price=price, entry_price=entry, direction=direction)
+                if t2_cross:
+                    note = f"🎯 Target hit @ ${price:.2f} (+{pnl_pct:.1f}%)"
+                elif won:
+                    note = f"✅ Stop reached in profit @ ${price:.2f} (+{pnl_pct:.1f}%) — locked the gain"
+                else:
+                    note = f"🔴 Stop hit @ ${price:.2f} ({pnl_pct:.1f}%) — stopped out"
+                _log_event(sb, sig["id"], "closed_win" if won else "closed_loss", price=price, note=note)
+                _STATUS_CACHE.pop(sig["id"], None)
+                _SWING_PEAK.pop(sig["id"], None)
+                logger.info(f"[monitor] {ticker} BACKSTOP close "
+                            f"({'T2' if t2_cross else 'SL'}) @ {price:.2f} ({pnl_pct:+.1f}%)")
+                continue
+        except Exception as e:
+            logger.debug(f"[monitor] backstop close error for {ticker}: {e}")
+
         # ── 3. Status change tracking + event logging ─────────────────────────
         try:
             new_status = _derive_status(price, entry, t1, sl, direction)
