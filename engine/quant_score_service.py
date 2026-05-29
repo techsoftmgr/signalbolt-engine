@@ -224,10 +224,14 @@ def _build_dashboard(tickers: list[str]) -> dict:
             if x["setupType"] == "breakdown"
         ][:6]
 
-        high_volume = sorted(
+        # High volume split by DIRECTION — accumulation (up day) vs distribution
+        # (down day). Tracked separately so each gets a meaningful accuracy.
+        _high_vol = sorted(
             [x for x in scored if x["volumeScore"] >= 50],
             key=lambda x: x["volumeScore"], reverse=True,
-        )[:6]
+        )
+        high_volume_up   = [x for x in _high_vol if (x.get("dayChangePct") or 0) > 0][:6]
+        high_volume_down = [x for x in _high_vol if (x.get("dayChangePct") or 0) < 0][:6]
 
         vwap_reclaim = [
             x for x in scored
@@ -249,7 +253,8 @@ def _build_dashboard(tickers: list[str]) -> dict:
             "pullbacks":      pullbacks,
             "breakouts":      breakouts,
             "breakdowns":     breakdowns,
-            "highVolume":     high_volume,
+            "highVolumeUp":   high_volume_up,
+            "highVolumeDown": high_volume_down,
             "vwapReclaim":    vwap_reclaim,
             "oversoldBounce": oversold_bounce,
             "allScored":      sorted_by_quant[:20],

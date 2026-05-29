@@ -38,7 +38,8 @@ _BUCKET_CFG = {
     "breakdowns":     {"direction": "down", "needsTrigger": True,  "label": "Breakdown"},
     "topMomentum":    {"direction": "up",   "needsTrigger": False, "label": "Top Momentum"},
     "pullbacks":      {"direction": "up",   "needsTrigger": False, "label": "Pullback"},
-    "highVolume":     {"direction": "up",   "needsTrigger": False, "label": "High Volume"},
+    "highVolumeUp":   {"direction": "up",   "needsTrigger": False, "label": "High Volume ▲ (Accumulation)"},
+    "highVolumeDown": {"direction": "down", "needsTrigger": False, "label": "High Volume ▼ (Distribution)"},
     "vwapReclaim":    {"direction": "up",   "needsTrigger": False, "label": "VWAP Reclaim"},
     "oversoldBounce": {"direction": "up",   "needsTrigger": False, "label": "Oversold Bounce"},
 }

@@ -2503,7 +2503,8 @@ def start_scheduler() -> BackgroundScheduler:
             ("breakdowns",     "down", True,  "breakdownLevel", "breakdownScore"),
             ("topMomentum",    "up",   False, None,             "momentumScore"),
             ("pullbacks",      "up",   False, None,             "finalQuantScore"),
-            ("highVolume",     "up",   False, None,             "volumeScore"),
+            ("highVolumeUp",   "up",   False, None,             "volumeScore"),
+            ("highVolumeDown", "down", False, None,             "volumeScore"),
             ("vwapReclaim",    "up",   False, None,             "finalQuantScore"),
             ("oversoldBounce", "up",   False, None,             "meanReversionScore"),
         ]
