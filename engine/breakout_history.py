@@ -1,20 +1,21 @@
 """
 Breakout Watch — track record (aggregate scorecard + per-episode trajectory).
 
-Powers the "Breakout Watch — Track Record" screen. Everything here is computed
-ON THE FLY from Alpaca daily bars + the persisted episode rows — no extra table
-and no extra cron. Each episode already stores enter_price / entered_at /
-trigger_price / triggered_at / exited_at, which is enough to reconstruct:
+Everything is computed ON THE FLY from Alpaca daily bars + the persisted
+episode rows — no extra table, no extra cron.
 
-  • a day-by-day curve of % from the anchor (the TRIGGER if it broke out, else
-    the entry — the trigger is the only actionable moment, so we anchor there)
-  • MFE (max favorable) and MAE (max adverse) — opportunity vs pain
-  • total move (anchor → last/exit close) and days-to-target (+2%)
-  • a same-window SPY benchmark, so "edge vs SPY" is visible
+Resolution is PATH-DEPENDENT and BOUNDED (the "intelligent day count"):
+each triggered breakout is walked forward from the trigger and resolves on the
+FIRST of —
+  • TARGET  — a daily high reaches trigger × (1 + WIN_PCT)  → win
+  • STOP    — a daily close falls back below the breakout level → loss
+  • HORIZON — HORIZON_DAYS elapse with neither → loss (no follow-through)
+The day-by-day curve therefore stops itself when the trade is decided; it is
+never an arbitrary fixed length. A win realises at the target (what you'd
+actually capture), not at a transient spike that later round-trips.
 
-The aggregate scorecard rolls these up into the funnel that actually builds
-trust: flagged → triggered → followed-through, plus avg MFE/MAE, median
-days-to-target, judged accuracy, and the SPY edge.
+Episodes that never triggered (FADED / EXPIRED) are losses by definition —
+the watch flagged a breakout that never came.
 
 Best-effort: every failure degrades to a smaller payload, never raises.
 """
@@ -25,8 +26,9 @@ from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger("signalbolt.breakout_history")
 
-WIN_PCT = 0.02          # +2% past the anchor = "it paid" (matches breakout_validator)
-_TABLE  = "breakout_watch_history"
+WIN_PCT      = 0.02     # +2% past the trigger = target hit
+HORIZON_DAYS = 5        # a breakout gets this many trading days to follow through
+_TABLE       = "breakout_watch_history"
 
 
 # ── small helpers ───────────────────────────────────────────────────────────
@@ -60,78 +62,112 @@ def _median(vals):
     return vals[mid] if n % 2 else round((vals[mid - 1] + vals[mid]) / 2, 1)
 
 
-# ── per-episode metrics ──────────────────────────────────────────────────────
-def _episode_metrics(ep: dict, bars, spy_bars) -> dict:
-    """Daily curve + MFE/MAE/total + days-to-target for one episode.
+# ── path-dependent resolution (shared with breakout_validator) ───────────────
+def judge_path(bars, anchor_ts, anchor_px, stop_level,
+               *, horizon_days: int = HORIZON_DAYS, win_pct: float = WIN_PCT) -> dict:
+    """Walk forward from the anchor; resolve on target-before-stop within horizon.
 
-    bars: that ticker's 1Day DataFrame (UTC index, ohlcv). Anchored to the
-    trigger when present (the actionable moment), else to entry.
+    Returns: outcome (win|loss|None-if-open), resolutionType (target|stop|
+    horizon|open), daysToResolve, resolvedDate, realizedPct, mfePct, maePct,
+    and the bounded day-by-day curve (anchor → resolution).
     """
-    out = {"days": [], "mfe_pct": None, "mae_pct": None, "total_pct": None,
-           "days_to_target": None, "benchmark_pct": None}
-    if bars is None or len(bars) == 0:
+    out = {"outcome": None, "resolutionType": None, "daysToResolve": None,
+           "resolvedDate": None, "realizedPct": None, "mfePct": None,
+           "maePct": None, "curve": []}
+    if bars is None or len(bars) == 0 or anchor_ts is None or anchor_px <= 0:
         return out
 
-    anchor_ts = _parse(ep.get("triggered_at")) or _parse(ep.get("entered_at"))
-    anchor_px = float(ep.get("trigger_price") or ep.get("enter_price") or 0)
-    if anchor_ts is None or anchor_px <= 0:
-        return out
-
-    end_ts   = _parse(ep.get("exited_at")) or datetime.now(timezone.utc)
-    day0     = anchor_ts.replace(hour=0, minute=0, second=0, microsecond=0)
+    day0 = anchor_ts.replace(hour=0, minute=0, second=0, microsecond=0)
     try:
-        fwd = bars[(bars.index >= day0) & (bars.index <= end_ts + timedelta(days=1))]
+        fwd = bars[bars.index >= day0].head(horizon_days + 1)
     except Exception:
         return out
     if len(fwd) == 0:
-        return out   # episode younger than one daily bar — nothing to chart yet
+        return out
 
-    days = []
-    running_hi = anchor_px
-    running_lo = anchor_px
-    target_day = None
+    target = anchor_px * (1 + win_pct)
+    stop   = float(stop_level) if stop_level else None
+    hi_run = anchor_px; lo_run = anchor_px
+    curve  = []
+    rtype  = None; resolved_i = None
     for i, (ts, row) in enumerate(fwd.iterrows(), start=1):
         hi = float(row["high"]); lo = float(row["low"]); close = float(row["close"])
-        running_hi = max(running_hi, hi)
-        running_lo = min(running_lo, lo)
-        days.append({
-            "day":  i,
-            "date": ts.date().isoformat(),
-            "close": round(close, 2),
-            "pctFromAnchor": round((close - anchor_px) / anchor_px * 100, 2),
-        })
-        if target_day is None and hi >= anchor_px * (1 + WIN_PCT):
-            target_day = i
+        hi_run = max(hi_run, hi); lo_run = min(lo_run, lo)
+        curve.append({"day": i, "date": ts.date().isoformat(), "close": round(close, 2),
+                      "pctFromAnchor": round((close - anchor_px) / anchor_px * 100, 2)})
+        if hi >= target:                       # target reached intraday → win
+            rtype = "target"; resolved_i = i; break
+        if stop is not None and close < stop:  # daily close back below the level → fail
+            rtype = "stop"; resolved_i = i; break
 
-    last_close = float(fwd["close"].iloc[-1])
-    out["days"]            = days
-    out["mfe_pct"]         = round((running_hi - anchor_px) / anchor_px * 100, 2)
-    out["mae_pct"]         = round((running_lo - anchor_px) / anchor_px * 100, 2)
-    out["total_pct"]       = round((last_close - anchor_px) / anchor_px * 100, 2)
-    out["days_to_target"]  = target_day
+    last_close = curve[-1]["close"]
+    if rtype == "target":
+        outcome, realized = "win", round(win_pct * 100, 2)
+    elif rtype == "stop":
+        outcome, realized = "loss", round((last_close - anchor_px) / anchor_px * 100, 2)
+    elif len(fwd) >= horizon_days + 1:         # full horizon, never resolved → no follow-through
+        rtype, outcome = "horizon", "loss"
+        realized = round((last_close - anchor_px) / anchor_px * 100, 2)
+    else:                                      # not enough forward bars yet → still open
+        rtype, outcome = "open", None
+        realized = round((last_close - anchor_px) / anchor_px * 100, 2)
 
-    # SPY move over the same calendar window (the benchmark).
-    if spy_bars is not None and len(spy_bars) > 0:
+    out.update({
+        "outcome": outcome, "resolutionType": rtype,
+        "daysToResolve": resolved_i, "resolvedDate": curve[-1]["date"],
+        "realizedPct": realized,
+        "mfePct": round((hi_run - anchor_px) / anchor_px * 100, 2),
+        "maePct": round((lo_run - anchor_px) / anchor_px * 100, 2),
+        "curve": curve,
+    })
+    return out
+
+
+# ── per-episode metrics ──────────────────────────────────────────────────────
+def _episode_metrics(ep: dict, bars, spy_bars) -> dict:
+    triggered = bool(ep.get("triggered_at"))
+    if triggered:
+        anchor_ts  = _parse(ep.get("triggered_at"))
+        anchor_px  = float(ep.get("trigger_price") or ep.get("enter_price") or 0)
+        stop_level = ep.get("breakout_level")
+    else:
+        anchor_ts  = _parse(ep.get("entered_at"))
+        anchor_px  = float(ep.get("enter_price") or 0)
+        stop_level = None
+
+    jp = judge_path(bars, anchor_ts, anchor_px, stop_level)
+
+    # Never triggered → the watch's breakout call didn't come: it's a loss.
+    if not triggered and jp.get("outcome") is not None:
+        jp["outcome"]        = "loss"
+        jp["resolutionType"] = (ep.get("exit_reason") or "FADED").lower()
+        jp["daysToResolve"]  = None
+
+    # SPY over the same window (benchmark).
+    bench = None
+    curve = jp.get("curve") or []
+    if spy_bars is not None and len(spy_bars) and curve:
         try:
-            sp = spy_bars[(spy_bars.index >= fwd.index[0]) &
-                          (spy_bars.index <= fwd.index[-1] + timedelta(days=1))]
+            lo = _parse(curve[0]["date"]); hi = _parse(curve[-1]["date"])
+            sp = spy_bars[(spy_bars.index >= lo) & (spy_bars.index <= hi + timedelta(days=1))]
             if len(sp) >= 1:
                 sp0 = float(sp["close"].iloc[0]); sp1 = float(sp["close"].iloc[-1])
                 if sp0 > 0:
-                    out["benchmark_pct"] = round((sp1 - sp0) / sp0 * 100, 2)
+                    bench = round((sp1 - sp0) / sp0 * 100, 2)
         except Exception:
             pass
-    return out
+    jp["benchmark_pct"] = bench
+    return jp
 
 
 # ── aggregate scorecard ──────────────────────────────────────────────────────
 def _scorecard(eps: list[dict], days: int) -> dict:
     total     = len(eps)
-    closed    = [e for e in eps if not e["isOpen"]]
     triggered = [e for e in eps if e.get("triggeredAt")]
-    paid      = [e for e in triggered if e.get("daysToTarget")]      # hit +2%
+    paid      = [e for e in triggered if e.get("resolution") == "target"]
     judged    = [e for e in eps if e.get("outcome") in ("win", "loss")]
     wins      = [e for e in judged if e.get("outcome") == "win"]
+    open_n    = sum(1 for e in eps if e.get("outcome") is None)
 
     avg_total = _avg([e["totalPct"] for e in eps])
     avg_bench = _avg([e["benchmarkPct"] for e in eps])
@@ -139,8 +175,8 @@ def _scorecard(eps: list[dict], days: int) -> dict:
     return {
         "windowDays":           days,
         "total":                total,
-        "open":                 total - len(closed),
-        "closed":               len(closed),
+        "open":                 open_n,
+        "closed":               total - open_n,
         "triggered":            len(triggered),
         "triggerRatePct":       round(100 * len(triggered) / total) if total else None,
         "followThrough":        len(paid),
@@ -159,7 +195,7 @@ def _scorecard(eps: list[dict], days: int) -> dict:
 
 
 # ── public entry point ───────────────────────────────────────────────────────
-def build_history(sb, days: int = 30, limit: int = 80) -> dict:
+def build_history(sb, days: int = 30, limit: int = 120) -> dict:
     """Return {episodes:[...], scorecard:{...}, windowDays} for the track-record screen."""
     since = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
     try:
@@ -168,7 +204,7 @@ def build_history(sb, days: int = 30, limit: int = 80) -> dict:
               .select("*")
               .gte("session_date", since)
               .order("entered_at", desc=True)
-              .limit(max(1, min(limit, 200)))
+              .limit(max(1, min(limit, 300)))
               .execute()
         ).data or []
     except Exception as e:
@@ -188,28 +224,33 @@ def build_history(sb, days: int = 30, limit: int = 80) -> dict:
 
     enriched = []
     for ep in eps:
+        triggered = bool(ep.get("triggered_at"))
         m = _episode_metrics(ep, bars_by.get(ep.get("ticker")), spy_bars)
+        ep_date = (ep.get("triggered_at") if triggered else ep.get("entered_at")) or ""
         enriched.append({
             "id":            ep.get("id"),
             "ticker":        ep.get("ticker"),
             "state":         ep.get("state"),
             "exitReason":    ep.get("exit_reason"),
-            "outcome":       ep.get("outcome"),
+            "outcome":       m["outcome"],                       # computed live (path-dependent)
+            "resolution":    m["resolutionType"],                # target|stop|horizon|faded|expired|open
             "enteredAt":     ep.get("entered_at"),
             "triggeredAt":   ep.get("triggered_at"),
             "exitedAt":      ep.get("exited_at"),
+            "episodeDate":   ep_date[:10],                       # YYYY-MM-DD for day grouping
             "enterPrice":    _num(ep.get("enter_price")),
             "breakoutLevel": _num(ep.get("breakout_level")),
             "triggerPrice":  _num(ep.get("trigger_price")),
-            "anchor":        "trigger" if ep.get("triggered_at") else "entry",
-            "isOpen":        ep.get("exited_at") is None,
-            "mfePct":        m["mfe_pct"],
-            "maePct":        m["mae_pct"],
-            "totalPct":      m["total_pct"],
-            "daysToTarget":  m["days_to_target"],
+            "anchor":        "trigger" if triggered else "entry",
+            "isOpen":        m["outcome"] is None,
+            "mfePct":        m["mfePct"],
+            "maePct":        m["maePct"],
+            "totalPct":      m["realizedPct"],                   # realised at resolution
+            "daysToTarget":  m["daysToResolve"] if m["resolutionType"] == "target" else None,
+            "daysToResolve": m["daysToResolve"],
+            "resolvedDate":  m["resolvedDate"],
             "benchmarkPct":  m["benchmark_pct"],
-            "realizedPct":   _num(ep.get("realized_pct")),
-            "curve":         m["days"],
+            "curve":         m["curve"],
         })
 
     return {"episodes": enriched, "scorecard": _scorecard(enriched, days), "windowDays": days}
