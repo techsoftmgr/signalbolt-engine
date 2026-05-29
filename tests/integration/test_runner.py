@@ -156,7 +156,7 @@ class TestRunStrategyByType:
              patch("engine.regime_detector.detect", return_value=_MOCK_REGIME), \
              patch("engine.session_classifier.classify", return_value=_MOCK_SESSION), \
              patch("engine.risk_manager.check", return_value=_MOCK_RISK), \
-             patch("engine.explainer.generate", return_value="Strong bullish setup."), \
+             patch("engine.explainer.attach_narrative", return_value="Strong bullish setup."), \
              patch("engine.push.send_signal_alert", return_value=None), \
              patch("engine.options_scanner.scan", return_value=None):
             run_strategy_by_type(strategy_type)
