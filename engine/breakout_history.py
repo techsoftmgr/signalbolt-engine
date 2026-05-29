@@ -77,9 +77,14 @@ def judge_path(bars, anchor_ts, anchor_px, stop_level,
     if bars is None or len(bars) == 0 or anchor_ts is None or anchor_px <= 0:
         return out
 
-    day0 = anchor_ts.replace(hour=0, minute=0, second=0, microsecond=0)
+    # Forward window starts the DAY AFTER the breakout. You enter at the trigger
+    # (its close), so the holding period — and MFE/MAE — is the days that follow.
+    # Including the trigger day would make day-1 always 0% (close vs itself) and
+    # would count the trigger day's pre-breakout intraday low as drawdown you
+    # never actually sat through.
+    day_after = (anchor_ts + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     try:
-        fwd = bars[bars.index >= day0].head(horizon_days + 1)
+        fwd = bars[bars.index >= day_after].head(horizon_days)
     except Exception:
         return out
     if len(fwd) == 0:
@@ -105,7 +110,7 @@ def judge_path(bars, anchor_ts, anchor_px, stop_level,
         outcome, realized = "win", round(win_pct * 100, 2)
     elif rtype == "stop":
         outcome, realized = "loss", round((last_close - anchor_px) / anchor_px * 100, 2)
-    elif len(fwd) >= horizon_days + 1:         # full horizon, never resolved → no follow-through
+    elif len(fwd) >= horizon_days:             # full horizon, never resolved → no follow-through
         rtype, outcome = "horizon", "loss"
         realized = round((last_close - anchor_px) / anchor_px * 100, 2)
     else:                                      # not enough forward bars yet → still open
