@@ -27,20 +27,28 @@ _TABLE    = "breakout_watch_history"
 
 
 def _judge_one(row: dict):
-    """Path-dependent outcome (target-before-stop within HORIZON_DAYS), shared
-    with the track-record screen via breakout_history.judge_path."""
+    """Net-result outcome over the holding window, bucket/direction-aware —
+    shared with the track-record screen via breakout_history.judge_path."""
     from engine import alpaca_client
+    from engine.breakout_history import bucket_cfg
+    cfg = bucket_cfg(row.get("bucket") or "breakouts")
     state, exit_reason = row.get("state"), row.get("exit_reason")
 
-    # Never broke out → the watch's call didn't pay.
-    if state in ("FADED", "EXPIRED") or exit_reason in ("FADED", "EXPIRED"):
+    # Trigger-required buckets (breakout/breakdown): never broke = call didn't pay.
+    if cfg["needsTrigger"] and (state in ("FADED", "EXPIRED") or exit_reason in ("FADED", "EXPIRED")):
         return {"outcome": "loss", "realized_pct": 0.0}
 
-    trig_at = row.get("triggered_at")
-    if not trig_at:
+    # Anchor: trigger for trigger-buckets, else entry (when it joined the bucket).
+    if cfg["needsTrigger"]:
+        anchor_at = row.get("triggered_at")
+        entry = float(row.get("trigger_price") or row.get("breakout_level") or 0)
+    else:
+        anchor_at = row.get("entered_at")
+        entry = float(row.get("enter_price") or 0)
+    if not anchor_at or entry <= 0:
         return None
     try:
-        t = datetime.fromisoformat(trig_at.replace("Z", "+00:00"))
+        t = datetime.fromisoformat(anchor_at.replace("Z", "+00:00"))
     except Exception:
         return None
     if t.tzinfo is None:
@@ -50,15 +58,11 @@ def _judge_one(row: dict):
     if datetime.now(timezone.utc) - t < timedelta(days=HORIZON_DAYS) and not row.get("exited_at"):
         return None
 
-    entry = float(row.get("trigger_price") or row.get("breakout_level") or 0)
-    if entry <= 0:
-        return None
-
     bars = alpaca_client.get_bars(row.get("ticker"), timeframe="1Day", days=HORIZON_DAYS + 8)
     if bars is None or len(bars) < 2:
         return None
 
-    jp = judge_path(bars, t, entry)
+    jp = judge_path(bars, t, entry, direction=cfg["direction"])
     if jp.get("outcome") is None:
         return None   # not yet resolved (window not fully elapsed)
     return {"outcome": jp["outcome"], "realized_pct": jp["resultPct"]}
@@ -69,7 +73,7 @@ def judge_batch(sb, limit: int = 500) -> dict:
     try:
         rows = (
             sb.table(_TABLE)
-              .select("id,ticker,state,exit_reason,triggered_at,trigger_price,breakout_level,exited_at")
+              .select("id,ticker,bucket,state,exit_reason,triggered_at,trigger_price,breakout_level,entered_at,enter_price,exited_at")
               .is_("outcome", "null")
               .order("entered_at", desc=True)
               .limit(max(1, min(limit, 2000)))
@@ -103,6 +107,7 @@ def watch_accuracy(sb, days: int = 14) -> dict:
         rows = (
             sb.table(_TABLE)
               .select("outcome,state,exit_reason,realized_pct")
+              .eq("bucket", "breakouts")
               .gte("session_date", since)
               .not_.is_("outcome", "null")
               .limit(5000)

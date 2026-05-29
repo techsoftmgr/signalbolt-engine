@@ -30,6 +30,23 @@ HORIZON_DAYS = 5        # fixed follow-through window (trading days after the br
 _TABLE       = "breakout_watch_history"
 _GRADES      = ["A+", "A", "B", "C"]
 
+# Per-bucket semantics. direction = the move that counts as "good" for that
+# setup; needsTrigger = whether an episode must break a level (breakout/
+# breakdown) — others anchor to entry (no discrete trigger).
+_BUCKET_CFG = {
+    "breakouts":      {"direction": "up",   "needsTrigger": True,  "label": "Breakout Watch"},
+    "breakdowns":     {"direction": "down", "needsTrigger": True,  "label": "Breakdown"},
+    "topMomentum":    {"direction": "up",   "needsTrigger": False, "label": "Top Momentum"},
+    "pullbacks":      {"direction": "up",   "needsTrigger": False, "label": "Pullback"},
+    "highVolume":     {"direction": "up",   "needsTrigger": False, "label": "High Volume"},
+    "vwapReclaim":    {"direction": "up",   "needsTrigger": False, "label": "VWAP Reclaim"},
+    "oversoldBounce": {"direction": "up",   "needsTrigger": False, "label": "Oversold Bounce"},
+}
+
+
+def bucket_cfg(bucket: str) -> dict:
+    return _BUCKET_CFG.get(bucket, _BUCKET_CFG["breakouts"])
+
 
 # ── small helpers ───────────────────────────────────────────────────────────
 def _parse(ts):
@@ -62,8 +79,12 @@ def _grade(abs_pct: float) -> str:
 
 
 # ── path / result (shared with breakout_validator) ───────────────────────────
-def judge_path(bars, anchor_ts, anchor_px, *, horizon_days: int = HORIZON_DAYS) -> dict:
+def judge_path(bars, anchor_ts, anchor_px, *, horizon_days: int = HORIZON_DAYS,
+               direction: str = "up") -> dict:
     """Walk the holding window (days AFTER the breakout); grade by net result.
+
+    direction "up" = a positive net move is a win (bullish buckets); "down" =
+    a negative net move is a win (breakdown: the avoid call was right).
 
     Returns: outcome (win|loss|None-if-open), resultPct (net at window end),
     grade, mfePct/mfeDate (best), maePct/maeDate (worst), daysHeld, and the
@@ -98,8 +119,9 @@ def judge_path(bars, anchor_ts, anchor_px, *, horizon_days: int = HORIZON_DAYS) 
     last_close = curve[-1]["close"]
     result   = round((last_close - anchor_px) / anchor_px * 100, 2)
     resolved = len(fwd) >= horizon_days
+    won = (result < 0) if direction == "down" else (result > 0)
     out.update({
-        "outcome":  ("win" if result > 0 else "loss") if resolved else None,
+        "outcome":  ("win" if won else "loss") if resolved else None,
         "resultPct": result,
         "grade":     _grade(abs(result)),
         "mfePct":    round((hi_run - anchor_px) / anchor_px * 100, 2),
@@ -113,7 +135,7 @@ def judge_path(bars, anchor_ts, anchor_px, *, horizon_days: int = HORIZON_DAYS) 
 
 
 # ── per-episode metrics ──────────────────────────────────────────────────────
-def _episode_metrics(ep: dict, bars, spy_bars) -> dict:
+def _episode_metrics(ep: dict, bars, spy_bars, cfg: dict) -> dict:
     triggered = bool(ep.get("triggered_at"))
     if triggered:
         anchor_ts = _parse(ep.get("triggered_at"))
@@ -122,10 +144,12 @@ def _episode_metrics(ep: dict, bars, spy_bars) -> dict:
         anchor_ts = _parse(ep.get("entered_at"))
         anchor_px = float(ep.get("enter_price") or 0)
 
-    jp = judge_path(bars, anchor_ts, anchor_px)
+    jp = judge_path(bars, anchor_ts, anchor_px, direction=cfg["direction"])
 
-    # Never triggered → the watch's breakout call didn't come: a loss.
-    if not triggered and jp.get("outcome") is not None:
+    # For trigger-required buckets (breakout/breakdown), a never-triggered
+    # episode means the directional break never came → a loss. Other buckets
+    # anchor to entry and are graded purely on the forward move.
+    if cfg["needsTrigger"] and not triggered and jp.get("outcome") is not None:
         jp["outcome"] = "loss"
 
     # SPY over the same window (benchmark).
@@ -146,7 +170,7 @@ def _episode_metrics(ep: dict, bars, spy_bars) -> dict:
 
 
 # ── aggregate scorecard ──────────────────────────────────────────────────────
-def _scorecard(eps: list[dict], days: int) -> dict:
+def _scorecard(eps: list[dict], days: int, cfg: dict) -> dict:
     total     = len(eps)
     triggered = [e for e in eps if e.get("triggeredAt")]
     judged    = [e for e in eps if e.get("outcome") in ("win", "loss")]
@@ -166,6 +190,8 @@ def _scorecard(eps: list[dict], days: int) -> dict:
 
     return {
         "windowDays":      days,
+        "goodDirection":   cfg["direction"],
+        "needsTrigger":    cfg["needsTrigger"],
         "total":           total,
         "open":            open_n,
         "closed":          total - open_n,
@@ -186,13 +212,15 @@ def _scorecard(eps: list[dict], days: int) -> dict:
 
 
 # ── public entry point ───────────────────────────────────────────────────────
-def build_history(sb, days: int = 30, limit: int = 120) -> dict:
-    """Return {episodes:[...], scorecard:{...}, windowDays} for the track-record screen."""
+def build_history(sb, days: int = 30, limit: int = 120, bucket: str = "breakouts") -> dict:
+    """Return {episodes, scorecard, windowDays, bucket, label} for one bucket's track record."""
+    cfg = bucket_cfg(bucket)
     since = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
     try:
         eps = (
             sb.table(_TABLE)
               .select("*")
+              .eq("bucket", bucket)
               .gte("session_date", since)
               .order("entered_at", desc=True)
               .limit(max(1, min(limit, 300)))
@@ -200,7 +228,8 @@ def build_history(sb, days: int = 30, limit: int = 120) -> dict:
         ).data or []
     except Exception as e:
         logger.error(f"[breakout_history] fetch failed: {e}")
-        return {"episodes": [], "scorecard": _scorecard([], days), "windowDays": days}
+        return {"episodes": [], "scorecard": _scorecard([], days, cfg), "windowDays": days,
+                "bucket": bucket, "label": cfg["label"]}
 
     tickers  = sorted({e["ticker"] for e in eps if e.get("ticker")})
     bars_by  = {}
@@ -216,7 +245,7 @@ def build_history(sb, days: int = 30, limit: int = 120) -> dict:
     enriched = []
     for ep in eps:
         triggered = bool(ep.get("triggered_at"))
-        m = _episode_metrics(ep, bars_by.get(ep.get("ticker")), spy_bars)
+        m = _episode_metrics(ep, bars_by.get(ep.get("ticker")), spy_bars, cfg)
         breakout_at = (ep.get("triggered_at") if triggered else ep.get("entered_at")) or ""
         enriched.append({
             "id":            ep.get("id"),
@@ -246,4 +275,5 @@ def build_history(sb, days: int = 30, limit: int = 120) -> dict:
             "curve":         m["curve"],
         })
 
-    return {"episodes": enriched, "scorecard": _scorecard(enriched, days), "windowDays": days}
+    return {"episodes": enriched, "scorecard": _scorecard(enriched, days, cfg),
+            "windowDays": days, "bucket": bucket, "label": cfg["label"]}
