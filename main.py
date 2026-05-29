@@ -3556,6 +3556,25 @@ async def quant_breakout_history(request: Request, days: int = 30, bucket: str =
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/quant/scorecard-all")
+async def quant_scorecard_all(request: Request, days: int = 30):
+    """All-buckets success cockpit: per-bucket edge-vs-SPY, win rate, episode
+    count + grade spread. Pro/Pro+."""
+    if not ENABLE_QUANT_DASHBOARD:
+        raise HTTPException(status_code=503, detail="Quant dashboard is disabled")
+
+    _user_id, sb = _require_jwt(request)
+
+    try:
+        from engine import breakout_history
+        return breakout_history.build_all_scorecards(sb, days=max(7, min(days, 90)))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GET /quant/scorecard-all error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/quant/news/{ticker}")
 async def quant_ticker_news(request: Request, ticker: str, limit: int = 8):
     """Latest headlines for ONE ticker (headline + source + url + time), for the
