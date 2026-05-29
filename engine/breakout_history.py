@@ -278,3 +278,50 @@ def build_history(sb, days: int = 30, limit: int = 120, bucket: str = "breakouts
 
     return {"episodes": enriched, "scorecard": _scorecard(enriched, days, cfg),
             "windowDays": days, "bucket": bucket, "label": cfg["label"]}
+
+
+def build_all_scorecards(sb, days: int = 30) -> dict:
+    """Compact scorecard for EVERY bucket (the success cockpit) — one DB query
+    + one bars fetch, then a per-bucket scorecard. Used to watch edge-vs-SPY
+    accumulate across all sections at a glance."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+    try:
+        eps = (
+            sb.table(_TABLE).select("*")
+              .gte("session_date", since)
+              .order("entered_at", desc=True)
+              .limit(3000)
+              .execute()
+        ).data or []
+    except Exception as e:
+        logger.error(f"[breakout_history] all-scorecards fetch failed: {e}")
+        eps = []
+
+    tickers  = sorted({e["ticker"] for e in eps if e.get("ticker")})
+    bars_by  = {}
+    spy_bars = None
+    if tickers:
+        try:
+            from engine.alpaca_client import get_multi_bars
+            bars_by  = get_multi_bars(tickers + ["SPY"], "1Day", days + 12) or {}
+            spy_bars = bars_by.get("SPY")
+        except Exception as e:
+            logger.debug(f"[breakout_history] all-scorecards bars failed: {e}")
+
+    by_bucket: dict = {}
+    for ep in eps:
+        by_bucket.setdefault(ep.get("bucket") or "breakouts", []).append(ep)
+
+    out = []
+    for bucket, cfg in _BUCKET_CFG.items():
+        rows = []
+        for ep in by_bucket.get(bucket, []):
+            m = _episode_metrics(ep, bars_by.get(ep.get("ticker")), spy_bars, cfg)
+            rows.append({
+                "triggeredAt": ep.get("triggered_at"), "outcome": m["outcome"],
+                "grade": m["grade"], "resultPct": m["resultPct"],
+                "mfePct": m["mfePct"], "maePct": m["maePct"], "benchmarkPct": m["benchmark_pct"],
+            })
+        out.append({"bucket": bucket, "label": cfg["label"], "scorecard": _scorecard(rows, days, cfg)})
+
+    return {"windowDays": days, "buckets": out}
