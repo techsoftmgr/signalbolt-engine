@@ -672,7 +672,7 @@ def _process_mr_ticker(sb: Client, ticker: str, config: dict,
             "score_breakdown":     {"detector_source": "MEAN_REVERSION",
                                     "mr_score": mr.score, "mr_passes": list(mr.passes)},
         })
-        signal_row["ai_explanation"] = explainer.generate(signal_row, signal_row["score_breakdown"])
+        explainer.attach_narrative(signal_row, signal_row["score_breakdown"])
         _write_signal(sb, signal_row)
 
         try:
@@ -1008,7 +1008,7 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
         "setup_type":         setup_type_str,
         "missing_confirmations": scored.get("missing_confirmations", []),
     }
-    signal_row["ai_explanation"] = explainer.generate(signal_row, scored["breakdown"])
+    explainer.attach_narrative(signal_row, scored["breakdown"])
     new_sig_id = _write_signal(sb, signal_row)
 
     # ── Mark setup as promoted to CONFIRMED in lifecycle tracker ─
@@ -1137,7 +1137,7 @@ def _process_dark_pool_ticker(sb: Client, ticker: str, config: dict,
         "risk_reward":        sltp["risk_reward_1"],
         "score_breakdown":    {"detector_source": "DARK_POOL", **scored.get("breakdown", {})},
     }
-    signal_row["ai_explanation"] = explainer.generate(signal_row, scored["breakdown"])
+    explainer.attach_narrative(signal_row, scored["breakdown"])
     dark_sig_id = _write_signal(sb, signal_row)
 
     try:
@@ -1237,7 +1237,7 @@ def _process_options_flow_ticker(sb: Client, ticker: str, config: dict,
         "risk_reward":        sltp["risk_reward_1"],
         "score_breakdown":    {"detector_source": "OPTIONS_FLOW", **scored.get("breakdown", {})},
     }
-    signal_row["ai_explanation"] = explainer.generate(signal_row, scored["breakdown"])
+    explainer.attach_narrative(signal_row, scored["breakdown"])
     flow_sig_id = _write_signal(sb, signal_row)
 
     try:
