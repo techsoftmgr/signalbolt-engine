@@ -3269,6 +3269,30 @@ async def admin_armed_zones(request: Request):
         z["relaxed_eligible"] = bool(rel)
         z["ext_atr"] = rel.get("ext_atr")
 
+    # ── Plain-English "why it won't fire" note ───────────────────────────
+    # The per-tick fire path (engine/stream.py:_market_allows) skips counter-
+    # trend predictive entries: no SHORTs while the market is trending up, no
+    # LONGs while it's falling. A zone can show its trigger crossed yet never
+    # fire because of this — so spell it out in everyday language. This MUST
+    # mirror _market_allows so the note matches actual engine behaviour.
+    try:
+        from engine import regime_detector
+        _rt = (regime_detector.detect() or {}).get("regime_type", "RANGING")
+    except Exception:
+        _rt = "RANGING"
+    _blocks_long  = _rt in ("TRENDING_BEAR", "RISK_OFF", "PANIC")
+    _blocks_short = _rt == "TRENDING_BULL"
+    _note_short = "Waiting on the market: stocks are broadly rising right now, so the engine is holding off on short (sell) setups until the trend cools."
+    _note_long  = "Waiting on the market: stocks are broadly falling right now, so the engine is holding off on long (buy) setups until things steady."
+    for z in zones:
+        w = z.get("watch")
+        reason = None
+        if _blocks_short and z.get("trigger_short") is not None and w in ("SHORT", "BOTH"):
+            reason = _note_short
+        elif _blocks_long and z.get("trigger_long") is not None and w in ("LONG", "BOTH"):
+            reason = _note_long
+        z["hold_reason"] = reason
+
     # Closest-to-triggering first; unknown distance (no price) last
     zones.sort(key=lambda z: (z["nearest_trigger_pct"] is None,
                               z["nearest_trigger_pct"] if z["nearest_trigger_pct"] is not None else 1e9))
@@ -3276,6 +3300,7 @@ async def admin_armed_zones(request: Request):
     return {
         "as_of":  datetime.now(timezone.utc).isoformat(),
         "counts": {"compression": len(comp), "pullback": len(pull), "swing": len(swing)},
+        "regime": {"type": _rt, "blocks_long": _blocks_long, "blocks_short": _blocks_short},
         "zones":  zones,
     }
 
