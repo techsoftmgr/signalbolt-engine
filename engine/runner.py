@@ -1852,6 +1852,7 @@ def _fire_momentum(sb: Client, ms, direction: str) -> None:
             "ann_vol":           ms.ann_vol,
             "sma_fast":          ms.sma_fast,
             "sma_slow":          ms.sma_slow,
+            "ext_atr":           getattr(ms, "ext_atr", 0.0),
             "entry_gate":        entry_gate_log,
         },
         "confidence_grade":   "B+",
@@ -1893,8 +1894,23 @@ def _run_momentum_scan() -> None:
             except Exception:
                 continue
 
-        longs  = sorted([s for s in scores if s.bias == "LONG"],  key=lambda x: -x.score)[:_MOMENTUM_MAX_LONGS]
-        shorts = (sorted([s for s in scores if s.bias == "SHORT"], key=lambda x: x.score)[:_MOMENTUM_MAX_SHORTS]
+        # ── Chase-guard: skip top-ranked names that are a poor ENTRY today —
+        # stretched into a blow-off OR rolling over short-term (the TXN case).
+        # Filter BEFORE taking top-N so non-chasing leaders fill the slots.
+        def _chasing(s) -> bool:
+            ext = getattr(s, "ext_atr", 0.0)
+            if s.bias == "LONG":
+                return ext > md._CHASE_MAX_ATR or ext < md._CHASE_MIN_ATR
+            return ext < -md._CHASE_MAX_ATR or ext > -md._CHASE_MIN_ATR
+        for s in [x for x in scores if x.bias in ("LONG", "SHORT") and _chasing(x)]:
+            logger.info(f"[runner] momentum CHASE-SKIP {s.ticker} {s.bias} "
+                        f"ext={getattr(s,'ext_atr',0):+.1f} ATR vs EMA{md._CHASE_EMA} "
+                        f"(z={s.score:+.2f}) — poor entry, waiting for pullback")
+
+        longs  = sorted([s for s in scores if s.bias == "LONG" and not _chasing(s)],
+                        key=lambda x: -x.score)[:_MOMENTUM_MAX_LONGS]
+        shorts = (sorted([s for s in scores if s.bias == "SHORT" and not _chasing(s)],
+                         key=lambda x: x.score)[:_MOMENTUM_MAX_SHORTS]
                   if bearish else [])
         for s in longs:
             _fire_momentum(sb, s, "LONG")
