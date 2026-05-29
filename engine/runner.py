@@ -888,6 +888,7 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
             df_entry      = df,
             price         = price,
             entry_tf      = config.get("interval", "15m"),
+            has_catalyst  = has_news,   # breaking news → wider overextension cap
         )
         entry_gate_log = dict(gate.gate_log)
         if not gate.allowed:
@@ -1657,6 +1658,7 @@ def _fire_per_tick_predictive(ticker: str, direction: str, price: float,
         gate = entry_gate.check(
             ticker=ticker, direction=direction, strategy_type=strategy_type,
             df_entry=df, price=price, entry_tf="15m", detector=detector,
+            has_catalyst=_has_recent_news(ticker),   # breaking news → wider overextension cap
         )
         entry_gate_log = dict(gate.gate_log)
         if not gate.allowed:
