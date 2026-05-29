@@ -1008,6 +1008,10 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
         "setup_type":         setup_type_str,
         "missing_confirmations": scored.get("missing_confirmations", []),
     }
+    # Supply/demand zone bounds for the chart's SUPPORT/RESISTANCE box.
+    _zone = smc.zone_bounds(analysis)
+    if _zone:
+        signal_row["score_breakdown"]["zone"] = _zone
     explainer.attach_narrative(signal_row, scored["breakdown"])
     new_sig_id = _write_signal(sb, signal_row)
 

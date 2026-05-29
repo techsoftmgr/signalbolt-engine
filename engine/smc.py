@@ -408,6 +408,31 @@ def detect_order_blocks(
     return {"ob_bullish": bullish_ob, "ob_bearish": bearish_ob}
 
 
+def zone_bounds(analysis: dict) -> Optional[dict]:
+    """
+    The supply/demand zone the setup is built around — for drawing a shaded
+    SUPPORT/RESISTANCE box on the chart.
+      LONG  → bullish order block (demand), fallback bullish FVG.
+      SHORT → bearish order block (supply), fallback bearish FVG.
+    Returns {"low", "high", "kind"} (kind = "demand" | "supply") or None.
+    """
+    if not analysis:
+        return None
+    direction = analysis.get("direction")
+    obs  = analysis.get("obs")  or {}
+    fvgs = analysis.get("fvgs") or {}
+    if direction == "LONG":
+        zone, kind = obs.get("ob_bullish") or fvgs.get("fvg_bullish"), "demand"
+    elif direction == "SHORT":
+        zone, kind = obs.get("ob_bearish") or fvgs.get("fvg_bearish"), "supply"
+    else:
+        return None
+    if not zone or zone.get("top") is None or zone.get("bottom") is None:
+        return None
+    lo, hi = sorted((float(zone["top"]), float(zone["bottom"])))
+    return {"low": round(lo, 2), "high": round(hi, 2), "kind": kind}
+
+
 # ---------------------------------------------------------------------------
 # ATR calculation
 # ---------------------------------------------------------------------------
