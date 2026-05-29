@@ -20,7 +20,7 @@ from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger("signalbolt.breakout_validator")
 
-from engine.breakout_history import judge_path, HORIZON_DAYS, WIN_PCT  # single source of truth
+from engine.breakout_history import judge_path, HORIZON_DAYS  # single source of truth
 
 HOLD_DAYS = HORIZON_DAYS   # alias kept for readability; resolution window = HORIZON_DAYS
 _TABLE    = "breakout_watch_history"
@@ -58,10 +58,10 @@ def _judge_one(row: dict):
     if bars is None or len(bars) < 2:
         return None
 
-    jp = judge_path(bars, t, entry, row.get("breakout_level"))
+    jp = judge_path(bars, t, entry)
     if jp.get("outcome") is None:
-        return None   # not yet resolved (insufficient forward bars)
-    return {"outcome": jp["outcome"], "realized_pct": jp["realizedPct"]}
+        return None   # not yet resolved (window not fully elapsed)
+    return {"outcome": jp["outcome"], "realized_pct": jp["resultPct"]}
 
 
 def judge_batch(sb, limit: int = 500) -> dict:
