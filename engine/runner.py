@@ -2349,6 +2349,17 @@ def _run_gate_validator() -> None:
         sentry_sdk.capture_exception(e)
         logger.error(f"[runner] Zone validator failed: {e}", exc_info=True)
 
+    # Breakout-watch: judge watched setups (broke out & followed through?) → Watch Accuracy
+    try:
+        from engine import breakout_validator
+        if sb is None:
+            sb = create_client(os.environ["SUPABASE_URL"], _supabase_key())
+        bresult = breakout_validator.judge_batch(sb, limit=500)
+        logger.info(f"[runner] ═══ Breakout-watch validator done — {bresult} ═══")
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        logger.error(f"[runner] Breakout-watch validator failed: {e}", exc_info=True)
+
 
 def _run_momentum_monitor() -> None:
     """Post-close manager for the systematic momentum model (chandelier trail +

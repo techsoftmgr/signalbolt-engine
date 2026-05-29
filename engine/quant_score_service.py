@@ -77,9 +77,84 @@ def get_quant_dashboard(symbols: Optional[list[str]] = None) -> dict:
 
     result = _build_dashboard(symbols or DEFAULT_TICKERS)
     if result:
+        try:
+            _enrich_breakouts(result)
+        except Exception as e:
+            logger.debug(f"[quant] breakout enrich skipped: {e}")
         _cache    = result
         _cache_ts = now
     return result
+
+
+def _enrich_breakouts(result: dict) -> None:
+    """Add lifecycle state + catalyst + R:R to each breakout row, plus a top-level
+    Watch Accuracy summary. Best-effort — never breaks the dashboard."""
+    import os
+    from datetime import datetime, timezone
+
+    rows = result.get("breakouts") or []
+    sb = None
+    try:
+        from supabase import create_client
+        from engine.runner import _supabase_key
+        sb = create_client(os.environ["SUPABASE_URL"], _supabase_key())
+    except Exception:
+        sb = None
+
+    # Lifecycle state per ticker (open episodes).
+    state_by: dict = {}
+    if sb is not None and rows:
+        try:
+            eps = (sb.table("breakout_watch_history")
+                     .select("ticker,state,entered_at")
+                     .is_("exited_at", "null").execute().data) or []
+            now = datetime.now(timezone.utc)
+            for e in eps:
+                age = None
+                try:
+                    age = int((now - datetime.fromisoformat(
+                        e["entered_at"].replace("Z", "+00:00"))).total_seconds() // 60)
+                except Exception:
+                    pass
+                state_by[e["ticker"]] = {"state": e.get("state"), "ageMin": age}
+        except Exception:
+            pass
+
+    try:
+        from engine.runner import _has_recent_news
+    except Exception:
+        _has_recent_news = lambda _t: False
+
+    for r in rows:
+        tk = r.get("ticker"); lvl = r.get("breakoutLevel"); px = r.get("price")
+        st = state_by.get(tk) or {}
+        r["watchState"] = st.get("state") or (
+            "TRIGGERED" if (lvl and px and px > lvl) else "WATCHING")
+        r["watchAgeMin"] = st.get("ageMin")
+        try:
+            r["catalyst"] = bool(_has_recent_news(tk))
+        except Exception:
+            r["catalyst"] = False
+        # Rough breakout R:R — entry≈price, stop just below the level, target +3%.
+        try:
+            if lvl and px:
+                stop = round(lvl * 0.99, 2); target = round(lvl * 1.03, 2)
+                risk = px - stop
+                r["stopRef"] = stop
+                r["targetRef"] = target
+                r["riskReward"] = round((target - px) / risk, 1) if risk > 0 else None
+        except Exception:
+            pass
+
+    # Top-level Watch Accuracy (judged episodes, last 14d).
+    if sb is not None:
+        try:
+            from engine import breakout_validator
+            result["breakoutWatch"] = breakout_validator.watch_accuracy(sb, days=14)
+        except Exception:
+            result["breakoutWatch"] = {"judged": 0, "accuracy_pct": None}
+    else:
+        result["breakoutWatch"] = {"judged": 0, "accuracy_pct": None}
 
 
 def _build_dashboard(tickers: list[str]) -> dict:

@@ -60,14 +60,21 @@ def sync_watch(sb, watch_rows: list[dict]) -> dict:
         px = float(row["price"]); lvl = float(row["level"]); score = float(row.get("score") or 0)
         ep = open_by.get(tk)
         if ep is None:
+            already_broke = px > lvl   # entered the bucket already above the level
+            rec = {
+                "ticker": tk, "state": "TRIGGERED" if already_broke else "WATCHING",
+                "entered_at": _now(), "enter_price": round(px, 4),
+                "breakout_level": round(lvl, 4), "enter_score": round(score, 1),
+                "last_seen_at": _now(), "peak_price": round(px, 4), "max_favorable_pct": 0.0,
+            }
+            if already_broke:
+                rec["triggered_at"] = _now()
+                rec["trigger_price"] = round(px, 4)
             try:
-                sb.table(_TABLE).insert({
-                    "ticker": tk, "state": "WATCHING", "entered_at": _now(),
-                    "enter_price": round(px, 4), "breakout_level": round(lvl, 4),
-                    "enter_score": round(score, 1), "last_seen_at": _now(),
-                    "peak_price": round(px, 4), "max_favorable_pct": 0.0,
-                }).execute()
+                sb.table(_TABLE).insert(rec).execute()
                 stats["entered"] += 1
+                if already_broke:
+                    stats["triggered"] += 1
             except Exception as e:
                 logger.debug(f"[breakout_watch] enter {tk} failed: {e}")
             continue
