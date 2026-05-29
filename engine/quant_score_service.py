@@ -107,6 +107,7 @@ def _enrich_breakouts(result: dict) -> None:
         try:
             eps = (sb.table("breakout_watch_history")
                      .select("ticker,state,entered_at")
+                     .eq("bucket", "breakouts")
                      .is_("exited_at", "null").execute().data) or []
             now = datetime.now(timezone.utc)
             for e in eps:

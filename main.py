@@ -3534,11 +3534,12 @@ async def quant_dashboard(request: Request):
 
 
 @app.get("/quant/breakout-history")
-async def quant_breakout_history(request: Request, days: int = 30):
+async def quant_breakout_history(request: Request, days: int = 30, bucket: str = "breakouts"):
     """
-    Breakout Watch track record — per-episode trajectory (daily curve, MFE/MAE,
-    total, days-to-target, SPY benchmark) + an aggregate scorecard.
-    Computed on the fly from daily bars; no extra persistence. Pro/Pro+.
+    Quant setup track record for ONE bucket (breakouts, breakdowns, topMomentum,
+    pullbacks, highVolume, vwapReclaim, oversoldBounce): per-episode trajectory
+    (daily curve, MFE/MAE with dates, net result + grade, SPY benchmark) + an
+    aggregate scorecard. Computed on the fly from daily bars. Pro/Pro+.
     """
     if not ENABLE_QUANT_DASHBOARD:
         raise HTTPException(status_code=503, detail="Quant dashboard is disabled")
@@ -3547,7 +3548,7 @@ async def quant_breakout_history(request: Request, days: int = 30):
 
     try:
         from engine import breakout_history
-        return breakout_history.build_history(sb, days=max(7, min(days, 90)))
+        return breakout_history.build_history(sb, days=max(7, min(days, 90)), bucket=bucket)
     except HTTPException:
         raise
     except Exception as e:

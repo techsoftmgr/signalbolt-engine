@@ -2497,17 +2497,32 @@ def start_scheduler() -> BackgroundScheduler:
         _mins = _now.hour * 60 + _now.minute
         if not (570 <= _mins <= 960 and _now.weekday() < 5):   # 9:30 AM–4:00 PM ET
             return
+        # (dashboardKey, direction, needs_trigger, levelField, scoreField)
+        _BUCKETS = [
+            ("breakouts",      "up",   True,  "breakoutLevel",  "breakoutScore"),
+            ("breakdowns",     "down", True,  "breakdownLevel", "breakdownScore"),
+            ("topMomentum",    "up",   False, None,             "momentumScore"),
+            ("pullbacks",      "up",   False, None,             "finalQuantScore"),
+            ("highVolume",     "up",   False, None,             "volumeScore"),
+            ("vwapReclaim",    "up",   False, None,             "finalQuantScore"),
+            ("oversoldBounce", "up",   False, None,             "meanReversionScore"),
+        ]
         try:
             from engine import quant_score_service, breakout_watch
             dash = quant_score_service.get_quant_dashboard() or {}
-            rows = [
-                {"ticker": r.get("ticker"), "price": r.get("price"),
-                 "level": r.get("breakoutLevel"), "score": r.get("breakoutScore")}
-                for r in (dash.get("breakouts") or [])
-            ]
-            breakout_watch.sync_watch(_supabase(), rows)
+            sb = _supabase()
+            for _key, _dir, _needs, _lvl_f, _score_f in _BUCKETS:
+                rows = [
+                    {"ticker": r.get("ticker"), "price": r.get("price"),
+                     "level": (r.get(_lvl_f) if _lvl_f else None),
+                     "score": r.get(_score_f)}
+                    for r in (dash.get(_key) or [])
+                ]
+                if rows:
+                    breakout_watch.sync_watch(sb, rows, bucket=_key,
+                                              direction=_dir, needs_trigger=_needs)
         except Exception as _e:
-            logger.error(f"[runner] breakout-watch sync failed: {_e}")
+            logger.error(f"[runner] setup-watch sync failed: {_e}")
 
     scheduler.add_job(
         _run_breakout_watch,
