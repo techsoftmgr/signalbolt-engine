@@ -408,6 +408,27 @@ def _score_ticker(
     else:
         risk_label = "High"
 
+    # ── Breakout Quality (0-100) ──────────────────────────────────────────────
+    # A breakout-SPECIFIC score for the Breakout Watch bucket. Unlike
+    # finalQuantScore it does NOT subtract the volatility/risk term (breakouts
+    # NEED volatility to run, so penalizing it is misleading here) and it
+    # weights the three things that actually define a real breakout:
+    #   proximity to/above the 20-day high (40%), volume confirmation (30%),
+    #   and trend alignment (20%). A mild momentum-health term (10%) keeps the
+    #   score honest — it trims when RSI is in overbought/chase territory (>80).
+    if rsi >= 80:
+        mom_health = max(0.0, 100.0 - (rsi - 80.0) * 4.0)   # chase penalty above 80
+    elif rsi >= 55:
+        mom_health = 100.0
+    else:
+        mom_health = float(np.clip(momentum_score, 0, 100))
+    breakout_quality = float(np.clip(round(
+        0.40 * breakout_score
+      + 0.30 * volume_score
+      + 0.20 * trend_score
+      + 0.10 * mom_health
+    ), 0, 100))
+
     return {
         "ticker":              ticker,
         "price":               round(current, 2),
@@ -421,6 +442,7 @@ def _score_ticker(
         "breakoutScore":       round(breakout_score, 1),
         "breakoutLevel":       round(high_20, 2),        # 20-day high being tested
         "distToBreakoutPct":   round(dist_to_high_pct, 2),  # negative = below the high
+        "breakoutQuality":     breakout_quality,         # breakout-specific 0-100 (no vol penalty)
         "meanReversionScore":  round(mean_reversion_score, 1),
         "riskScore":           round(risk_score, 1),
         "finalQuantScore":     round(final_score, 1),
