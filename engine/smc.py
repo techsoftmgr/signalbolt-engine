@@ -412,9 +412,14 @@ def zone_bounds(analysis: dict) -> Optional[dict]:
     """
     The supply/demand zone the setup is built around — for drawing a shaded
     SUPPORT/RESISTANCE box on the chart.
-      LONG  → bullish order block (demand), fallback bullish FVG.
-      SHORT → bearish order block (supply), fallback bearish FVG.
-    Returns {"low", "high", "kind"} (kind = "demand" | "supply") or None.
+      LONG  → bullish demand zone (order block / FVG).
+      SHORT → bearish supply zone (order block / FVG).
+
+    The order block returned by detect_order_blocks is the *most recent* one,
+    which can sit far from the trade (a demand OB 2% below entry isn't the
+    support the signal is testing). So we pick whichever candidate zone (OB or
+    FVG) is nearest the entry — the level price actually bounced from — and
+    draw that. Returns {"low", "high", "kind"} (kind = demand|supply) or None.
     """
     if not analysis:
         return None
@@ -422,13 +427,25 @@ def zone_bounds(analysis: dict) -> Optional[dict]:
     obs  = analysis.get("obs")  or {}
     fvgs = analysis.get("fvgs") or {}
     if direction == "LONG":
-        zone, kind = obs.get("ob_bullish") or fvgs.get("fvg_bullish"), "demand"
+        candidates, kind = [obs.get("ob_bullish"), fvgs.get("fvg_bullish")], "demand"
     elif direction == "SHORT":
-        zone, kind = obs.get("ob_bearish") or fvgs.get("fvg_bearish"), "supply"
+        candidates, kind = [obs.get("ob_bearish"), fvgs.get("fvg_bearish")], "supply"
     else:
         return None
-    if not zone or zone.get("top") is None or zone.get("bottom") is None:
+
+    valid = [z for z in candidates
+             if z and z.get("top") is not None and z.get("bottom") is not None]
+    if not valid:
         return None
+
+    # Anchor to the entry (where price tested support); fall back to last price.
+    ref = analysis.get("entry") or analysis.get("current_price")
+    if ref is not None:
+        ref = float(ref)
+        zone = min(valid, key=lambda z: abs(ref - (float(z["top"]) + float(z["bottom"])) / 2))
+    else:
+        zone = valid[0]
+
     lo, hi = sorted((float(zone["top"]), float(zone["bottom"])))
     return {"low": round(lo, 2), "high": round(hi, 2), "kind": kind}
 
