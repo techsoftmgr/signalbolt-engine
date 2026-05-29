@@ -4,18 +4,17 @@ Breakout Watch — track record (aggregate scorecard + per-episode trajectory).
 Everything is computed ON THE FLY from Alpaca daily bars + the persisted
 episode rows — no extra table, no extra cron.
 
-Resolution is PATH-DEPENDENT and BOUNDED (the "intelligent day count"):
-each triggered breakout is walked forward from the trigger and resolves on the
-FIRST of —
-  • TARGET  — a daily high reaches trigger × (1 + WIN_PCT)  → win
-  • STOP    — a daily close falls back below the breakout level → loss
-  • HORIZON — HORIZON_DAYS elapse with neither → loss (no follow-through)
-The day-by-day curve therefore stops itself when the trade is decided; it is
-never an arbitrary fixed length. A win realises at the target (what you'd
-actually capture), not at a transient spike that later round-trips.
-
-Episodes that never triggered (FADED / EXPIRED) are losses by definition —
-the watch flagged a breakout that never came.
+How an episode is scored (the "real picture"):
+  • You enter at the breakout (the trigger). The holding window is the
+    HORIZON_DAYS trading days that FOLLOW (a fixed, comparable 1-week window —
+    not the trigger day, so day-1 isn't a trivial 0% and pre-breakout intraday
+    moves don't count).
+  • RESULT = net % at the end of the window (the actual close move). A spike
+    that round-trips nets out honestly → it does NOT count as a win.
+  • WON = result > 0.  GRADE = magnitude band of the result:
+        0–5% C · 5–10% B · 10–15% A · 15%+ A+   (same letters for down moves)
+  • MFE (best) / MAE (worst) keep the path's extremes, each with the date it
+    occurred.
 
 Best-effort: every failure degrades to a smaller payload, never raises.
 """
@@ -26,9 +25,10 @@ from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger("signalbolt.breakout_history")
 
-WIN_PCT      = 0.02     # +2% past the trigger = target hit
-HORIZON_DAYS = 5        # a breakout gets this many trading days to follow through
+WIN_PCT      = 0.02     # retained for import compatibility (no longer gates wins)
+HORIZON_DAYS = 5        # fixed follow-through window (trading days after the breakout)
 _TABLE       = "breakout_watch_history"
+_GRADES      = ["A+", "A", "B", "C"]
 
 
 # ── small helpers ───────────────────────────────────────────────────────────
@@ -54,34 +54,28 @@ def _avg(vals):
     return round(sum(vals) / len(vals), 2) if vals else None
 
 
-def _median(vals):
-    vals = sorted(v for v in vals if v is not None)
-    if not vals:
-        return None
-    n = len(vals); mid = n // 2
-    return vals[mid] if n % 2 else round((vals[mid - 1] + vals[mid]) / 2, 1)
+def _grade(abs_pct: float) -> str:
+    if abs_pct >= 15: return "A+"
+    if abs_pct >= 10: return "A"
+    if abs_pct >= 5:  return "B"
+    return "C"
 
 
-# ── path-dependent resolution (shared with breakout_validator) ───────────────
-def judge_path(bars, anchor_ts, anchor_px, stop_level,
-               *, horizon_days: int = HORIZON_DAYS, win_pct: float = WIN_PCT) -> dict:
-    """Walk forward from the anchor; resolve on target-before-stop within horizon.
+# ── path / result (shared with breakout_validator) ───────────────────────────
+def judge_path(bars, anchor_ts, anchor_px, *, horizon_days: int = HORIZON_DAYS) -> dict:
+    """Walk the holding window (days AFTER the breakout); grade by net result.
 
-    Returns: outcome (win|loss|None-if-open), resolutionType (target|stop|
-    horizon|open), daysToResolve, resolvedDate, realizedPct, mfePct, maePct,
-    and the bounded day-by-day curve (anchor → resolution).
+    Returns: outcome (win|loss|None-if-open), resultPct (net at window end),
+    grade, mfePct/mfeDate (best), maePct/maeDate (worst), daysHeld, and the
+    day-by-day curve (% from the breakout).
     """
-    out = {"outcome": None, "resolutionType": None, "daysToResolve": None,
-           "resolvedDate": None, "realizedPct": None, "mfePct": None,
-           "maePct": None, "curve": []}
+    out = {"outcome": None, "resultPct": None, "grade": None,
+           "mfePct": None, "mfeDate": None, "maePct": None, "maeDate": None,
+           "daysHeld": 0, "curve": []}
     if bars is None or len(bars) == 0 or anchor_ts is None or anchor_px <= 0:
         return out
 
-    # Forward window starts the DAY AFTER the breakout. You enter at the trigger
-    # (its close), so the holding period — and MFE/MAE — is the days that follow.
-    # Including the trigger day would make day-1 always 0% (close vs itself) and
-    # would count the trigger day's pre-breakout intraday low as drawdown you
-    # never actually sat through.
+    # Forward window starts the DAY AFTER the breakout (your actual holding period).
     day_after = (anchor_ts + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     try:
         fwd = bars[bars.index >= day_after].head(horizon_days)
@@ -90,40 +84,30 @@ def judge_path(bars, anchor_ts, anchor_px, stop_level,
     if len(fwd) == 0:
         return out
 
-    target = anchor_px * (1 + win_pct)
-    stop   = float(stop_level) if stop_level else None
     hi_run = anchor_px; lo_run = anchor_px
-    curve  = []
-    rtype  = None; resolved_i = None
+    hi_date = None; lo_date = None
+    curve = []
     for i, (ts, row) in enumerate(fwd.iterrows(), start=1):
         hi = float(row["high"]); lo = float(row["low"]); close = float(row["close"])
-        hi_run = max(hi_run, hi); lo_run = min(lo_run, lo)
-        curve.append({"day": i, "date": ts.date().isoformat(), "close": round(close, 2),
+        d = ts.date().isoformat()
+        if hi > hi_run: hi_run = hi; hi_date = d
+        if lo < lo_run: lo_run = lo; lo_date = d
+        curve.append({"day": i, "date": d, "close": round(close, 2),
                       "pctFromAnchor": round((close - anchor_px) / anchor_px * 100, 2)})
-        if hi >= target:                       # target reached intraday → win
-            rtype = "target"; resolved_i = i; break
-        if stop is not None and close < stop:  # daily close back below the level → fail
-            rtype = "stop"; resolved_i = i; break
 
     last_close = curve[-1]["close"]
-    if rtype == "target":
-        outcome, realized = "win", round(win_pct * 100, 2)
-    elif rtype == "stop":
-        outcome, realized = "loss", round((last_close - anchor_px) / anchor_px * 100, 2)
-    elif len(fwd) >= horizon_days:             # full horizon, never resolved → no follow-through
-        rtype, outcome = "horizon", "loss"
-        realized = round((last_close - anchor_px) / anchor_px * 100, 2)
-    else:                                      # not enough forward bars yet → still open
-        rtype, outcome = "open", None
-        realized = round((last_close - anchor_px) / anchor_px * 100, 2)
-
+    result   = round((last_close - anchor_px) / anchor_px * 100, 2)
+    resolved = len(fwd) >= horizon_days
     out.update({
-        "outcome": outcome, "resolutionType": rtype,
-        "daysToResolve": resolved_i, "resolvedDate": curve[-1]["date"],
-        "realizedPct": realized,
-        "mfePct": round((hi_run - anchor_px) / anchor_px * 100, 2),
-        "maePct": round((lo_run - anchor_px) / anchor_px * 100, 2),
-        "curve": curve,
+        "outcome":  ("win" if result > 0 else "loss") if resolved else None,
+        "resultPct": result,
+        "grade":     _grade(abs(result)),
+        "mfePct":    round((hi_run - anchor_px) / anchor_px * 100, 2),
+        "mfeDate":   hi_date or (curve[0]["date"] if curve else None),
+        "maePct":    round((lo_run - anchor_px) / anchor_px * 100, 2),
+        "maeDate":   lo_date or (curve[0]["date"] if curve else None),
+        "daysHeld":  len(curve),
+        "curve":     curve,
     })
     return out
 
@@ -132,21 +116,17 @@ def judge_path(bars, anchor_ts, anchor_px, stop_level,
 def _episode_metrics(ep: dict, bars, spy_bars) -> dict:
     triggered = bool(ep.get("triggered_at"))
     if triggered:
-        anchor_ts  = _parse(ep.get("triggered_at"))
-        anchor_px  = float(ep.get("trigger_price") or ep.get("enter_price") or 0)
-        stop_level = ep.get("breakout_level")
+        anchor_ts = _parse(ep.get("triggered_at"))
+        anchor_px = float(ep.get("trigger_price") or ep.get("enter_price") or 0)
     else:
-        anchor_ts  = _parse(ep.get("entered_at"))
-        anchor_px  = float(ep.get("enter_price") or 0)
-        stop_level = None
+        anchor_ts = _parse(ep.get("entered_at"))
+        anchor_px = float(ep.get("enter_price") or 0)
 
-    jp = judge_path(bars, anchor_ts, anchor_px, stop_level)
+    jp = judge_path(bars, anchor_ts, anchor_px)
 
-    # Never triggered → the watch's breakout call didn't come: it's a loss.
+    # Never triggered → the watch's breakout call didn't come: a loss.
     if not triggered and jp.get("outcome") is not None:
-        jp["outcome"]        = "loss"
-        jp["resolutionType"] = (ep.get("exit_reason") or "FADED").lower()
-        jp["daysToResolve"]  = None
+        jp["outcome"] = "loss"
 
     # SPY over the same window (benchmark).
     bench = None
@@ -169,33 +149,39 @@ def _episode_metrics(ep: dict, bars, spy_bars) -> dict:
 def _scorecard(eps: list[dict], days: int) -> dict:
     total     = len(eps)
     triggered = [e for e in eps if e.get("triggeredAt")]
-    paid      = [e for e in triggered if e.get("resolution") == "target"]
     judged    = [e for e in eps if e.get("outcome") in ("win", "loss")]
     wins      = [e for e in judged if e.get("outcome") == "win"]
     open_n    = sum(1 for e in eps if e.get("outcome") is None)
 
-    avg_total = _avg([e["totalPct"] for e in eps])
-    avg_bench = _avg([e["benchmarkPct"] for e in eps])
+    # Grade distribution split by direction (over judged episodes).
+    up   = {g: 0 for g in _GRADES}
+    down = {g: 0 for g in _GRADES}
+    for e in judged:
+        g = e.get("grade")
+        if g in up:
+            (up if (e.get("resultPct") or 0) > 0 else down)[g] += 1
+
+    avg_result = _avg([e["resultPct"] for e in eps])
+    avg_bench  = _avg([e["benchmarkPct"] for e in eps])
 
     return {
-        "windowDays":           days,
-        "total":                total,
-        "open":                 open_n,
-        "closed":               total - open_n,
-        "triggered":            len(triggered),
-        "triggerRatePct":       round(100 * len(triggered) / total) if total else None,
-        "followThrough":        len(paid),
-        "followThroughRatePct": round(100 * len(paid) / len(triggered)) if triggered else None,
-        "judged":               len(judged),
-        "wins":                 len(wins),
-        "accuracyPct":          round(100 * len(wins) / len(judged)) if judged else None,
-        "avgMfePct":            _avg([e["mfePct"] for e in eps]),
-        "avgMaePct":            _avg([e["maePct"] for e in eps]),
-        "avgTotalPct":          avg_total,
-        "avgBenchmarkPct":      avg_bench,
-        "edgeVsSpyPct":         round(avg_total - avg_bench, 2)
-                                if (avg_total is not None and avg_bench is not None) else None,
-        "medianDaysToTarget":   _median([e["daysToTarget"] for e in paid]),
+        "windowDays":      days,
+        "total":           total,
+        "open":            open_n,
+        "closed":          total - open_n,
+        "triggered":       len(triggered),
+        "triggerRatePct":  round(100 * len(triggered) / total) if total else None,
+        "judged":          len(judged),
+        "wins":            len(wins),
+        "winRatePct":      round(100 * len(wins) / len(judged)) if judged else None,
+        "avgResultPct":    avg_result,
+        "avgMfePct":       _avg([e["mfePct"] for e in eps]),
+        "avgMaePct":       _avg([e["maePct"] for e in eps]),
+        "avgBenchmarkPct": avg_bench,
+        "edgeVsSpyPct":    round(avg_result - avg_bench, 2)
+                           if (avg_result is not None and avg_bench is not None) else None,
+        "gradeUp":         up,
+        "gradeDown":       down,
     }
 
 
@@ -231,29 +217,31 @@ def build_history(sb, days: int = 30, limit: int = 120) -> dict:
     for ep in eps:
         triggered = bool(ep.get("triggered_at"))
         m = _episode_metrics(ep, bars_by.get(ep.get("ticker")), spy_bars)
-        ep_date = (ep.get("triggered_at") if triggered else ep.get("entered_at")) or ""
+        breakout_at = (ep.get("triggered_at") if triggered else ep.get("entered_at")) or ""
         enriched.append({
             "id":            ep.get("id"),
             "ticker":        ep.get("ticker"),
             "state":         ep.get("state"),
             "exitReason":    ep.get("exit_reason"),
-            "outcome":       m["outcome"],                       # computed live (path-dependent)
-            "resolution":    m["resolutionType"],                # target|stop|horizon|faded|expired|open
+            "outcome":       m["outcome"],
+            "won":           (m["outcome"] == "win") if m["outcome"] else None,
+            "grade":         m["grade"],
             "enteredAt":     ep.get("entered_at"),
             "triggeredAt":   ep.get("triggered_at"),
             "exitedAt":      ep.get("exited_at"),
-            "episodeDate":   ep_date[:10],                       # YYYY-MM-DD for day grouping
+            "breakoutAt":    breakout_at,            # full ISO (date + time) of the breakout
+            "episodeDate":   breakout_at[:10],       # YYYY-MM-DD for day grouping
             "enterPrice":    _num(ep.get("enter_price")),
             "breakoutLevel": _num(ep.get("breakout_level")),
             "triggerPrice":  _num(ep.get("trigger_price")),
             "anchor":        "trigger" if triggered else "entry",
             "isOpen":        m["outcome"] is None,
+            "resultPct":     m["resultPct"],         # net move at window end
             "mfePct":        m["mfePct"],
+            "mfeDate":       m["mfeDate"],
             "maePct":        m["maePct"],
-            "totalPct":      m["realizedPct"],                   # realised at resolution
-            "daysToTarget":  m["daysToResolve"] if m["resolutionType"] == "target" else None,
-            "daysToResolve": m["daysToResolve"],
-            "resolvedDate":  m["resolvedDate"],
+            "maeDate":       m["maeDate"],
+            "daysHeld":      m["daysHeld"],
             "benchmarkPct":  m["benchmark_pct"],
             "curve":         m["curve"],
         })
