@@ -215,9 +215,12 @@ class TestMaintenancePass:
         # _run_maintenance is a private function but importable
         from engine.runner import _run_maintenance
         mock_sb = _mock_sb()
+        # _run_maintenance early-returns on closed-market days, so force "open"
+        # to exercise the body deterministically (else this is a no-op on weekends).
         with patch("engine.tracker.track_signals", return_value=None), \
              patch("engine.runner._supabase", return_value=mock_sb), \
              patch("engine.runner._close_signals", return_value=None), \
+             patch("engine.session_classifier.is_market_open_today", return_value=True), \
              patch("engine.signal_monitor.run", return_value=None):
             _run_maintenance()
 
@@ -225,10 +228,13 @@ class TestMaintenancePass:
         from engine.runner import _run_maintenance
         mock_sb = _mock_sb()
         # runner.py does "from engine.tracker import track_signals" so the local
-        # reference lives at engine.runner.track_signals, not engine.tracker.track_signals
+        # reference lives at engine.runner.track_signals, not engine.tracker.track_signals.
+        # Also force market-open, since _run_maintenance skips (returns early) on
+        # closed-market days — otherwise this fails on weekend/holiday CI runs.
         with patch("engine.runner.track_signals") as mock_tracker, \
              patch("engine.runner._supabase", return_value=mock_sb), \
              patch("engine.runner._close_signals", return_value=None), \
+             patch("engine.session_classifier.is_market_open_today", return_value=True), \
              patch("engine.signal_monitor.run", return_value=None):
             _run_maintenance()
         mock_tracker.assert_called_once()
