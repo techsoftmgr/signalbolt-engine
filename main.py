@@ -1886,6 +1886,62 @@ async def stripe_webhook(request: Request):
     return {"status": "ok"}
 
 
+@app.post("/webhook/revenuecat")
+async def revenuecat_webhook(request: Request):
+    """
+    RevenueCat webhook → update profiles.subscription_status (Google Play / App
+    Store billing). Mirrors the Stripe webhook. RevenueCat is configured to send
+    the shared secret in the Authorization header (set REVENUECAT_WEBHOOK_AUTH).
+    app_user_id MUST be the Supabase profile id (set via Purchases.logIn in app).
+    Entitlements expected: "pro" and "pro_plus".
+    """
+    expected = os.environ.get("REVENUECAT_WEBHOOK_AUTH", "")
+    if not expected or request.headers.get("Authorization", "") != expected:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid payload")
+
+    event   = (body or {}).get("event") or {}
+    etype   = event.get("type")
+    user_id = event.get("app_user_id")
+    ents    = event.get("entitlement_ids") or (
+        [event["entitlement_id"]] if event.get("entitlement_id") else []
+    )
+    if not user_id:
+        return {"status": "ignored", "reason": "no app_user_id"}
+
+    # Active = entitlement is currently granted. CANCELLATION/BILLING_ISSUE keep
+    # access until the period actually lapses (EXPIRATION) — matches store behavior.
+    ACTIVE = {"INITIAL_PURCHASE", "RENEWAL", "PRODUCT_CHANGE", "UNCANCELLATION",
+              "NON_RENEWING_PURCHASE", "SUBSCRIPTION_EXTENDED", "TEMPORARY_ENTITLEMENT_GRANT"}
+    LAPSE  = {"EXPIRATION"}
+
+    sb = _make_supabase()
+    if etype in ACTIVE:
+        tier = "pro_plus" if "pro_plus" in ents else ("pro" if "pro" in ents else None)
+        if tier:
+            sb.table("profiles").update({
+                "subscription_status": tier, "tier": tier, "free_ends_at": None,
+            }).eq("id", user_id).execute()
+            logger.info(f"[revenuecat] {etype} user={user_id} -> {tier}")
+        else:
+            logger.warning(f"[revenuecat] {etype} user={user_id} unknown entitlements={ents}")
+    elif etype in LAPSE:
+        sb.table("profiles").update({
+            "subscription_status": "expired", "tier": "expired",
+        }).eq("id", user_id).execute()
+        logger.info(f"[revenuecat] {etype} user={user_id} -> expired")
+    elif etype in ("CANCELLATION", "BILLING_ISSUE"):
+        logger.info(f"[revenuecat] {etype} user={user_id} (access retained until EXPIRATION)")
+    else:
+        logger.debug(f"[revenuecat] unhandled event {etype} user={user_id}")
+
+    return {"status": "ok"}
+
+
 @app.post("/cancel-subscription")
 @limiter.limit("5/minute")
 async def cancel_subscription(request: Request):
