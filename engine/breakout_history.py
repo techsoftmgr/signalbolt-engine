@@ -27,6 +27,7 @@ logger = logging.getLogger("signalbolt.breakout_history")
 
 WIN_PCT      = 0.02     # retained for import compatibility (no longer gates wins)
 HORIZON_DAYS = 5        # fixed follow-through window (trading days after the breakout)
+VOL_CONFIRM  = 1.5      # break-day volume ≥ 1.5× the prior-20d avg = volume-confirmed
 _TABLE       = "breakout_watch_history"
 _GRADES      = ["A+", "A", "B", "C"]
 
@@ -77,6 +78,22 @@ def _grade(abs_pct: float) -> str:
     if abs_pct >= 10: return "A"
     if abs_pct >= 5:  return "B"
     return "C"
+
+
+def _vol_ratio(bars, anchor_ts):
+    """Break-day volume ÷ the prior-20-day avg volume (None if unknown)."""
+    if bars is None or len(bars) < 21 or anchor_ts is None:
+        return None
+    try:
+        cutoff = anchor_ts.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        prior = bars[bars.index <= cutoff]      # bars up to & incl. the break day
+        if len(prior) < 21:
+            return None
+        vols = prior["volume"].values.astype(float)
+        avg20 = float(vols[-21:-1].mean())
+        return round(float(vols[-1]) / avg20, 2) if avg20 > 0 else None
+    except Exception:
+        return None
 
 
 # ── path / result (shared with breakout_validator) ───────────────────────────
@@ -153,6 +170,11 @@ def _episode_metrics(ep: dict, bars, spy_bars, cfg: dict) -> dict:
     if cfg["needsTrigger"] and not triggered and jp.get("outcome") is not None:
         jp["outcome"] = "loss"
 
+    # Volume confirmation at the break day (for strong-vs-weak segmentation).
+    vr = _vol_ratio(bars, anchor_ts)
+    jp["volRatio"]     = vr
+    jp["volConfirmed"] = (vr >= VOL_CONFIRM) if vr is not None else None
+
     # SPY over the same window (benchmark).
     bench = None
     curve = jp.get("curve") or []
@@ -189,9 +211,24 @@ def _scorecard(eps: list[dict], days: int, cfg: dict) -> dict:
     avg_result = _avg([e["resultPct"] for e in eps])
     avg_bench  = _avg([e["benchmarkPct"] for e in eps])
 
+    # Strong-vs-weak-volume segmentation — does the volume confirmation pay?
+    def _seg(subset):
+        judged_s = [e for e in subset if e.get("outcome") in ("win", "loss")]
+        wins_s   = [e for e in judged_s if e.get("outcome") == "win"]
+        ar = _avg([e["resultPct"] for e in subset])
+        ab = _avg([e["benchmarkPct"] for e in subset])
+        return {
+            "n": len(subset), "judged": len(judged_s), "wins": len(wins_s),
+            "winRatePct":   round(100 * len(wins_s) / len(judged_s)) if judged_s else None,
+            "avgResultPct": ar,
+            "edgeVsSpyPct": round(ar - ab, 2) if (ar is not None and ab is not None) else None,
+        }
+
     return {
         "windowDays":      days,
         "goodDirection":   cfg["direction"],
+        "volStrong":       _seg([e for e in eps if e.get("volConfirmed") is True]),
+        "volWeak":         _seg([e for e in eps if e.get("volConfirmed") is False]),
         "needsTrigger":    cfg["needsTrigger"],
         "total":           total,
         "open":            open_n,
@@ -273,6 +310,8 @@ def build_history(sb, days: int = 30, limit: int = 120, bucket: str = "breakouts
             "maeDate":       m["maeDate"],
             "daysHeld":      m["daysHeld"],
             "benchmarkPct":  m["benchmark_pct"],
+            "volRatio":      m.get("volRatio"),
+            "volConfirmed":  m.get("volConfirmed"),
             "curve":         m["curve"],
         })
 
@@ -321,6 +360,7 @@ def build_all_scorecards(sb, days: int = 30) -> dict:
                 "triggeredAt": ep.get("triggered_at"), "outcome": m["outcome"],
                 "grade": m["grade"], "resultPct": m["resultPct"],
                 "mfePct": m["mfePct"], "maePct": m["maePct"], "benchmarkPct": m["benchmark_pct"],
+                "volConfirmed": m.get("volConfirmed"),
             })
         out.append({"bucket": bucket, "label": cfg["label"], "scorecard": _scorecard(rows, days, cfg)})
 
