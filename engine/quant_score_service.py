@@ -41,27 +41,81 @@ DEFAULT_TICKERS: list[str] = [
 
 _BUCKET_LIMIT = 10   # max cards/episodes per bucket per cycle (was 6)
 
-# Lazily widen the scan universe by reusing the momentum model's curated, liquid
-# ~95-name list (deduped union with DEFAULT_TICKERS). More candidates = more
-# episodes = faster statistical significance, while staying liquid/clean.
-_UNIVERSE_CACHE: Optional[list[str]] = None
+# ── Liquidity-filtered, movers-augmented scan universe ───────────────────────
+# Rather than a hand-picked list, build the scan set dynamically (~every 3h)
+# from a broad liquid candidate POOL (curated liquid base + momentum universe +
+# today's Alpaca movers), keep only TRADABLE names (price ≥ $MIN, avg
+# $-volume ≥ $THRESHOLD), then cap to the most-liquid _LIQ_MAX_NAMES for cost.
+# Core + today's movers are always kept (they're liquid by definition and the
+# whole point is to catch the in-play names). Falls back to the last good set
+# / DEFAULT_TICKERS on any failure. NOT the whole market — illiquid names are
+# untradable and would poison the track-record accuracy.
+_LIQ_MIN_PRICE      = 5.0
+_LIQ_MIN_DOLLAR_VOL = 10_000_000     # $10M/day average
+_LIQ_MAX_NAMES      = 150            # per-cycle scan cap (cost on the web VM)
+_LIQ_TTL            = 3 * 3600       # rebuild at most every ~3h
+_liq_universe: list[str] = []
+_liq_built_ts: float     = 0.0
+
+
+def _candidate_pool() -> list[str]:
+    """Broad liquid candidate set before the dollar-volume filter."""
+    pool = set(DEFAULT_TICKERS)
+    try:
+        from engine.prescreener import EXTENDED_UNIVERSE, fetch_movers
+        pool.update(EXTENDED_UNIVERSE)
+        pool.update(fetch_movers(top=40) or [])
+    except Exception:
+        pass
+    try:
+        from engine.momentum_detector import UNIVERSE as _MOM
+        pool.update(_MOM)
+    except Exception:
+        pass
+    return sorted(pool)
 
 
 def _scan_universe() -> list[str]:
-    global _UNIVERSE_CACHE
-    if _UNIVERSE_CACHE is not None:
-        return _UNIVERSE_CACHE
-    syms = list(DEFAULT_TICKERS)
+    """Liquidity-filtered, movers-augmented universe, rebuilt ~every 3h."""
+    global _liq_universe, _liq_built_ts
+    if _liq_universe and (time.monotonic() - _liq_built_ts) < _LIQ_TTL:
+        return _liq_universe
+
+    pool = _candidate_pool()
     try:
-        from engine.momentum_detector import UNIVERSE as _MOM
-        seen = set(syms)
-        for t in _MOM:
-            if t not in seen:
-                syms.append(t); seen.add(t)
-    except Exception:
-        pass
-    _UNIVERSE_CACHE = syms
-    return syms
+        from engine.alpaca_client import get_multi_bars
+        # Only the core is always-kept (mega-liquid). Today's movers are in the
+        # pool and must pass the SAME liquidity filter — so we keep liquid movers
+        # (real volume) and drop low-float % pumps. That's the whole point of a
+        # liquidity base.
+        must = set(DEFAULT_TICKERS)
+
+        bars = get_multi_bars(pool, "1Day", 30) or {}
+        keep_must: list[str] = []
+        ranked:    list[tuple[str, float]] = []
+        for tk, df in bars.items():
+            if df is None or len(df) < 5:
+                continue
+            closes = df["close"].values.astype(float)
+            vols   = df["volume"].values.astype(float)
+            if float(closes[-1]) < _LIQ_MIN_PRICE:
+                continue                               # drop sub-$5 junk
+            dvol = float(np.mean(closes[-20:] * vols[-20:]))
+            if tk in must:
+                keep_must.append(tk)
+            elif dvol >= _LIQ_MIN_DOLLAR_VOL:
+                ranked.append((tk, dvol))
+        ranked.sort(key=lambda x: x[1], reverse=True)
+        liq = list(dict.fromkeys(keep_must + [t for t, _ in ranked]))[:_LIQ_MAX_NAMES]
+        if liq:
+            _liq_universe = liq
+            _liq_built_ts = time.monotonic()
+            logger.info(f"[quant] liquid universe rebuilt: {len(liq)} of {len(pool)} candidates")
+            return liq
+    except Exception as e:
+        logger.warning(f"[quant] liquid universe build failed: {e}")
+
+    return _liq_universe or list(DEFAULT_TICKERS)
 
 
 def _safe(val, default: float = 0.0) -> float:
