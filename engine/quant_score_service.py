@@ -39,6 +39,30 @@ DEFAULT_TICKERS: list[str] = [
     "MARA", "RIOT", "CLSK", "MRNA", "BNTX",
 ]
 
+_BUCKET_LIMIT = 10   # max cards/episodes per bucket per cycle (was 6)
+
+# Lazily widen the scan universe by reusing the momentum model's curated, liquid
+# ~95-name list (deduped union with DEFAULT_TICKERS). More candidates = more
+# episodes = faster statistical significance, while staying liquid/clean.
+_UNIVERSE_CACHE: Optional[list[str]] = None
+
+
+def _scan_universe() -> list[str]:
+    global _UNIVERSE_CACHE
+    if _UNIVERSE_CACHE is not None:
+        return _UNIVERSE_CACHE
+    syms = list(DEFAULT_TICKERS)
+    try:
+        from engine.momentum_detector import UNIVERSE as _MOM
+        seen = set(syms)
+        for t in _MOM:
+            if t not in seen:
+                syms.append(t); seen.add(t)
+    except Exception:
+        pass
+    _UNIVERSE_CACHE = syms
+    return syms
+
 
 def _safe(val, default: float = 0.0) -> float:
     try:
@@ -75,7 +99,7 @@ def get_quant_dashboard(symbols: Optional[list[str]] = None) -> dict:
     if now - _cache_ts < _CACHE_TTL and _cache:
         return _cache
 
-    result = _build_dashboard(symbols or DEFAULT_TICKERS)
+    result = _build_dashboard(symbols or _scan_universe())
     if result:
         try:
             _enrich_breakouts(result)
@@ -215,22 +239,22 @@ def _build_dashboard(tickers: list[str]) -> dict:
         top_momentum = [
             x for x in sorted_by_quant
             if x["momentumScore"] >= 55 and x["finalQuantScore"] >= 45
-        ][:6]
+        ][:_BUCKET_LIMIT]
 
         pullbacks = [
             x for x in scored
             if x["setupType"] == "pullback"
-        ][:6]
+        ][:_BUCKET_LIMIT]
 
         breakouts = [
             x for x in scored
             if x["setupType"] == "breakout"
-        ][:6]
+        ][:_BUCKET_LIMIT]
 
         breakdowns = [
             x for x in scored
             if x["setupType"] == "breakdown"
-        ][:6]
+        ][:_BUCKET_LIMIT]
 
         # High volume split by DIRECTION — accumulation (up day) vs distribution
         # (down day). Tracked separately so each gets a meaningful accuracy.
@@ -238,18 +262,18 @@ def _build_dashboard(tickers: list[str]) -> dict:
             [x for x in scored if x["volumeScore"] >= 50],
             key=lambda x: x["volumeScore"], reverse=True,
         )
-        high_volume_up   = [x for x in _high_vol if (x.get("dayChangePct") or 0) > 0][:6]
-        high_volume_down = [x for x in _high_vol if (x.get("dayChangePct") or 0) < 0][:6]
+        high_volume_up   = [x for x in _high_vol if (x.get("dayChangePct") or 0) > 0][:_BUCKET_LIMIT]
+        high_volume_down = [x for x in _high_vol if (x.get("dayChangePct") or 0) < 0][:_BUCKET_LIMIT]
 
         vwap_reclaim = [
             x for x in scored
             if x["setupType"] == "vwap_reclaim"
-        ][:6]
+        ][:_BUCKET_LIMIT]
 
         oversold_bounce = [
             x for x in scored
             if x["setupType"] == "oversold_bounce"
-        ][:6]
+        ][:_BUCKET_LIMIT]
 
         return {
             "marketRegime": {
