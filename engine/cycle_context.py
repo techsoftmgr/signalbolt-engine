@@ -25,7 +25,8 @@ import numpy as np
 
 logger = logging.getLogger("signalbolt.cycle_context")
 
-_DRIVER_WINDOW = 40   # bars over which to attribute the move to market vs idiosyncratic
+_DRIVER_WINDOW = 60   # bars to attribute the move to market vs idiosyncratic (covers the swing)
+_DRIVER_MIN_MOVE = 0.05   # need a >=5% net move to attribute reliably (small moves inflate the %)
 
 
 def _cyclicality(df) -> dict:
@@ -75,10 +76,17 @@ def _driver(df, spy_df, window: int = _DRIVER_WINDOW) -> dict:
         beta = float(np.cov(s, m)[0, 1] / var_m) if var_m > 0 else 1.0
         total = float(df["close"].iloc[-1] / df["close"].iloc[-window] - 1)
         spy_total = float(spy_df["close"].iloc[-1] / spy_df["close"].iloc[-window] - 1)
-        market_comp = beta * spy_total
-        if abs(total) < 1e-6:
+        # Only attribute when the net move is meaningful — a tiny net move makes
+        # the ratio explode. Below the floor, leave the driver unclear (None).
+        if abs(total) < _DRIVER_MIN_MOVE:
             return out
-        market_pct = float(np.clip(abs(market_comp) / abs(total) * 100, 0, 100))
+        market_comp = beta * spy_total
+        # DIRECTION-AWARE: what fraction of the ACTUAL move the market explains
+        # IN THE SAME DIRECTION. If the move fought the market (ratio <= 0) it's
+        # company-specific — e.g. the stock FELL while the market ROSE (the
+        # falling-knife case). The old absolute-value ratio wrongly read those as
+        # partly market-driven.
+        market_pct = float(np.clip((market_comp / total) * 100, 0, 100))
         label = ("market-driven" if market_pct >= 60
                  else "company-specific" if market_pct <= 30
                  else "mixed")
