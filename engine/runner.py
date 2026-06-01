@@ -2528,6 +2528,7 @@ def start_scheduler() -> BackgroundScheduler:
             ("vwapReclaim",    "up",   False, None,             "finalQuantScore"),
             ("oversoldBounce", "up",   False, None,             "meanReversionScore"),
             ("turnaround",     "up",   False, None,             "turnaroundScore"),
+            ("peak",           "down", False, None,             "peakScore"),
         ]
         try:
             from engine import quant_score_service, breakout_watch

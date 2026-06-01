@@ -349,6 +349,13 @@ def _build_dashboard(tickers: list[str]) -> dict:
             key=lambda x: -(x.get("turnaroundScore") or 0),
         )[:_BUCKET_LIMIT]
 
+        # Peak (swing-high / distribution) — Watch + confirmed Peak, ranked by
+        # peak score. Take-profit / hedge primary; short/puts optional.
+        peak = sorted(
+            [x for x in scored if x.get("peakStage") in ("watch", "peak")],
+            key=lambda x: -(x.get("peakScore") or 0),
+        )[:_BUCKET_LIMIT]
+
         return {
             "marketRegime": {
                 "label":       regime_label,
@@ -364,6 +371,7 @@ def _build_dashboard(tickers: list[str]) -> dict:
             "vwapReclaim":    vwap_reclaim,
             "oversoldBounce": oversold_bounce,
             "turnaround":     turnaround,
+            "peak":           peak,
             "allScored":      sorted_by_quant[:20],
         }
 
@@ -580,6 +588,23 @@ def _score_ticker(
     except Exception as _te:
         logger.debug(f"[quant] {ticker} turnaround: {_te}")
 
+    # ── Peak (swing-high / distribution top) — mirror of turnaround ──────────
+    peak_score = 0.0
+    peak_stage = "none"
+    peak_reasons: list[str] = []
+    try:
+        from engine import peak_detector
+        _pk = peak_detector.score_peak(
+            daily_long_df if daily_long_df is not None else daily_df,
+            regime_type=regime_type,
+        )
+        if _pk:
+            peak_score   = _pk["score"]
+            peak_stage   = _pk["stage"]
+            peak_reasons = _pk.get("reasons", [])
+    except Exception as _pe:
+        logger.debug(f"[quant] {ticker} peak: {_pe}")
+
     return {
         "ticker":              ticker,
         "price":               round(current, 2),
@@ -602,6 +627,9 @@ def _score_ticker(
         "turnaroundScore":     round(turnaround_score, 1),
         "turnaroundStage":     turnaround_stage,
         "turnaroundReasons":   turnaround_reasons,
+        "peakScore":           round(peak_score, 1),
+        "peakStage":           peak_stage,
+        "peakReasons":         peak_reasons,
         "riskScore":           round(risk_score, 1),
         "finalQuantScore":     round(final_score, 1),
         # Qualitative outputs
