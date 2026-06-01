@@ -1797,6 +1797,14 @@ def fire_ema_reclaim(ticker: str, direction: str, price: float,
 _MOMENTUM_MAX_LONGS  = 8
 _MOMENTUM_MAX_SHORTS = 4
 _MOMENTUM_ATR_STOP   = 1.5    # initial stop = entry ∓ 1.5 × daily ATR (chandelier takes over)
+# Inverse-vol (equal-risk) position sizing — the managed-futures standard: size
+# each name to a common annualized-vol budget so a high-vol name (MARA) and a
+# low-vol name (KO) contribute similar risk, instead of equal dollars. The
+# multiplier scales the tier-based size by (target_vol / realized_vol), clipped
+# so a very-low-vol name can't lever up and a very-high-vol name keeps a floor.
+_MOM_TARGET_VOL      = 0.30   # 30% annualized vol budget per position
+_MOM_VOL_SCALAR_MIN  = 0.30
+_MOM_VOL_SCALAR_MAX  = 1.25
 # Targets are intentionally WIDE/aspirational — momentum_monitor exits on the
 # chandelier trail / trend break, NOT a fixed target. They exist only so the
 # card shows the let-it-run upside; nothing acts on them.
@@ -1846,9 +1854,20 @@ def _fire_momentum(sb: Client, ms, direction: str) -> None:
         logger.info(f"[runner] {ms.ticker} TREND_MOMENTUM blocked — portfolio: {risk_chk['block_reason']}")
         return
 
+    # ── Inverse-vol (equal-risk) sizing ───────────────────────────────────────
+    # Scale the tier-based position size to a common vol budget so each momentum
+    # name carries comparable risk (managed-futures standard).
+    vol_scalar = 1.0
+    if ms.ann_vol and ms.ann_vol > 0:
+        vol_scalar = max(_MOM_VOL_SCALAR_MIN,
+                         min(_MOM_VOL_SCALAR_MAX, _MOM_TARGET_VOL / ms.ann_vol))
+    pos_mult = round(risk_chk["position_mult"] * vol_scalar, 3)
+
     setup_reason = (f"Trend momentum — {direction} (rank z={ms.score:+.2f}, "
-                    f"6m-blend {ms.raw_return * 100:+.1f}% @ {ms.ann_vol * 100:.0f}% vol)")
-    logger.info(f"[runner] {ms.ticker} TREND_MOMENTUM {direction} @ ${price:.2f}  z={ms.score:+.2f}")
+                    f"12-1 mom {ms.raw_return * 100:+.1f}% @ {ms.ann_vol * 100:.0f}% vol, "
+                    f"size {vol_scalar:.2f}x inv-vol)")
+    logger.info(f"[runner] {ms.ticker} TREND_MOMENTUM {direction} @ ${price:.2f}  "
+                f"z={ms.score:+.2f}  inv-vol={vol_scalar:.2f}x")
     signal_row = {
         "ticker":             ms.ticker,
         "direction":          direction,
@@ -1865,7 +1884,7 @@ def _fire_momentum(sb: Client, ms, direction: str) -> None:
         "regime_type":        "",
         "session_mode":       "",
         "confidence_tier":    risk_chk["confidence_tier"],
-        "position_multiplier": risk_chk["position_mult"],
+        "position_multiplier": pos_mult,
         "risk_reward":        _MOMENTUM_T1_R,
         "score_breakdown":    {
             "detector_source":   "TREND_MOMENTUM",
@@ -1874,6 +1893,9 @@ def _fire_momentum(sb: Client, ms, direction: str) -> None:
             "mom_score":         ms.score,
             "blended_return":    ms.raw_return,
             "ann_vol":           ms.ann_vol,
+            "vol_target":        _MOM_TARGET_VOL,
+            "vol_scalar":        round(vol_scalar, 3),
+            "base_position_mult": risk_chk["position_mult"],
             "sma_fast":          ms.sma_fast,
             "sma_slow":          ms.sma_slow,
             "ext_atr":           getattr(ms, "ext_atr", 0.0),
@@ -1911,7 +1933,9 @@ def _run_momentum_scan() -> None:
         scores = []
         for tk in md.UNIVERSE:
             try:
-                df = _alpaca.get_bars(tk, timeframe="1Day", days=400)
+                # ~500 calendar days ≈ 345 trading bars — enough for the canonical
+                # 12-1 formation (needs 252 + 21 = 273 bars) plus margin.
+                df = _alpaca.get_bars(tk, timeframe="1Day", days=500)
                 ms = md.score(tk, df)
                 if ms and ms.bias != "NONE":
                     scores.append(ms)
@@ -1994,6 +2018,16 @@ def _close_signals(sb: Client) -> None:
                 pass
 
     for sig in rows:
+        # TREND_MOMENTUM is managed SOLELY by engine.momentum_monitor (chandelier
+        # trail, structural SMA50 backstop, daily-close trend-break exit, NO fixed
+        # target and NO time expiry — let winners run). The generic closer must
+        # skip it, otherwise it would (a) force-expire the trade at the swing
+        # 10-day backstop and (b) stop it out on an intraday wick against a stale
+        # stop — both contradict the trend-following design. (signal_monitor
+        # already skips it for the same reason.)
+        if ((sig.get("score_breakdown") or {}).get("detector_source")) == "TREND_MOMENTUM":
+            continue
+
         created      = datetime.fromisoformat(sig["created_at"].replace("Z", "+00:00"))
         strategy     = sig.get("strategy_type") or "day_trade"
         reason: Optional[str] = None
