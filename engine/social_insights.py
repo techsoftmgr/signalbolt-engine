@@ -56,6 +56,7 @@ _BUZZ_UP_PCT     = 20.0          # mentions change considered "rising"
 _BUZZ_HOT_PCT    = 100.0         # mentions change considered "spiking"
 _PRICE_UP_PCT    = 1.0           # 1d price move considered "up"
 _PRICE_DN_PCT    = -1.0          # 1d price move considered "down"
+_VOL_CONFIRM     = 1.5           # rel-volume to confirm a move is real (not drift)
 
 # Verdict definitions: key → (label, tone, blurb). tone drives UI color.
 #   good = confirmed/healthy, warn = caution, bad = avoid, info = neutral-early
@@ -199,12 +200,17 @@ def _latest_news(ticker: str) -> Optional[dict]:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _price_changes(df) -> dict:
-    """1d and 5d % change from daily closes."""
-    out = {"price1dPct": None, "price5dPct": None, "lastClose": None}
+    """
+    1d/5d % change + relative volume (latest daily bar vol vs its 20-day avg).
+    NOTE: mid-session the latest daily bar's volume is partial, so relVolume is
+    understated during RTH (conservative — fewer false "confirmed" reads).
+    """
+    out = {"price1dPct": None, "price5dPct": None, "lastClose": None, "relVolume": None}
     try:
         if df is None or len(df) < 2:
             return out
-        closes = df.sort_index()["close"].dropna()
+        d = df.sort_index()
+        closes = d["close"].dropna()
         if len(closes) < 2:
             return out
         last = float(closes.iloc[-1])
@@ -212,6 +218,14 @@ def _price_changes(df) -> dict:
         out["price1dPct"] = round((last / float(closes.iloc[-2]) - 1) * 100, 2)
         if len(closes) >= 6:
             out["price5dPct"] = round((last / float(closes.iloc[-6]) - 1) * 100, 2)
+        if "volume" in d.columns:
+            vols = d["volume"].dropna()
+            if len(vols) >= 6:
+                recent = float(vols.iloc[-1])
+                base = vols.iloc[-21:-1] if len(vols) > 21 else vols.iloc[:-1]
+                avg = float(base.mean()) if len(base) else 0.0
+                if avg > 0:
+                    out["relVolume"] = round(recent / avg, 2)
     except Exception:
         pass
     return out
@@ -313,18 +327,19 @@ def _engine_take(ticker: str, sentiment: Optional[float],
 
 def _verdict(*, mentions_chg: Optional[float], price1d: Optional[float],
              price5d: Optional[float], sentiment: Optional[float],
-             viral: bool, engine: dict) -> dict:
+             viral: bool, engine: dict, rel_vol: Optional[float] = None) -> dict:
     """The combined read. Order matters — strongest warning wins."""
     manip = engine.get("manipulation") or {}
     p1 = price1d if price1d is not None else 0.0
     p5 = price5d if price5d is not None else 0.0
     mc = mentions_chg
 
-    buzz_up      = (mc is not None and mc >= _BUZZ_UP_PCT) or viral
-    buzz_hot     = (mc is not None and mc >= _BUZZ_HOT_PCT) or viral
-    price_up     = p1 >= _PRICE_UP_PCT or (price5d is not None and p5 >= 3.0)
-    price_strong = p1 >= 5.0 or (price5d is not None and p5 >= 10.0)
-    price_dn     = p1 <= _PRICE_DN_PCT
+    buzz_up       = (mc is not None and mc >= _BUZZ_UP_PCT) or viral
+    buzz_hot      = (mc is not None and mc >= _BUZZ_HOT_PCT) or viral
+    price_up      = p1 >= _PRICE_UP_PCT or (price5d is not None and p5 >= 3.0)
+    price_strong  = p1 >= 5.0 or (price5d is not None and p5 >= 10.0)
+    price_dn      = p1 <= _PRICE_DN_PCT
+    vol_confirmed = rel_vol is not None and rel_vol >= _VOL_CONFIRM
 
     if manip.get("flagged") and buzz_hot:
         key = "PUMP_RISK"
@@ -336,11 +351,17 @@ def _verdict(*, mentions_chg: Optional[float], price1d: Optional[float],
     elif buzz_up and not price_up:
         key = "HYPE_FADING"
     elif price_up and not buzz_up:
-        key = "UNDER_RADAR"
+        # only "ahead of the crowd" if REAL volume backs the move; a quiet rise
+        # on below-average volume is just drift, not accumulation → Mixed.
+        key = "UNDER_RADAR" if vol_confirmed else "MIXED"
     else:
         key = "MIXED"
 
     label, tone, blurb = VERDICTS[key]
+    # Show the evidence instead of asserting a cause.
+    if key == "UNDER_RADAR" and rel_vol is not None:
+        blurb = (f"Up on {rel_vol:g}× normal volume while chatter cools — "
+                 f"moving before the crowd.")
     # Upgrade the blurb when our own engine agrees with a momentum call.
     if key == "REAL_MOMENTUM" and engine.get("confirmed"):
         blurb = "Buzz, price, AND our engine all line up here."
@@ -394,11 +415,13 @@ def get_enriched_trending(sb, limit: int = 30, force: bool = False) -> dict:
             mentions_chg=mentions_chg,
             price1d=pc["price1dPct"], price5d=pc["price5dPct"],
             sentiment=sentiment, viral=viral["viral"], engine=engine,
+            rel_vol=pc.get("relVolume"),
         )
 
         r["price1dPct"]  = pc["price1dPct"]
         r["price5dPct"]  = pc["price5dPct"]
         r["lastClose"]   = pc["lastClose"]
+        r["relVolume"]   = pc.get("relVolume")
         r["goingViral"]  = viral["viral"]
         r["viralZ"]      = viral["zScore"]
         r["baselineAvg"] = viral["baselineAvg"]
