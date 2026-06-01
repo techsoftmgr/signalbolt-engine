@@ -114,6 +114,35 @@ def _tokens_for(pref_key: str, default: bool = True) -> list[str]:
     ]
 
 
+def _record_alert(
+    type_: str,
+    ticker: str | None,
+    title: str,
+    body: str,
+    stage: str | None = None,
+    data: dict | None = None,
+    sb: Client | None = None,
+) -> None:
+    """Persist an alert to the shared in-app Alerts feed (the `alerts` table).
+
+    Best-effort and INDEPENDENT of push delivery — the in-app Alerts tab must
+    populate even when no device has a push token (e.g. FCM not configured on a
+    standalone Android build). Never raise; telemetry must not break alerting.
+    """
+    try:
+        client = sb or _supabase()
+        client.table("alerts").insert({
+            "type":   type_,
+            "ticker": (ticker or None),
+            "stage":  stage,
+            "title":  title,
+            "body":   body,
+            "data":   data or {},
+        }).execute()
+    except Exception as e:
+        logger.debug(f"[push] record alert failed ({type_} {ticker}): {e}")
+
+
 def send_signal_alert(
     ticker: str,
     direction: str,
@@ -122,11 +151,6 @@ def send_signal_alert(
     signal_id: str | None = None,
 ) -> None:
     """Send a new-signal push to users who have new_signals pref enabled."""
-    tokens = _tokens_for("new_signals")
-    if not tokens:
-        logger.info("[push] No tokens with new_signals enabled — skipping")
-        return
-
     emoji = "📈" if direction == "LONG" else "📉"
     type_label = "Options" if signal_type == "option" else "Stock"
 
@@ -134,11 +158,22 @@ def send_signal_alert(
     if signal_id:
         notif_data["signal_id"] = signal_id
 
+    title = f"{emoji} New {type_label} Signal: {ticker}"
+    body  = f"{direction} · {confidence}% confidence · Tap to view details"
+
+    # Record to the in-app feed FIRST — independent of push delivery.
+    _record_alert("signal", ticker, title, body, stage=direction, data=notif_data)
+
+    tokens = _tokens_for("new_signals")
+    if not tokens:
+        logger.info("[push] No tokens with new_signals enabled — skipping")
+        return
+
     messages = [
         {
             "to":    token,
-            "title": f"{emoji} New {type_label} Signal: {ticker}",
-            "body":  f"{direction} · {confidence}% confidence · Tap to view details",
+            "title": title,
+            "body":  body,
             "data":  notif_data,
             "sound": "default",
             "badge": 1,
@@ -164,18 +199,22 @@ def send_stop_protected_alert(
     on the single crossing (handled by the caller), so no spam on later ratchets.
     """
     try:
-        tokens = _tokens_for("t1_breakeven")
-        if not tokens:
-            return
         notif_data: dict = {"type": "t1_breakeven", "ticker": ticker, "direction": direction}
         if signal_id:
             notif_data["signal_id"] = signal_id
+        title = f"🔒 {ticker} stop raised — now risk-free"
+        body  = (f"We moved your stop to ${new_stop:.2f}, locking +{locked_pct:.1f}%. "
+                 f"Downside is protected — update your broker stop to match.")
+        _record_alert("stop", ticker, title, body, stage="breakeven", data=notif_data)
+
+        tokens = _tokens_for("t1_breakeven")
+        if not tokens:
+            return
         messages = [
             {
                 "to":    token,
-                "title": f"🔒 {ticker} stop raised — now risk-free",
-                "body":  (f"We moved your stop to ${new_stop:.2f}, locking +{locked_pct:.1f}%. "
-                          f"Downside is protected — update your broker stop to match."),
+                "title": title,
+                "body":  body,
                 "data":  notif_data,
                 "sound": "default",
                 "badge": 1,
@@ -258,9 +297,6 @@ def send_breakdown_alert(
     dispatched; the caller handles ranking, per-run caps and per-day dedup.
     """
     try:
-        tokens = _tokens_for("breakdown_alerts", default=True)
-        if not tokens:
-            return 0
         px    = f" (${price:.2f})" if price else ""
         suff  = f" · {extra}" if extra else ""
         if stage == "confirmed":
@@ -269,6 +305,13 @@ def send_breakdown_alert(
         else:
             title = f"⚠️ {ticker} — Heavy selling"
             body  = f"{ticker} lost its 20-day average on strong down-volume{px}{suff}. Early breakdown risk. Tap for the read."
+
+        _record_alert("breakdown", ticker, title, body, stage=stage,
+                      data={"ticker": ticker, "stage": stage})
+
+        tokens = _tokens_for("breakdown_alerts", default=True)
+        if not tokens:
+            return 0
         messages = [
             {
                 "to":    t,
@@ -303,6 +346,11 @@ def send_buzz_spike_alert(
     """
     try:
         client = sb or _supabase()
+        chg   = f" (+{change_pct:.0f}% mentions)" if change_pct is not None else ""
+        title = f"🔥 {ticker} buzz spiking"
+        body  = f"{ticker} is heating up on social{chg}. Tap to see why."
+        _record_alert("buzz", ticker, title, body, data={"ticker": ticker}, sb=client)
+
         watchers = (
             client.table("watchlist").select("user_id").eq("ticker", ticker).execute().data
         ) or []
@@ -327,12 +375,11 @@ def send_buzz_spike_alert(
         if not tokens:
             return 0
 
-        chg = f" (+{change_pct:.0f}% mentions)" if change_pct is not None else ""
         messages = [
             {
                 "to":    t,
-                "title": f"🔥 {ticker} buzz spiking",
-                "body":  f"{ticker} is heating up on social{chg}. Tap to see why.",
+                "title": title,
+                "body":  body,
                 "data":  {"type": "community_buzz", "ticker": ticker},
                 "sound": "default",
                 "badge": 1,
@@ -355,6 +402,8 @@ def send_watchlist_state_alert(ticker: str, title: str, body: str, sb: Client | 
     """
     try:
         client = sb or _supabase()
+        _record_alert("watchlist", ticker, title, body, sb=client)
+
         watchers = (
             client.table("watchlist").select("user_id").eq("ticker", ticker).execute().data
         ) or []
@@ -407,6 +456,15 @@ def send_cycle_alert(ticker: str, kind: str, sb: Client | None = None) -> int:
     """
     try:
         client = sb or _supabase()
+        if kind == "turnaround":
+            title = f"🔄 {ticker} — Turnaround Buy Zone"
+            body  = f"{ticker} confirmed a reversal off the lows. Tap for the setup."
+        else:
+            title = f"🔻 {ticker} — Peak / Distribution"
+            body  = f"{ticker} looks topped — consider taking profit / hedging. Tap for details."
+        _record_alert("cycle", ticker, title, body, stage=kind,
+                      data={"kind": kind, "ticker": ticker}, sb=client)
+
         watchers = (
             client.table("watchlist").select("user_id").eq("ticker", ticker).execute().data
         ) or []
@@ -429,12 +487,6 @@ def send_cycle_alert(ticker: str, kind: str, sb: Client | None = None) -> int:
         ]
         if not tokens:
             return 0
-        if kind == "turnaround":
-            title = f"🔄 {ticker} — Turnaround Buy Zone"
-            body  = f"{ticker} confirmed a reversal off the lows. Tap for the setup."
-        else:
-            title = f"🔻 {ticker} — Peak / Distribution"
-            body  = f"{ticker} looks topped — consider taking profit / hedging. Tap for details."
         messages = [
             {
                 "to":    t,
