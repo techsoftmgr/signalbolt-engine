@@ -147,6 +147,44 @@ def send_signal_alert(
     _dispatch(messages, f"{ticker} {direction}")
 
 
+def send_stop_protected_alert(
+    ticker: str,
+    direction: str,
+    new_stop: float,
+    locked_pct: float,
+    signal_id: str | None = None,
+) -> None:
+    """Push ONCE when a signal's stop is first trailed to breakeven-or-better.
+
+    The monitors raise the stop silently as price runs; a user who isn't watching
+    never learns their downside is now protected (and that their broker stop is
+    stale). Gated by the t1_breakeven pref ("stop moved to breakeven"). Sent only
+    on the single crossing (handled by the caller), so no spam on later ratchets.
+    """
+    try:
+        tokens = _tokens_for("t1_breakeven")
+        if not tokens:
+            return
+        notif_data: dict = {"type": "t1_breakeven", "ticker": ticker, "direction": direction}
+        if signal_id:
+            notif_data["signal_id"] = signal_id
+        messages = [
+            {
+                "to":    token,
+                "title": f"🔒 {ticker} stop raised — now risk-free",
+                "body":  (f"We moved your stop to ${new_stop:.2f}, locking +{locked_pct:.1f}%. "
+                          f"Downside is protected — update your broker stop to match."),
+                "data":  notif_data,
+                "sound": "default",
+                "badge": 1,
+            }
+            for token in tokens
+        ]
+        _dispatch(messages, f"{ticker} stop→BE")
+    except Exception as e:
+        logger.debug(f"[push] stop_protected alert failed for {ticker}: {e}")
+
+
 # Maps notification data["type"] → notification_prefs key
 # Types not listed here are sent to all users (no pref filter)
 _TYPE_TO_PREF: dict[str, str] = {

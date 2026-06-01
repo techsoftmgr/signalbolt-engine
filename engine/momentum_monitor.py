@@ -99,7 +99,7 @@ def manage(sb) -> dict:
                     continue
                 new_sl = round(max(sl, chandelier), 2)   # ratchet up only
                 if new_sl > sl + 0.01:
-                    _update_sl(sb, sig_id, new_sl)
+                    _update_sl(sb, sig_id, new_sl, sig=sig)
                     _log_event(sb, sig_id, "be_move", price=price,
                                note=(f"📈 Chandelier trail → ${new_sl:.2f} "
                                      f"(3×ATR below {roll_high:.2f}, rides the trend)"))
@@ -114,7 +114,7 @@ def manage(sb) -> dict:
                     continue
                 new_sl = round(min(sl, chandelier), 2)
                 if new_sl < sl - 0.01:
-                    _update_sl(sb, sig_id, new_sl)
+                    _update_sl(sb, sig_id, new_sl, sig=sig)
                     _log_event(sb, sig_id, "be_move", price=price,
                                note=(f"📉 Chandelier trail → ${new_sl:.2f} "
                                      f"(3×ATR above {roll_low:.2f}, rides the trend)"))
