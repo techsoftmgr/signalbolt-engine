@@ -67,7 +67,20 @@ async def run_subscriber() -> None:
                         f"— relaying ticks to local price_store")
             backoff = _RECONNECT_BACKOFF_INITIAL   # reset on successful connect
 
-            async for msg in pubsub.listen():
+            # Poll with a short timeout instead of a blocking listen(). Under
+            # socket_timeout, a blocking read RAISES (tearing down the whole
+            # connection) whenever the channel sits idle for >socket_timeout —
+            # e.g. market closed and the worker publishes no ticks. That caused
+            # a reconnect/resubscribe loop every ~10s. get_message(timeout=...)
+            # uses a non-blocking readiness poll, so an idle interval just
+            # returns None and we keep waiting. Calling get_message regularly
+            # also lets redis-py fire its health_check_interval PINGs, which is
+            # how a genuinely dead socket still gets detected.
+            while True:
+                msg = await pubsub.get_message(ignore_subscribe_messages=True,
+                                               timeout=1.0)
+                if msg is None:
+                    continue   # idle this interval — no tick, keep waiting
                 if msg.get("type") != "message":
                     continue   # 'subscribe' confirmations, pings, etc.
                 try:
