@@ -3207,6 +3207,7 @@ async def admin_gate_performance(request: Request, days: int = 7):
 
         by_gate:   dict[str, dict] = {}
         by_ticker: dict[str, dict] = {}
+        by_date:   dict[str, dict] = {}   # calendar date → bucket, so older days (e.g. May) stay browsable
         overall = {"rejections": 0, "would_won": 0, "would_lost": 0, "pending": 0}
         for r in rows:
             won = r.get("would_have_won")
@@ -3234,6 +3235,9 @@ async def admin_gate_performance(request: Request, days: int = 7):
                 _accumulate(by_gate.setdefault(g, _new_bucket()), won, pct, sig_row)
             tk = r.get("ticker") or "?"
             _accumulate(by_ticker.setdefault(tk, _new_bucket()), won, pct, sig_row)
+            d = (r.get("created_at") or "")[:10]   # YYYY-MM-DD
+            if d:
+                _accumulate(by_date.setdefault(d, _new_bucket()), won, pct, sig_row)
 
         def _finalize(d: dict):
             for b in d.values():
@@ -3245,12 +3249,16 @@ async def admin_gate_performance(request: Request, days: int = 7):
                 b.pop("pnl_sum", None); b.pop("pnl_n", None)
         _finalize(by_gate)
         _finalize(by_ticker)
+        _finalize(by_date)
 
         judged = overall["would_won"] + overall["would_lost"]
         overall["correct_pct"] = round(overall["would_lost"] / judged * 100, 1) if judged else None
 
+        # Newest day first so the date-grouped view scrolls present → past.
+        by_date_sorted = dict(sorted(by_date.items(), key=lambda kv: kv[0], reverse=True))
+
         return {"since": since, "days": days, "by_gate": by_gate,
-                "by_ticker": by_ticker, "overall": overall}
+                "by_ticker": by_ticker, "by_date": by_date_sorted, "overall": overall}
     except HTTPException:
         raise
     except Exception as e:
