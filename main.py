@@ -2705,12 +2705,53 @@ async def admin_rejection_detail(rejection_id: int, request: Request):
 @app.get("/community/trending")
 async def community_trending(limit: int = 30, force: bool = False):
     """
-    Trending tickers across Reddit (via Apewisdom) + StockTwits.
-    Public — no auth required (same as /market/pulse). Cached 10 minutes.
+    Trending tickers across Reddit (via Apewisdom) + StockTwits, ENRICHED with
+    SignalBolt's own read: buzz-vs-price, going-viral z-score, mention sparkline,
+    engine agreement (active signal + quant score + manipulation flag), catalyst
+    headline, and a combined Verdict. Public — no auth (same as /market/pulse).
+    Cached 10 minutes.
     """
-    from engine import social_sentiment
+    from engine import social_insights
     import anyio
-    return await anyio.to_thread.run_sync(lambda: social_sentiment.get_trending(limit=limit, force=force))
+    sb = _make_supabase()
+    return await anyio.to_thread.run_sync(
+        lambda: social_insights.get_enriched_trending(sb, limit=limit, force=force)
+    )
+
+
+@app.get("/community/pulse")
+async def community_pulse(force: bool = False):
+    """Rule-based narrative digest + what-changed since ~24h ago. Public, cached."""
+    from engine import social_insights
+    import anyio
+    sb = _make_supabase()
+
+    def _build():
+        return {
+            "pulse":       social_insights.community_pulse(sb, force=force),
+            "whatsChanged": social_insights.whats_changed(sb, force=force),
+        }
+    return await anyio.to_thread.run_sync(_build)
+
+
+@app.get("/community/track-record")
+async def community_track_record(days: int = 30, horizon: int = 5, force: bool = False):
+    """Did trending names beat SPY? Forward return vs SPY by rank bucket. Public, cached 6h."""
+    from engine import social_insights
+    import anyio
+    sb = _make_supabase()
+    return await anyio.to_thread.run_sync(
+        lambda: social_insights.track_record(sb, days=days, horizon_days=horizon, force=force)
+    )
+
+
+@app.get("/community/ticker/{ticker}")
+async def community_ticker_detail(ticker: str):
+    """Tap-through detail: mention history + sparkline + the news behind the buzz. Public."""
+    from engine import social_insights
+    import anyio
+    sb = _make_supabase()
+    return await anyio.to_thread.run_sync(lambda: social_insights.ticker_detail(sb, ticker))
 
 
 @app.get("/admin/engine-status")

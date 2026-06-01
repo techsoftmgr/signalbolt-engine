@@ -2534,6 +2534,87 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled breakout-watch lifecycle sync every 5 min (RTH)")
 
+    # ── Community social snapshot (hourly, 24/7) ────────────────────────────
+    # Captures the merged trending feed + price-at-capture into social_snapshots.
+    # This time-series is what powers going-viral z-scores, buzz velocity,
+    # mention sparklines, "what changed", and the trending->returns track record
+    # on the Community tab. Runs hourly — social buzz is a 24/7 signal, not
+    # RTH-bound. No-ops gracefully (logs) until the social_snapshots table exists.
+    def _run_social_snapshot():
+        try:
+            from engine import social_sentiment
+            from engine import alpaca_client as _alpaca
+            data = social_sentiment.get_trending(limit=50, force=True) or {}
+            rows = data.get("trending") or []
+            if not rows:
+                logger.info("[runner] social snapshot: no trending data, skipping")
+                return
+            tickers = [r.get("ticker") for r in rows if r.get("ticker")]
+            prices  = _alpaca.get_latest_prices(tickers) or {}
+            snap_rows = []
+            for i, r in enumerate(rows):
+                t = r.get("ticker")
+                if not t:
+                    continue
+                snap_rows.append({
+                    "ticker":              t,
+                    "name":                r.get("name"),
+                    "rank":                i + 1,
+                    "score":               r.get("score"),
+                    "reddit_mentions":     r.get("reddit_mentions"),
+                    "reddit_rank":         r.get("reddit_rank"),
+                    "reddit_sentiment":    r.get("reddit_sentiment"),
+                    "stocktwits_rank":     r.get("stocktwits_rank"),
+                    "stocktwits_watchers": r.get("stocktwits_watchers"),
+                    "sources":             r.get("sources"),
+                    "price":               prices.get(t),
+                })
+            sb = _supabase()
+            sb.table("social_snapshots").insert(snap_rows).execute()
+            logger.info(f"[runner] social snapshot captured {len(snap_rows)} tickers "
+                        f"({len(prices)} priced)")
+
+            # ── Buzz-spike push alerts (watchlist-scoped, deduped per day) ──
+            # Only fires once a ticker has enough history for a real z-score, so
+            # this is a no-op for the first several days after launch.
+            try:
+                from engine import social_insights, cache
+                from datetime import datetime as _dt2, timezone as _tz2
+                current = {r["ticker"]: r.get("reddit_mentions") for r in snap_rows}
+                chg = {r.get("ticker"): r.get("reddit_change_pct") for r in rows}
+                spikes = social_insights.detect_spikes(sb, list(current), current)
+                today = _dt2.now(_tz2.utc).date().isoformat()
+                for sp in spikes[:5]:   # cap dispatches per run
+                    t = sp["ticker"]
+                    dedup_key = f"buzz_alert:{t}:{today}"
+                    try:
+                        if cache.kv.get_json(dedup_key):
+                            continue
+                    except Exception:
+                        pass
+                    sent = push.send_buzz_spike_alert(
+                        t, change_pct=chg.get(t), mentions=sp.get("mentions"), sb=sb)
+                    if sent:
+                        try:
+                            cache.kv.set_json(dedup_key, {"sent": sent}, 86400)
+                        except Exception:
+                            pass
+                        logger.info(f"[runner] buzz spike alert sent: {t} "
+                                    f"(z={sp['z']}, {sent} users)")
+            except Exception as _be:
+                logger.error(f"[runner] buzz spike alerts failed: {_be}")
+        except Exception as _e:
+            logger.error(f"[runner] social snapshot failed: {_e}")
+
+    scheduler.add_job(
+        _run_social_snapshot,
+        trigger=IntervalTrigger(hours=1),
+        id="social_snapshot",
+        name="Community social trending snapshot (hourly)",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled community social snapshot every 1h")
+
     # ── Pre-market scans — 8:00 AM ET (12:00 UTC) and 9:00 AM ET (13:00 UTC) ──
     from apscheduler.triggers.cron import CronTrigger
     scheduler.add_job(
