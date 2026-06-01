@@ -3012,22 +3012,27 @@ async def admin_detector_scorecard(request: Request, days: int = 30, cost_pct: f
     try:
         rows = (
             sb.table("signals")
-              .select("result, result_pct, status, score_breakdown, created_at")
+              .select("result, result_pct, status, score_breakdown, strategy_type, created_at")
               .eq("status", "closed")
               .gte("created_at", since)
               .limit(5000)
               .execute()
         ).data or []
 
-        det: dict[str, dict] = {}
+        # Group by detector_source × strategy_type so e.g. SMC-swing is isolated
+        # from SMC-day_trade, and TREND_MOMENTUM (always swing) stands on its own
+        # — the head-to-head the operator actually wants ("is 12-1 momentum
+        # beating SMC swing?"), not a blended SMC row.
+        det: dict[tuple, dict] = {}
         for r in rows:
             bd  = r.get("score_breakdown") or {}
             src = bd.get("detector_source") or "SMC"
+            strat = r.get("strategy_type") or "—"
             pct = r.get("result_pct")
             if pct is None:
                 continue
             pct = float(pct)
-            d = det.setdefault(src, {"n": 0, "wins": 0, "losses": 0,
+            d = det.setdefault((src, strat), {"n": 0, "wins": 0, "losses": 0,
                                      "win_sum": 0.0, "loss_sum": 0.0, "pnl_sum": 0.0})
             d["n"] += 1
             d["pnl_sum"] += pct
@@ -3037,7 +3042,7 @@ async def admin_detector_scorecard(request: Request, days: int = 30, cost_pct: f
                 d["losses"] += 1; d["loss_sum"] += pct
 
         out = []
-        for src, d in det.items():
+        for (src, strat), d in det.items():
             n = d["n"]
             win_rate = round(d["wins"] / n * 100, 1) if n else None
             avg_win  = round(d["win_sum"]  / d["wins"],   3) if d["wins"]   else None
@@ -3057,7 +3062,7 @@ async def admin_detector_scorecard(request: Request, days: int = 30, cost_pct: f
             else:
                 verdict = "WATCH"; reason = "marginal edge"
 
-            out.append({"detector": src, "n": n, "win_rate": win_rate,
+            out.append({"detector": src, "strategy": strat, "n": n, "win_rate": win_rate,
                         "avg_win": avg_win, "avg_loss": avg_loss, "payoff": payoff,
                         "expectancy_gross": exp_gross, "expectancy_net": exp_net,
                         "verdict": verdict, "reason": reason})
