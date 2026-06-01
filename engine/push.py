@@ -33,6 +33,7 @@ _DEFAULT_PREFS = {
     "t1_breakeven":   True,
     "market_open":    False,
     "weekly_summary": True,
+    "community_buzz": True,   # watchlist-scoped social-buzz spike alerts
 }
 
 # Single Supabase client reused for the lifetime of the process
@@ -194,6 +195,65 @@ def send_block_print_alert(ticker: str, size: int, price: float, direction: str 
         _dispatch(messages, f"BLOCK {direction} {ticker}")
     except Exception as e:
         logger.debug(f"[push] block_print alert failed for {ticker}: {e}")
+
+
+def send_buzz_spike_alert(
+    ticker: str,
+    change_pct: float | None = None,
+    mentions: int | None = None,
+    sb: Client | None = None,
+) -> int:
+    """
+    Notify users who WATCH `ticker` that its social buzz is spiking.
+
+    Watchlist-scoped (NOT a broadcast) so it stays relevant instead of spammy —
+    only users with `ticker` on their watchlist and the `community_buzz` pref on
+    (default on) get pinged. Returns the number of notifications dispatched.
+    Fire-and-forget; the caller handles per-day dedup.
+    """
+    try:
+        client = sb or _supabase()
+        watchers = (
+            client.table("watchlist").select("user_id").eq("ticker", ticker).execute().data
+        ) or []
+        user_ids = list({w["user_id"] for w in watchers if w.get("user_id")})
+        if not user_ids:
+            return 0
+
+        prof = (
+            client.table("profiles")
+            .select("push_token, notification_prefs")
+            .in_("id", user_ids)
+            .neq("push_token", None)
+            .execute()
+            .data
+        ) or []
+        tokens = [
+            p["push_token"]
+            for p in prof
+            if p.get("push_token", "").startswith("ExponentPushToken[")
+            and {**_DEFAULT_PREFS, **(p.get("notification_prefs") or {})}.get("community_buzz", True)
+        ]
+        if not tokens:
+            return 0
+
+        chg = f" (+{change_pct:.0f}% mentions)" if change_pct is not None else ""
+        messages = [
+            {
+                "to":    t,
+                "title": f"🔥 {ticker} buzz spiking",
+                "body":  f"{ticker} is heating up on social{chg}. Tap to see why.",
+                "data":  {"type": "community_buzz", "ticker": ticker},
+                "sound": "default",
+                "badge": 1,
+            }
+            for t in tokens
+        ]
+        _dispatch(messages, f"BUZZ {ticker}")
+        return len(messages)
+    except Exception as e:
+        logger.debug(f"[push] buzz spike alert failed for {ticker}: {e}")
+        return 0
 
 
 def _send_raw(
