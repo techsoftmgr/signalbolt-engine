@@ -8,15 +8,18 @@ patterns. Two ingredients, both required:
   1. TREND filter (time-series momentum): price above SMA50, SMA50 above SMA200
      for longs (mirror for shorts). Only trade names already in a confirmed
      trend — never counter-trend.
-  2. CROSS-SECTIONAL momentum: rank the universe by VOLATILITY-ADJUSTED blended
-     trailing return (1/3/6-month proxy = 21/63/126 trading days). Trade only
-     the strongest (longs) / weakest (shorts) — relative strength, not raw move.
+  2. CROSS-SECTIONAL momentum: rank the universe by VOLATILITY-ADJUSTED trailing
+     return using the canonical 12-1 / 6-1 formation — the cumulative return from
+     12 (and 6) months ago UP TO ~1 month ago, deliberately SKIPPING the most
+     recent month. That 1-month skip is the well-documented short-term-reversal
+     window (Jegadeesh-Titman / AQR): including it contaminates the signal.
+     Trade only the strongest (longs) / weakest (shorts) — relative strength.
 
 Vol-adjustment (return ÷ annualized vol) stops us chasing high-vol junk that
 posts a big number on noise. Ranking is done by the caller across the universe;
 this module scores a single name's daily bars.
 
-Holds as a swing (days–weeks) and rides on the swing trailing stop.
+Holds as a swing (days–weeks) and rides on the chandelier trailing stop.
 """
 
 from __future__ import annotations
@@ -31,8 +34,12 @@ import pandas as pd
 logger = logging.getLogger("signalbolt.momentum")
 
 # ── Tunables ────────────────────────────────────────────────────────────────
-_LOOKBACKS      = (21, 63, 126)   # 1 / 3 / 6 month (trading days)
-_MIN_BARS       = 150             # need enough history for a trend read
+# Canonical 12-1 / 6-1 momentum: cumulative return measured from `lb` trading
+# days ago up to `_SKIP_RECENT` days ago (i.e. the formation window ENDS ~1 month
+# back, skipping the recent-month reversal). 252 ≈ 12mo, 126 ≈ 6mo.
+_LOOKBACKS      = (252, 126)      # 12 / 6 month formation (trading days)
+_SKIP_RECENT    = 21              # skip the most recent ~1 month (reversal window)
+_MIN_BARS       = 150             # ≥ 6-1 needs 126+21 bars; 12-1 used when ≥ 273
 _SMA_FAST       = 50
 _SMA_SLOW       = 200             # falls back to 100 if <200 bars
 
@@ -109,12 +116,19 @@ def score(ticker: str, df_daily: pd.DataFrame) -> Optional[MomentumScore]:
     if last <= 0:
         return None
 
-    # Blended trailing return across lookbacks (skips the most recent bar to
-    # avoid the 1-bar reversal noise — classic 12-1 style, scaled down).
+    # Canonical 12-1 / 6-1 formation: return from `lb` days ago up to the point
+    # ~1 month ago (closes[-1 - _SKIP_RECENT]), skipping the recent-month
+    # reversal. Blend the available windows (12-1 used only when there's enough
+    # history; recent IPOs fall back to 6-1).
+    if len(closes) <= _SKIP_RECENT + 1:
+        return None
+    end_px = closes[-1 - _SKIP_RECENT]        # price ~1 month ago
     rets = []
     for lb in _LOOKBACKS:
-        if len(closes) > lb + 1:
-            rets.append((closes[-2] - closes[-2 - lb]) / closes[-2 - lb])
+        if len(closes) >= 1 + _SKIP_RECENT + lb:
+            base = closes[-1 - _SKIP_RECENT - lb]
+            if base > 0:
+                rets.append((end_px - base) / base)
     if not rets:
         return None
     raw_return = float(np.mean(rets))

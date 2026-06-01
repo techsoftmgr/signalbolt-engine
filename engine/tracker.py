@@ -271,6 +271,14 @@ def track_signals() -> None:
     for sig in rows:
         ticker = sig["ticker"]
 
+        # TREND_MOMENTUM is owned end-to-end by engine.momentum_monitor (daily
+        # chandelier trail + trend-break exit, no fixed target, no time expiry).
+        # Skip it here so this tracker doesn't expire it at the 10-day backstop
+        # or close it on an intraday level touch — both break the let-winners-run
+        # trend-following design.
+        if ((sig.get("score_breakdown") or {}).get("detector_source")) == "TREND_MOMENTUM":
+            continue
+
         # --- Expiry check first (no price fetch needed) ---
         if _is_expired(sig):
             try:
