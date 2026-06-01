@@ -2517,29 +2517,34 @@ def start_scheduler() -> BackgroundScheduler:
         _mins = _now.hour * 60 + _now.minute
         if not (570 <= _mins <= 960 and _now.weekday() < 5):   # 9:30 AM–4:00 PM ET
             return
-        # (dashboardKey, direction, needs_trigger, levelField, scoreField)
+        # (dashboardKey, direction, needs_trigger, levelField, scoreField, stageField, stageValue)
+        # stageField/stageValue: only track episodes at the CONFIRMED stage. For
+        # the cycle buckets we record ONLY the Buy Zone / Peak (not the Watch/base
+        # stage) — measuring a Watch on ±8% barriers would just capture base noise
+        # (HOOD chopping 70↔76↔63). Episodes anchor at the confirmed turn.
         _BUCKETS = [
-            ("breakouts",      "up",   True,  "breakoutLevel",  "breakoutScore"),
-            ("breakdowns",     "down", True,  "breakdownLevel", "breakdownScore"),
-            ("topMomentum",    "up",   False, None,             "momentumScore"),
-            ("pullbacks",      "up",   False, None,             "finalQuantScore"),
-            ("highVolumeUp",   "up",   False, None,             "volumeScore"),
-            ("highVolumeDown", "down", False, None,             "volumeScore"),
-            ("vwapReclaim",    "up",   False, None,             "finalQuantScore"),
-            ("oversoldBounce", "up",   False, None,             "meanReversionScore"),
-            ("turnaround",     "up",   False, None,             "turnaroundScore"),
-            ("peak",           "down", False, None,             "peakScore"),
+            ("breakouts",      "up",   True,  "breakoutLevel",  "breakoutScore",      None,              None),
+            ("breakdowns",     "down", True,  "breakdownLevel", "breakdownScore",     None,              None),
+            ("topMomentum",    "up",   False, None,             "momentumScore",      None,              None),
+            ("pullbacks",      "up",   False, None,             "finalQuantScore",    None,              None),
+            ("highVolumeUp",   "up",   False, None,             "volumeScore",        None,              None),
+            ("highVolumeDown", "down", False, None,             "volumeScore",        None,              None),
+            ("vwapReclaim",    "up",   False, None,             "finalQuantScore",    None,              None),
+            ("oversoldBounce", "up",   False, None,             "meanReversionScore", None,              None),
+            ("turnaround",     "up",   False, None,             "turnaroundScore",    "turnaroundStage", "buyzone"),
+            ("peak",           "down", False, None,             "peakScore",          "peakStage",       "peak"),
         ]
         try:
             from engine import quant_score_service, breakout_watch
             dash = quant_score_service.get_quant_dashboard() or {}
             sb = _supabase()
-            for _key, _dir, _needs, _lvl_f, _score_f in _BUCKETS:
+            for _key, _dir, _needs, _lvl_f, _score_f, _stage_f, _stage_v in _BUCKETS:
                 rows = [
                     {"ticker": r.get("ticker"), "price": r.get("price"),
                      "level": (r.get(_lvl_f) if _lvl_f else None),
                      "score": r.get(_score_f)}
                     for r in (dash.get(_key) or [])
+                    if (_stage_f is None or r.get(_stage_f) == _stage_v)
                 ]
                 if rows:
                     breakout_watch.sync_watch(sb, rows, bucket=_key,
