@@ -24,12 +24,21 @@ from typing import Optional
 
 import numpy as np
 
+from engine import cache
+
 logger = logging.getLogger("signalbolt.quant")
 
 # ── Cache ─────────────────────────────────────────────────────────────────────
 _cache: dict       = {}
 _cache_ts: float   = 0.0
 _CACHE_TTL: int    = int(os.environ.get("QUANT_CACHE_TTL", "60"))
+_REDIS_KEY         = "quant:dashboard:v1"   # cross-process precomputed result (worker → web)
+
+# ~1y daily bars barely change intraday — cache them so we don't refetch
+# ~150×250 bars on every dashboard build.
+_long_bars_cache: dict = {}
+_long_bars_ts: float   = 0.0
+_LONG_BARS_TTL: int    = 2 * 3600
 
 DEFAULT_TICKERS: list[str] = [
     "SPY", "QQQ", "IWM", "DIA",
@@ -118,6 +127,26 @@ def _scan_universe() -> list[str]:
     return _liq_universe or list(DEFAULT_TICKERS)
 
 
+def _get_long_bars(tickers: list[str]) -> dict:
+    """
+    ~1y daily bars, cached ~2h — they barely change intraday, so there's no need
+    to refetch ~150×250 bars on every 60s dashboard build (this fetch + the
+    per-ticker structure detection was what made /quant/dashboard time out).
+    """
+    global _long_bars_cache, _long_bars_ts
+    if _long_bars_cache and (time.monotonic() - _long_bars_ts) < _LONG_BARS_TTL:
+        return _long_bars_cache
+    try:
+        from engine.alpaca_client import get_multi_bars
+        bars = get_multi_bars(tickers, "1Day", 365) or {}
+        if bars:
+            _long_bars_cache = bars
+            _long_bars_ts    = time.monotonic()
+    except Exception as e:
+        logger.debug(f"[quant] long bars fetch failed: {e}")
+    return _long_bars_cache
+
+
 def _safe(val, default: float = 0.0) -> float:
     try:
         v = float(val)
@@ -133,7 +162,7 @@ def _normalize(value: float, lo: float, hi: float) -> float:
     return float(np.clip((value - lo) / (hi - lo) * 100, 0, 100))
 
 
-def get_quant_dashboard(symbols: Optional[list[str]] = None) -> dict:
+def get_quant_dashboard(symbols: Optional[list[str]] = None, force: bool = False) -> dict:
     """
     Returns the full quant dashboard payload:
     {
@@ -150,8 +179,22 @@ def get_quant_dashboard(symbols: Optional[list[str]] = None) -> dict:
     global _cache, _cache_ts
 
     now = time.monotonic()
-    if now - _cache_ts < _CACHE_TTL and _cache:
+    if not force and (now - _cache_ts < _CACHE_TTL) and _cache:
         return _cache
+
+    # Cross-process precompute: the worker rebuilds on a schedule (force=True) and
+    # stores the result in Redis; the web endpoint serves THAT instantly instead
+    # of crunching ~150 names on the request path (which was timing out →
+    # "engine unreachable"). Only the scheduled refresh actually rebuilds.
+    if not force:
+        try:
+            cached = cache.kv.get_json(_REDIS_KEY)
+            if cached:
+                _cache    = cached
+                _cache_ts = now
+                return cached
+        except Exception:
+            pass
 
     result = _build_dashboard(symbols or _scan_universe())
     if result:
@@ -161,6 +204,10 @@ def get_quant_dashboard(symbols: Optional[list[str]] = None) -> dict:
             logger.debug(f"[quant] breakout enrich skipped: {e}")
         _cache    = result
         _cache_ts = now
+        try:
+            cache.kv.set_json(_REDIS_KEY, result, _CACHE_TTL * 10)
+        except Exception:
+            pass
     return result
 
 
@@ -252,7 +299,7 @@ def _build_dashboard(tickers: list[str]) -> dict:
         daily_bars    = get_multi_bars(tickers, timeframe="1Day", days=25)
         # Turnaround scoring needs ~1y of dailies (200-day trend gate, drawdown,
         # swing structure) — a separate, longer fetch from the 25-bar set above.
-        daily_long    = get_multi_bars(tickers, timeframe="1Day", days=365)
+        daily_long    = _get_long_bars(tickers)
         intraday_bars = get_multi_bars(tickers, timeframe="5Min", days=2)
         latest_prices = get_latest_prices(tickers)
 
@@ -577,35 +624,40 @@ def _score_ticker(
     turnaround_score = 0.0
     turnaround_stage = "none"
     turnaround_reasons: list[str] = []
-    try:
-        from engine import turnaround_detector
-        _ta = turnaround_detector.score_turnaround(
-            daily_long_df if daily_long_df is not None else daily_df,
-            regime_type=regime_type,
-        )
-        if _ta:
-            turnaround_score   = _ta["score"]
-            turnaround_stage   = _ta["stage"]
-            turnaround_reasons = _ta.get("reasons", [])
-    except Exception as _te:
-        logger.debug(f"[quant] {ticker} turnaround: {_te}")
+    # Pre-filter: turnarounds only form from oversold/pullback — skip the
+    # expensive structure detection for clearly-strong names (build-cost cut).
+    if rsi <= 52:
+        try:
+            from engine import turnaround_detector
+            _ta = turnaround_detector.score_turnaround(
+                daily_long_df if daily_long_df is not None else daily_df,
+                regime_type=regime_type,
+            )
+            if _ta:
+                turnaround_score   = _ta["score"]
+                turnaround_stage   = _ta["stage"]
+                turnaround_reasons = _ta.get("reasons", [])
+        except Exception as _te:
+            logger.debug(f"[quant] {ticker} turnaround: {_te}")
 
     # ── Peak (swing-high / distribution top) — mirror of turnaround ──────────
     peak_score = 0.0
     peak_stage = "none"
     peak_reasons: list[str] = []
-    try:
-        from engine import peak_detector
-        _pk = peak_detector.score_peak(
-            daily_long_df if daily_long_df is not None else daily_df,
-            regime_type=regime_type,
-        )
-        if _pk:
-            peak_score   = _pk["score"]
-            peak_stage   = _pk["stage"]
-            peak_reasons = _pk.get("reasons", [])
-    except Exception as _pe:
-        logger.debug(f"[quant] {ticker} peak: {_pe}")
+    # Pre-filter: tops only form from overbought — skip the rest.
+    if rsi >= 60:
+        try:
+            from engine import peak_detector
+            _pk = peak_detector.score_peak(
+                daily_long_df if daily_long_df is not None else daily_df,
+                regime_type=regime_type,
+            )
+            if _pk:
+                peak_score   = _pk["score"]
+                peak_stage   = _pk["stage"]
+                peak_reasons = _pk.get("reasons", [])
+        except Exception as _pe:
+            logger.debug(f"[quant] {ticker} peak: {_pe}")
 
     # ── Cycle-context differentiators — only for staged turnaround/peak names ──
     cyclicality_score = None

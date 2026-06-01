@@ -2583,6 +2583,27 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled breakout-watch lifecycle sync every 5 min (RTH)")
 
+    # ── Quant dashboard precompute (every 3 min, 24/7) ──────────────────────
+    # The web endpoint serves the Redis-cached result; this keeps it warm so the
+    # UI never crunches ~150 names on the request path (was timing out →
+    # "engine unreachable"). Runs on the worker; web reads Redis.
+    def _run_quant_refresh():
+        try:
+            from engine import quant_score_service
+            quant_score_service.get_quant_dashboard(force=True)
+        except Exception as _e:
+            logger.error(f"[runner] quant dashboard refresh failed: {_e}")
+
+    scheduler.add_job(
+        _run_quant_refresh,
+        trigger=IntervalTrigger(minutes=3),
+        id="quant_refresh",
+        name="Quant dashboard precompute (3-min)",
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=20),
+    )
+    logger.info("[runner] Scheduled quant dashboard precompute every 3 min")
+
     # ── Community social snapshot (hourly, 24/7) ────────────────────────────
     # Captures the merged trending feed + price-at-capture into social_snapshots.
     # This time-series is what powers going-viral z-scores, buzz velocity,
