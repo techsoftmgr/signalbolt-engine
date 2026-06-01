@@ -250,8 +250,19 @@ def _build_dashboard(tickers: list[str]) -> dict:
 
     try:
         daily_bars    = get_multi_bars(tickers, timeframe="1Day", days=25)
+        # Turnaround scoring needs ~1y of dailies (200-day trend gate, drawdown,
+        # swing structure) — a separate, longer fetch from the 25-bar set above.
+        daily_long    = get_multi_bars(tickers, timeframe="1Day", days=365)
         intraday_bars = get_multi_bars(tickers, timeframe="5Min", days=2)
         latest_prices = get_latest_prices(tickers)
+
+        # Market regime up front — the turnaround falling-knife gate needs the
+        # regime during per-ticker scoring (reused for the label block below).
+        try:
+            regime_raw = regime_detector.detect()
+        except Exception:
+            regime_raw = {}
+        regime_type = (regime_raw.get("regime_type") or regime_raw.get("regime") or "NEUTRAL")
 
         scored: list[dict] = []
         for ticker in tickers:
@@ -261,15 +272,16 @@ def _build_dashboard(tickers: list[str]) -> dict:
                     latest_prices.get(ticker),
                     daily_bars.get(ticker),
                     intraday_bars.get(ticker),
+                    daily_long_df=daily_long.get(ticker),
+                    regime_type=regime_type,
                 )
                 if row:
                     scored.append(row)
             except Exception as e:
                 logger.debug(f"[quant] {ticker}: {e}")
 
-        # ── Market regime (reuse existing detector) ───────────────────────────
+        # ── Market regime label (reuse regime_raw fetched above) ──────────────
         try:
-            regime_raw = regime_detector.detect()
             regime_map = {
                 "TRENDING_BULL":   "Bullish",
                 "TRENDING_BEAR":   "Bearish",
@@ -278,7 +290,7 @@ def _build_dashboard(tickers: list[str]) -> dict:
                 "RANGING":         "Risk-Off",
                 "NEUTRAL":         "Neutral",
             }
-            regime_label = regime_map.get(regime_raw.get("regime", "NEUTRAL"), "Neutral")
+            regime_label = regime_map.get(regime_type, "Neutral")
             regime_desc  = _regime_description(regime_label)
         except Exception:
             regime_label = "Neutral"
@@ -329,6 +341,14 @@ def _build_dashboard(tickers: list[str]) -> dict:
             if x["setupType"] == "oversold_bounce"
         ][:_BUCKET_LIMIT]
 
+        # Turnaround (swing-low reversal) — both Watch and confirmed Buy Zone,
+        # ranked by turnaround score. Filtered on the lifecycle STAGE (not
+        # setupType) so a confirmed turn surfaces regardless of its base setup.
+        turnaround = sorted(
+            [x for x in scored if x.get("turnaroundStage") in ("watch", "buyzone")],
+            key=lambda x: -(x.get("turnaroundScore") or 0),
+        )[:_BUCKET_LIMIT]
+
         return {
             "marketRegime": {
                 "label":       regime_label,
@@ -343,6 +363,7 @@ def _build_dashboard(tickers: list[str]) -> dict:
             "highVolumeDown": high_volume_down,
             "vwapReclaim":    vwap_reclaim,
             "oversoldBounce": oversold_bounce,
+            "turnaround":     turnaround,
             "allScored":      sorted_by_quant[:20],
         }
 
@@ -356,6 +377,8 @@ def _score_ticker(
     latest_price: Optional[float],
     daily_df,
     intraday_df,
+    daily_long_df=None,
+    regime_type: Optional[str] = None,
 ) -> Optional[dict]:
     """Compute all quant scores for one ticker. Returns None if data insufficient."""
     import pandas as pd
@@ -540,6 +563,23 @@ def _score_ticker(
       + 0.10 * mom_health
     ), 0, 100))
 
+    # ── Turnaround (swing-low reversal) — scored off ~1y dailies + regime gate ──
+    turnaround_score = 0.0
+    turnaround_stage = "none"
+    turnaround_reasons: list[str] = []
+    try:
+        from engine import turnaround_detector
+        _ta = turnaround_detector.score_turnaround(
+            daily_long_df if daily_long_df is not None else daily_df,
+            regime_type=regime_type,
+        )
+        if _ta:
+            turnaround_score   = _ta["score"]
+            turnaround_stage   = _ta["stage"]
+            turnaround_reasons = _ta.get("reasons", [])
+    except Exception as _te:
+        logger.debug(f"[quant] {ticker} turnaround: {_te}")
+
     return {
         "ticker":              ticker,
         "price":               round(current, 2),
@@ -559,6 +599,9 @@ def _score_ticker(
         "breakdownLevel":      round(low_20, 2),          # 20-day low being tested
         "distToBelowPct":      round(dist_to_low_pct, 2), # positive = above the low
         "meanReversionScore":  round(mean_reversion_score, 1),
+        "turnaroundScore":     round(turnaround_score, 1),
+        "turnaroundStage":     turnaround_stage,
+        "turnaroundReasons":   turnaround_reasons,
         "riskScore":           round(risk_score, 1),
         "finalQuantScore":     round(final_score, 1),
         # Qualitative outputs
