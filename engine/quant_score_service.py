@@ -274,6 +274,7 @@ def _build_dashboard(tickers: list[str]) -> dict:
                     intraday_bars.get(ticker),
                     daily_long_df=daily_long.get(ticker),
                     regime_type=regime_type,
+                    spy_long_df=daily_long.get("SPY"),
                 )
                 if row:
                     scored.append(row)
@@ -387,6 +388,7 @@ def _score_ticker(
     intraday_df,
     daily_long_df=None,
     regime_type: Optional[str] = None,
+    spy_long_df=None,
 ) -> Optional[dict]:
     """Compute all quant scores for one ticker. Returns None if data insufficient."""
     import pandas as pd
@@ -605,6 +607,23 @@ def _score_ticker(
     except Exception as _pe:
         logger.debug(f"[quant] {ticker} peak: {_pe}")
 
+    # ── Cycle-context differentiators — only for staged turnaround/peak names ──
+    cyclicality_score = None
+    market_driven_pct = None
+    driver_label      = None
+    expected_pain_pct = None
+    if turnaround_stage != "none" or peak_stage != "none":
+        try:
+            from engine import cycle_context
+            _cx = cycle_context.compute(
+                daily_long_df if daily_long_df is not None else daily_df, spy_long_df)
+            cyclicality_score = _cx.get("cyclicalityScore")
+            market_driven_pct = _cx.get("marketDrivenPct")
+            driver_label      = _cx.get("driverLabel")
+            expected_pain_pct = _cx.get("expectedPainPct")
+        except Exception as _ce:
+            logger.debug(f"[quant] {ticker} cycle_context: {_ce}")
+
     return {
         "ticker":              ticker,
         "price":               round(current, 2),
@@ -630,6 +649,10 @@ def _score_ticker(
         "peakScore":           round(peak_score, 1),
         "peakStage":           peak_stage,
         "peakReasons":         peak_reasons,
+        "cyclicalityScore":    cyclicality_score,
+        "marketDrivenPct":     market_driven_pct,
+        "driverLabel":         driver_label,
+        "expectedPainPct":     expected_pain_pct,
         "riskScore":           round(risk_score, 1),
         "finalQuantScore":     round(final_score, 1),
         # Qualitative outputs

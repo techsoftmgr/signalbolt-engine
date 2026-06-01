@@ -2544,6 +2544,33 @@ def start_scheduler() -> BackgroundScheduler:
                 if rows:
                     breakout_watch.sync_watch(sb, rows, bucket=_key,
                                               direction=_dir, needs_trigger=_needs)
+
+            # ── Cycle Buy-Zone / Peak push alerts (watchlist-scoped, deduped) ──
+            from engine import cache as _cache
+            from datetime import datetime as _dt3, timezone as _tz3
+            _today = _dt3.now(_tz3.utc).date().isoformat()
+            _alerts = [(r.get("ticker"), "turnaround")
+                       for r in (dash.get("turnaround") or [])
+                       if r.get("turnaroundStage") == "buyzone"]
+            _alerts += [(r.get("ticker"), "peak")
+                        for r in (dash.get("peak") or [])
+                        if r.get("peakStage") == "peak"]
+            for _tk, _kind in _alerts[:8]:
+                if not _tk:
+                    continue
+                _ck = f"cycle_alert:{_kind}:{_tk}:{_today}"
+                try:
+                    if _cache.kv.get_json(_ck):
+                        continue
+                except Exception:
+                    pass
+                _sent = push.send_cycle_alert(_tk, _kind, sb=sb)
+                if _sent:
+                    try:
+                        _cache.kv.set_json(_ck, {"sent": _sent}, 86400)
+                    except Exception:
+                        pass
+                    logger.info(f"[runner] cycle alert sent: {_tk} {_kind} ({_sent} users)")
         except Exception as _e:
             logger.error(f"[runner] setup-watch sync failed: {_e}")
 

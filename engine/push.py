@@ -34,6 +34,7 @@ _DEFAULT_PREFS = {
     "market_open":    False,
     "weekly_summary": True,
     "community_buzz": True,   # watchlist-scoped social-buzz spike alerts
+    "cycle_signals":  True,   # turnaround Buy-Zone / Peak distribution alerts
 }
 
 # Single Supabase client reused for the lifetime of the process
@@ -253,6 +254,64 @@ def send_buzz_spike_alert(
         return len(messages)
     except Exception as e:
         logger.debug(f"[push] buzz spike alert failed for {ticker}: {e}")
+        return 0
+
+
+def send_cycle_alert(ticker: str, kind: str, sb: Client | None = None) -> int:
+    """
+    Notify users who WATCH `ticker` of a confirmed cycle signal:
+      kind="turnaround" → swing-low Buy Zone (reversal confirmed)
+      kind="peak"       → swing-high / distribution top (take profit / hedge)
+
+    Watchlist-scoped (same targeting as the buzz alert), respects the
+    'cycle_signals' pref (default on). Returns the number dispatched. The caller
+    handles per-day dedup.
+    """
+    try:
+        client = sb or _supabase()
+        watchers = (
+            client.table("watchlist").select("user_id").eq("ticker", ticker).execute().data
+        ) or []
+        user_ids = list({w["user_id"] for w in watchers if w.get("user_id")})
+        if not user_ids:
+            return 0
+        prof = (
+            client.table("profiles")
+            .select("push_token, notification_prefs")
+            .in_("id", user_ids)
+            .neq("push_token", None)
+            .execute()
+            .data
+        ) or []
+        tokens = [
+            p["push_token"]
+            for p in prof
+            if p.get("push_token", "").startswith("ExponentPushToken[")
+            and {**_DEFAULT_PREFS, **(p.get("notification_prefs") or {})}.get("cycle_signals", True)
+        ]
+        if not tokens:
+            return 0
+        if kind == "turnaround":
+            title = f"🔄 {ticker} — Turnaround Buy Zone"
+            body  = f"{ticker} confirmed a reversal off the lows. Tap for the setup."
+        else:
+            title = f"🔻 {ticker} — Peak / Distribution"
+            body  = f"{ticker} looks topped — consider taking profit / hedging. Tap for details."
+        messages = [
+            {
+                "to":    t,
+                "title": title,
+                "body":  body,
+                "data":  {"type": "cycle_signal", "ticker": ticker, "kind": kind},
+                "sound": "default",
+                "badge": 1,
+            }
+            for t in tokens
+        ]
+        _dispatch(messages, f"CYCLE {kind} {ticker}")
+        return len(messages)
+    except Exception as e:
+        logger.debug(f"[push] cycle alert failed for {ticker}: {e}")
         return 0
 
 

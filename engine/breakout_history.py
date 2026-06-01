@@ -43,6 +43,8 @@ _BUCKET_CFG = {
     "highVolumeDown": {"direction": "down", "needsTrigger": False, "label": "High Volume ▼ (Distribution)"},
     "vwapReclaim":    {"direction": "up",   "needsTrigger": False, "label": "VWAP Reclaim"},
     "oversoldBounce": {"direction": "up",   "needsTrigger": False, "label": "Oversold Bounce"},
+    "turnaround":     {"direction": "up",   "needsTrigger": False, "label": "Turnaround"},
+    "peak":           {"direction": "down", "needsTrigger": False, "label": "Peak / Distribution"},
 }
 
 
