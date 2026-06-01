@@ -186,6 +186,69 @@ def get_weekly_earnings(tickers: Optional[list[str]] = None) -> dict:
     return _filter(result, tickers)
 
 
+def get_next_earnings(ticker: str, horizon_days: int = 120) -> Optional[dict]:
+    """
+    Next UPCOMING earnings date for one ticker (looks ahead up to horizon_days),
+    for the Ticker Hub volatility heads-up. Unlike get_weekly_earnings this is
+    per-symbol and can reach beyond the current week.
+
+    Returns {date, when, daysAway, eps_estimate} or None when unknown /
+    no key / nothing scheduled in the window. Cached 12h per ticker.
+    """
+    sym = (ticker or "").upper().strip()
+    if not sym:
+        return None
+
+    cache_key = f"earnings:next:{sym}"
+    cached = kv.get_json(cache_key)
+    if cached is not None:
+        # cached may be {} (sentinel for "checked, nothing scheduled")
+        return cached or None
+
+    key = _api_key()
+    if not key:
+        return None
+
+    today    = datetime.now(timezone.utc).date()
+    from_iso = today.isoformat()
+    to_iso   = (today + timedelta(days=max(7, horizon_days))).isoformat()
+    url      = f"{_FINNHUB_BASE}/calendar/earnings"
+    params   = {"from": from_iso, "to": to_iso, "symbol": sym, "token": key}
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.get(url, params=params)
+            resp.raise_for_status()
+            payload = resp.json() or {}
+    except Exception as e:
+        logger.debug(f"[earnings] next({sym}) fetch failed: {e}")
+        return None
+
+    rows = payload.get("earningsCalendar", []) or []
+    upcoming = sorted(
+        [r for r in rows if r.get("date") and r["date"] >= from_iso],
+        key=lambda r: r["date"],
+    )
+    if not upcoming:
+        kv.set_json(cache_key, {}, ttl_sec=_CACHE_TTL_SEC)   # remember "none" briefly
+        return None
+
+    nxt = _normalize_entry(upcoming[0])
+    try:
+        d = datetime.strptime(nxt["date"], "%Y-%m-%d").date()
+        nxt["daysAway"] = (d - today).days
+    except Exception:
+        nxt["daysAway"] = None
+
+    out = {
+        "date":         nxt.get("date"),
+        "when":         nxt.get("when"),
+        "daysAway":     nxt.get("daysAway"),
+        "eps_estimate": nxt.get("eps_estimate"),
+    }
+    kv.set_json(cache_key, out, ttl_sec=_CACHE_TTL_SEC * 12)   # 12h
+    return out
+
+
 def _filter(result: dict, tickers: Optional[list[str]]) -> dict:
     if not tickers:
         return result

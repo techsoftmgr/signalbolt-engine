@@ -3719,14 +3719,85 @@ async def quant_ticker_news(request: Request, ticker: str, limit: int = 8):
         return {"ticker": ticker.upper().strip(), "items": [], "count": 0}
 
 
+def _compute_performance(daily_df, current) -> Optional[dict]:
+    """Trailing returns (1W/1M/3M/YTD) + 52-week range position from daily bars."""
+    try:
+        import pandas as pd
+        if daily_df is None or len(daily_df) < 30 or not current or current <= 0:
+            return None
+        closes = daily_df["close"].astype(float)
+        highs  = daily_df["high"].astype(float) if "high" in daily_df else closes
+        lows   = daily_df["low"].astype(float)  if "low"  in daily_df else closes
+
+        def _ret(n: int):
+            if len(closes) > n:
+                base = float(closes.iloc[-1 - n])
+                if base > 0:
+                    return round((current - base) / base * 100, 2)
+            return None
+
+        ytd = None
+        try:
+            yr   = datetime.now(timezone.utc).year
+            idx  = pd.to_datetime(daily_df.index)
+            mask = (idx.year == yr)
+            if mask.any():
+                first = float(closes[mask].iloc[0])
+                if first > 0:
+                    ytd = round((current - first) / first * 100, 2)
+        except Exception:
+            ytd = None
+
+        hi52 = float(highs.tail(252).max())
+        lo52 = float(lows.tail(252).min())
+        rng  = round((current - lo52) / (hi52 - lo52) * 100, 1) if hi52 > lo52 else None
+        return {
+            "ret1W": _ret(5), "ret1M": _ret(21), "ret3M": _ret(63), "retYTD": ytd,
+            "high52": round(hi52, 2), "low52": round(lo52, 2), "rangePct": rng,
+        }
+    except Exception:
+        return None
+
+
+def _ticker_track_record(sb, sym: str) -> Optional[dict]:
+    """Our OWN closed-signal record for this ticker (win rate + avg result)."""
+    try:
+        rows = (sb.table("signals")
+                .select("result,result_pct,closed_at,closed_reason")
+                .eq("ticker", sym)
+                .eq("status", "closed")
+                .order("closed_at", desc=True)
+                .limit(50)
+                .execute().data) or []
+        if not rows:
+            return None
+        pcts = [float(r["result_pct"]) for r in rows if r.get("result_pct") is not None]
+        if not pcts:
+            return None
+        wins = sum(1 for p in pcts if p > 0)
+        last = rows[0]
+        return {
+            "count":         len(rows),
+            "graded":        len(pcts),
+            "wins":          wins,
+            "winRatePct":    round(wins / len(pcts) * 100),
+            "avgPct":        round(sum(pcts) / len(pcts), 2),
+            "lastResultPct": round(float(last["result_pct"]), 2) if last.get("result_pct") is not None else None,
+            "lastClosedAt":  last.get("closed_at"),
+        }
+    except Exception as e:
+        logger.debug(f"[ticker_overview] track record failed for {sym}: {e}")
+        return None
+
+
 @app.get("/ticker/{symbol}/overview")
 async def ticker_overview(request: Request, symbol: str):
     """
-    Ticker Hub overview — one call returns {ticker, price, quant, news} for a
-    single symbol so the per-ticker hub screen can render live price, quant +
-    cycle status and news in one place.
+    Ticker Hub overview — one call returns {ticker, price, quant, news,
+    performance, trackRecord, nextEarnings} for a single symbol so the
+    per-ticker hub screen can render everything in one place.
 
-    Each section is best-effort: if quant or news fails it is returned as
+    Each section is best-effort: if a section fails it is returned as
     null / [] rather than 500-ing the whole response.
     """
     _require_jwt(request)
@@ -3743,6 +3814,7 @@ async def ticker_overview(request: Request, symbol: str):
 
     # ── Quant + cycle read ──────────────────────────────────────────────────
     quant = None
+    daily_df = None
     try:
         from engine.alpaca_client import get_bars
         from engine import quant_score_service, regime_detector
@@ -3792,7 +3864,40 @@ async def ticker_overview(request: Request, symbol: str):
         logger.debug(f"GET /ticker/{sym}/overview news error: {e}")
         news = []
 
-    return {"ticker": sym, "price": price, "quant": quant, "news": news}
+    # ── Performance & 52-week range (from the daily bars already fetched) ─────
+    performance = None
+    try:
+        ref_price = price if (price and price > 0) else None
+        if ref_price is None and daily_df is not None and len(daily_df):
+            ref_price = float(daily_df["close"].iloc[-1])
+        performance = _compute_performance(daily_df, ref_price)
+    except Exception as e:
+        logger.debug(f"GET /ticker/{sym}/overview performance error: {e}")
+
+    # ── Our own track record on this ticker (closed signals) ─────────────────
+    track_record = None
+    try:
+        track_record = _ticker_track_record(_make_supabase(), sym)
+    except Exception as e:
+        logger.debug(f"GET /ticker/{sym}/overview track record error: {e}")
+
+    # ── Next earnings (volatility heads-up) ──────────────────────────────────
+    next_earnings = None
+    try:
+        from engine.earnings_service import get_next_earnings
+        next_earnings = get_next_earnings(sym)
+    except Exception as e:
+        logger.debug(f"GET /ticker/{sym}/overview earnings error: {e}")
+
+    return {
+        "ticker":       sym,
+        "price":        price,
+        "quant":        quant,
+        "news":         news,
+        "performance":  performance,
+        "trackRecord":  track_record,
+        "nextEarnings": next_earnings,
+    }
 
 
 # ── News Reaction Feed ────────────────────────────────────────────────────────
