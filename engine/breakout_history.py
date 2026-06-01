@@ -43,8 +43,8 @@ _BUCKET_CFG = {
     "highVolumeDown": {"direction": "down", "needsTrigger": False, "label": "High Volume ▼ (Distribution)"},
     "vwapReclaim":    {"direction": "up",   "needsTrigger": False, "label": "VWAP Reclaim"},
     "oversoldBounce": {"direction": "up",   "needsTrigger": False, "label": "Oversold Bounce"},
-    "turnaround":     {"direction": "up",   "needsTrigger": False, "label": "Turnaround",          "horizonDays": 15},
-    "peak":           {"direction": "down", "needsTrigger": False, "label": "Peak / Distribution", "horizonDays": 15},
+    "turnaround":     {"direction": "up",   "needsTrigger": False, "label": "Turnaround",          "horizonDays": 50, "winMfePct": 8},
+    "peak":           {"direction": "down", "needsTrigger": False, "label": "Peak / Distribution", "horizonDays": 50, "winMfePct": 8},
 }
 
 
@@ -100,7 +100,7 @@ def _vol_ratio(bars, anchor_ts):
 
 # ── path / result (shared with breakout_validator) ───────────────────────────
 def judge_path(bars, anchor_ts, anchor_px, *, horizon_days: int = HORIZON_DAYS,
-               direction: str = "up") -> dict:
+               direction: str = "up", win_mfe_pct=None) -> dict:
     """Walk the holding window (days AFTER the breakout); grade by net result.
 
     direction "up" = a positive net move is a win (bullish buckets); "down" =
@@ -128,6 +128,24 @@ def judge_path(bars, anchor_ts, anchor_px, *, horizon_days: int = HORIZON_DAYS,
     hi_run = anchor_px; lo_run = anchor_px
     hi_date = None; lo_date = None
     curve = []
+
+    # ── Triple-barrier labelling (when win_mfe_pct is set, i.e. cycle buckets) ──
+    # Instead of judging at a fixed day, resolve at the FIRST of:
+    #   • target  (+win% favourable) → WIN, resolved early (a real swing fired)
+    #   • stop    (−win% adverse)    → LOSS, resolved early (knife / wrong level)
+    #   • horizon (vertical barrier) → judge on the net move (it just chopped)
+    # This makes the exact horizon length far less sensitive — clear winners and
+    # knives resolve in days/weeks; only sideways basers wait out the backstop.
+    tgt_px = stp_px = None
+    if win_mfe_pct is not None:
+        if direction == "down":   # peak: win = price FALLS, stop = squeezed UP
+            tgt_px = anchor_px * (1 - win_mfe_pct / 100)
+            stp_px = anchor_px * (1 + win_mfe_pct / 100)
+        else:                     # turnaround: win = price RISES, stop = breaks DOWN
+            tgt_px = anchor_px * (1 + win_mfe_pct / 100)
+            stp_px = anchor_px * (1 - win_mfe_pct / 100)
+    barrier = None; barrier_day = None; barrier_close = None
+
     for i, (ts, row) in enumerate(fwd.iterrows(), start=1):
         hi = float(row["high"]); lo = float(row["low"]); close = float(row["close"])
         d = ts.date().isoformat()
@@ -135,20 +153,50 @@ def judge_path(bars, anchor_ts, anchor_px, *, horizon_days: int = HORIZON_DAYS,
         if lo < lo_run: lo_run = lo; lo_date = d
         curve.append({"day": i, "date": d, "close": round(close, 2),
                       "pctFromAnchor": round((close - anchor_px) / anchor_px * 100, 2)})
+        if tgt_px is not None and barrier is None:
+            hit_tgt = (lo <= tgt_px) if direction == "down" else (hi >= tgt_px)
+            hit_stp = (hi >= stp_px) if direction == "down" else (lo <= stp_px)
+            if hit_tgt:
+                barrier, barrier_day, barrier_close = "win", i, close
+            elif hit_stp:
+                barrier, barrier_day, barrier_close = "loss", i, close
+            if barrier:
+                break   # exit at the first barrier touched
 
-    last_close = curve[-1]["close"]
-    result   = round((last_close - anchor_px) / anchor_px * 100, 2)
-    resolved = len(fwd) >= horizon_days
-    won = (result < 0) if direction == "down" else (result > 0)
+    result = round(((barrier_close if barrier_close is not None else curve[-1]["close"]) - anchor_px) / anchor_px * 100, 2)
+    mfe    = round((hi_run - anchor_px) / anchor_px * 100, 2)
+    mae    = round((lo_run - anchor_px) / anchor_px * 100, 2)
+
+    if win_mfe_pct is not None:
+        if barrier is not None:                       # target / stop hit → resolved early
+            outcome    = barrier
+            days_held  = barrier_day
+            grade_move = win_mfe_pct
+        elif len(fwd) >= horizon_days:                # vertical barrier → judge net move
+            won        = (result < 0) if direction == "down" else (result > 0)
+            outcome    = "win" if won else "loss"
+            days_held  = len(curve)
+            grade_move = abs(result)
+        else:                                         # not enough forward data yet → open
+            outcome    = None
+            days_held  = len(curve)
+            grade_move = abs(result)
+    else:                                             # non-cycle buckets: net-at-horizon
+        resolved   = len(fwd) >= horizon_days
+        won        = (result < 0) if direction == "down" else (result > 0)
+        outcome    = ("win" if won else "loss") if resolved else None
+        days_held  = len(curve)
+        grade_move = abs(result)
+
     out.update({
-        "outcome":  ("win" if won else "loss") if resolved else None,
+        "outcome":   outcome,
         "resultPct": result,
-        "grade":     _grade(abs(result)),
-        "mfePct":    round((hi_run - anchor_px) / anchor_px * 100, 2),
+        "grade":     _grade(grade_move),
+        "mfePct":    mfe,
         "mfeDate":   hi_date or (curve[0]["date"] if curve else None),
-        "maePct":    round((lo_run - anchor_px) / anchor_px * 100, 2),
+        "maePct":    mae,
         "maeDate":   lo_date or (curve[0]["date"] if curve else None),
-        "daysHeld":  len(curve),
+        "daysHeld":  days_held,
         "curve":     curve,
     })
     return out
@@ -165,7 +213,8 @@ def _episode_metrics(ep: dict, bars, spy_bars, cfg: dict) -> dict:
         anchor_px = float(ep.get("enter_price") or 0)
 
     jp = judge_path(bars, anchor_ts, anchor_px, direction=cfg["direction"],
-                    horizon_days=int(cfg.get("horizonDays", HORIZON_DAYS)))
+                    horizon_days=int(cfg.get("horizonDays", HORIZON_DAYS)),
+                    win_mfe_pct=cfg.get("winMfePct"))
 
     # For trigger-required buckets (breakout/breakdown), a never-triggered
     # episode means the directional break never came → a loss. Other buckets
