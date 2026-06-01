@@ -36,6 +36,7 @@ _DEFAULT_PREFS = {
     "community_buzz": True,   # watchlist-scoped social-buzz spike alerts
     "cycle_signals":  True,   # turnaround Buy-Zone / Peak distribution alerts
     "watchlist_alerts": True, # watched ticker changed state (buy zone / topping / breakout / trend lost)
+    "breakdown_alerts": True, # universe-wide heavy-selling / breakdown-risk alerts
 }
 
 # Single Supabase client reused for the lifetime of the process
@@ -235,6 +236,55 @@ def send_block_print_alert(ticker: str, size: int, price: float, direction: str 
         _dispatch(messages, f"BLOCK {direction} {ticker}")
     except Exception as e:
         logger.debug(f"[push] block_print alert failed for {ticker}: {e}")
+
+
+def send_breakdown_alert(
+    ticker: str,
+    stage: str,
+    price: float | None = None,
+    extra: str = "",
+) -> int:
+    """
+    Broadcast a heavy-selling / breakdown alert to ALL users with the
+    'breakdown_alerts' pref on (default on). NOT watchlist-scoped — it surfaces
+    the strongest breakdowns across the scanned universe so a user can act even
+    on names they don't already watch.
+
+      stage="early"     → lost its 20-day average on heavy down-volume
+                          (earliest structural warning — "breakdown risk")
+      stage="confirmed" → broke its 20-day low on volume (breakdown confirmed)
+
+    This is an educational RISK heads-up, not advice to short. Returns the number
+    dispatched; the caller handles ranking, per-run caps and per-day dedup.
+    """
+    try:
+        tokens = _tokens_for("breakdown_alerts", default=True)
+        if not tokens:
+            return 0
+        px    = f" (${price:.2f})" if price else ""
+        suff  = f" · {extra}" if extra else ""
+        if stage == "confirmed":
+            title = f"🔻 {ticker} — Breakdown confirmed"
+            body  = f"{ticker} broke its 20-day low on volume{px}{suff}. Heavy selling — breakdown risk. Tap for the read."
+        else:
+            title = f"⚠️ {ticker} — Heavy selling"
+            body  = f"{ticker} lost its 20-day average on strong down-volume{px}{suff}. Early breakdown risk. Tap for the read."
+        messages = [
+            {
+                "to":    t,
+                "title": title,
+                "body":  body,
+                "data":  {"type": "breakdown_alert", "ticker": ticker, "stage": stage},
+                "sound": "default",
+                "badge": 1,
+            }
+            for t in tokens
+        ]
+        _dispatch(messages, f"BREAKDOWN {stage} {ticker}")
+        return len(messages)
+    except Exception as e:
+        logger.debug(f"[push] breakdown alert failed for {ticker}: {e}")
+        return 0
 
 
 def send_buzz_spike_alert(
