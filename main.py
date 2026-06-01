@@ -3719,6 +3719,82 @@ async def quant_ticker_news(request: Request, ticker: str, limit: int = 8):
         return {"ticker": ticker.upper().strip(), "items": [], "count": 0}
 
 
+@app.get("/ticker/{symbol}/overview")
+async def ticker_overview(request: Request, symbol: str):
+    """
+    Ticker Hub overview — one call returns {ticker, price, quant, news} for a
+    single symbol so the per-ticker hub screen can render live price, quant +
+    cycle status and news in one place.
+
+    Each section is best-effort: if quant or news fails it is returned as
+    null / [] rather than 500-ing the whole response.
+    """
+    _require_jwt(request)
+
+    sym = symbol.upper().strip()
+
+    # ── Price (latest from Alpaca) ──────────────────────────────────────────
+    price = None
+    try:
+        from engine.alpaca_client import get_latest_price
+        price = get_latest_price(sym)
+    except Exception as e:
+        logger.debug(f"GET /ticker/{sym}/overview price error: {e}")
+
+    # ── Quant + cycle read ──────────────────────────────────────────────────
+    quant = None
+    try:
+        from engine.alpaca_client import get_bars
+        from engine import quant_score_service, regime_detector
+
+        daily_df    = get_bars(sym, "1Day", days=400)
+        intraday_df = get_bars(sym, "15Min", days=5)
+
+        # Market regime — the turnaround/peak falling-knife gates use it.
+        try:
+            regime_raw  = regime_detector.detect()
+            regime_type = (regime_raw.get("regime_type") or regime_raw.get("regime") or "NEUTRAL")
+        except Exception:
+            regime_type = None
+
+        # SPY long history for the cycle driver (best-effort).
+        try:
+            spy_long_df = get_bars("SPY", "1Day", days=400)
+        except Exception:
+            spy_long_df = None
+
+        quant = quant_score_service._score_ticker(
+            sym,
+            price,
+            daily_df,
+            intraday_df,
+            daily_long_df=daily_df,
+            regime_type=regime_type,
+            spy_long_df=spy_long_df,
+        )
+    except Exception as e:
+        logger.debug(f"GET /ticker/{sym}/overview quant error: {e}")
+        quant = None
+
+    # ── News (latest headlines — same shape as /quant/news/{ticker}) ─────────
+    news: list[dict] = []
+    try:
+        from engine.alpaca_client import get_news
+        raw = get_news(sym, limit=8) or []
+        news = [{
+            "headline":  n.get("headline") or n.get("title") or "",
+            "source":    n.get("source") or "",
+            "url":       n.get("url") or "",
+            "createdAt": n.get("created_at") or n.get("createdAt") or "",
+            "summary":   (n.get("summary") or "")[:240],
+        } for n in raw if (n.get("headline") or n.get("title"))]
+    except Exception as e:
+        logger.debug(f"GET /ticker/{sym}/overview news error: {e}")
+        news = []
+
+    return {"ticker": sym, "price": price, "quant": quant, "news": news}
+
+
 # ── News Reaction Feed ────────────────────────────────────────────────────────
 
 @app.get("/news/reaction")
