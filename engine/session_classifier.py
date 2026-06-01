@@ -177,6 +177,27 @@ def is_market_open_today() -> bool:
     return is_trading
 
 
+def trading_days_between(start: datetime, end: datetime) -> int:
+    """
+    NYSE trading sessions elapsed from `start` to `end` (the entry day counts
+    as 0). Excludes weekends AND holidays — so a multi-day signal's max-hold
+    window isn't consumed by a weekend (the swing-expiry bug, 2026-06-01).
+    Falls back to calendar days if the calendar library errors.
+    """
+    try:
+        s = start.astimezone(ET).date()
+        e = end.astimezone(ET).date()
+        if e <= s:
+            return 0
+        sched = _NYSE.schedule(start_date=s.isoformat(), end_date=e.isoformat())
+        return max(0, len(sched) - 1)
+    except Exception:
+        try:
+            return max(0, (end - start).days)
+        except Exception:
+            return 0
+
+
 def is_market_open_now() -> bool:
     """
     True if right now is within today's trading hours (9:30 AM ET to
