@@ -2604,6 +2604,30 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled quant dashboard precompute every 3 min")
 
+    # ── Community insights precompute (every 5 min, 24/7) ───────────────────
+    # Same fix as quant: the /community/* enrichment (bars + manipulation + news
+    # for ~30 names) was computed on the request path → timeouts. Precompute on
+    # the worker so the endpoints serve the warm Redis cache instantly.
+    def _run_community_refresh():
+        try:
+            from engine import social_insights
+            sb = _supabase()
+            social_insights.get_enriched_trending(sb, force=True)
+            social_insights.community_pulse(sb, force=True)
+            social_insights.whats_changed(sb, force=True)
+        except Exception as _e:
+            logger.error(f"[runner] community refresh failed: {_e}")
+
+    scheduler.add_job(
+        _run_community_refresh,
+        trigger=IntervalTrigger(minutes=5),
+        id="community_refresh",
+        name="Community insights precompute (5-min)",
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=40),
+    )
+    logger.info("[runner] Scheduled community insights precompute every 5 min")
+
     # ── Community social snapshot (hourly, 24/7) ────────────────────────────
     # Captures the merged trending feed + price-at-capture into social_snapshots.
     # This time-series is what powers going-viral z-scores, buzz velocity,
