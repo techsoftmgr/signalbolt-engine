@@ -300,14 +300,31 @@ def _gate_patterns(direction: str, df_entry: pd.DataFrame, price: float,
         _rv = float(df_entry["volume"].iloc[-1])
         _av = float(df_entry["volume"].iloc[-11:-1].mean())
         strong_vol = _av > 0 and _rv >= _av
-    momentum_ok = trend_agrees and strong_vol
+
+    # MACD acceleration on the entry timeframe: the histogram is BUILDING in the
+    # signal direction. A genuine runner often pauses on volume for a single bar
+    # while MACD keeps expanding — that's "momentum in motion", not a chase. This
+    # mirrors the Game Plan / quant-verdict read ("extended + accelerating → ride
+    # it") so signal generation stays consistent with what we tell the user.
+    macd_accel = False
+    try:
+        _h = _macd_hist(df_entry["close"]).values.astype(float)
+        if len(_h) >= 3:
+            macd_accel = (_h[-1] > _h[-2] >= _h[-3]) if direction == "LONG" \
+                         else (_h[-1] < _h[-2] <= _h[-3])
+    except Exception:
+        macd_accel = False
+
+    # Momentum confirmation = trend agrees AND (volume OR MACD acceleration).
+    momentum_ok = trend_agrees and (strong_vol or macd_accel)
     # Catalyst gets the widest cap (news justifies extension); a technical runner
-    # (trend+vol, no news) gets the momentum cap; everything else the tight cap.
+    # (trend+confirmation, no news) gets the momentum cap; everything else tight.
     catalyst_ok = has_catalyst and momentum_ok
     if catalyst_ok:    max_atr = _CATALYST_MAX_ATR
     elif momentum_ok:  max_atr = _MOMENTUM_MAX_ATR
     else:              max_atr = _STD_MAX_ATR
 
+    relaxed_reason: Optional[str] = None
     if atr > 0:
         deviation = (price - ema21) / atr
         if direction == "LONG" and deviation > max_atr:
@@ -316,11 +333,16 @@ def _gate_patterns(direction: str, df_entry: pd.DataFrame, price: float,
             return False, f"overextended below EMA21 ({deviation:+.1f} ATRs > {max_atr})"
         if (catalyst_ok or momentum_ok) and abs(deviation) > _STD_MAX_ATR:
             # Passed only because of a relaxed cap — flag it for A/B telemetry.
-            # (strong_vol is required either way, so the volume-drop check below
-            # can't trigger — safe to short-circuit here.)
-            tag = "catalyst_relaxed" if catalyst_ok else "momentum_relaxed"
+            why  = "vol+trend" if strong_vol else "macd+trend"
+            tag  = "catalyst_relaxed" if catalyst_ok else "momentum_relaxed"
             news = "+news" if catalyst_ok else ""
-            return True, f"{tag} (ext {deviation:+.1f} ATR <= {max_atr}, vol+trend{news} ok)"
+            relaxed_reason = f"{tag} (ext {deviation:+.1f} ATR <= {max_atr}, {why}{news} ok)"
+            if strong_vol:
+                # Volume is healthy → the volume-drop check below can't trigger;
+                # safe to short-circuit and tag now.
+                return True, relaxed_reason
+            # MACD-only relaxation: fall through so the volume-drop check can
+            # still reject an accelerating-but-volume-collapsing bar.
 
     # 3. Volume drop into entry (last bar < 50% of avg of prior 10 bars)
     if "volume" in df_entry.columns and len(df_entry) >= 11:
@@ -329,7 +351,7 @@ def _gate_patterns(direction: str, df_entry: pd.DataFrame, price: float,
         if avg_vol > 0 and recent_vol < 0.5 * avg_vol:
             return False, f"volume drop on entry bar ({recent_vol:.0f} vs avg {avg_vol:.0f})"
 
-    return True, "no rejection patterns"
+    return True, relaxed_reason or "no rejection patterns"
 
 
 # ── Public entry point ──────────────────────────────────────────────────
