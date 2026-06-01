@@ -201,6 +201,28 @@ STRATEGY_MAX_HOLD_HOURS = {
 }
 
 
+def is_past_max_hold(created: datetime, strategy: str) -> bool:
+    """
+    True if a signal has exceeded its strategy's max-hold backstop.
+
+    The time cap is only a backstop — real exits are thesis-driven (stop /
+    target / trailing stop / structure-reversal). For MULTI-DAY holds (>=24h
+    window, e.g. swing 240h, position 720h) we count TRADING days so weekends
+    and holidays don't consume the window, and we NEVER report expired on a
+    non-trading day — so nothing closes over a Saturday/Sunday/holiday. Intraday
+    strategies (same-session) keep the simple wall-clock window.
+    """
+    hold_hours = STRATEGY_MAX_HOLD_HOURS.get(strategy, 48.0)
+    now = datetime.now(timezone.utc)
+    if hold_hours >= 24:
+        from engine import session_classifier
+        if not session_classifier.is_market_open_today():
+            return False   # never expire on a weekend / holiday
+        elapsed_td = session_classifier.trading_days_between(created, now)
+        return elapsed_td >= (hold_hours / 24.0)
+    return (now - created) > timedelta(hours=hold_hours)
+
+
 # ---------------------------------------------------------------------------
 # Supabase helpers
 # ---------------------------------------------------------------------------
@@ -1974,12 +1996,10 @@ def _close_signals(sb: Client) -> None:
     for sig in rows:
         created      = datetime.fromisoformat(sig["created_at"].replace("Z", "+00:00"))
         strategy     = sig.get("strategy_type") or "day_trade"
-        hold_hours   = STRATEGY_MAX_HOLD_HOURS.get(strategy, 48.0)
-        cutoff       = now - timedelta(hours=hold_hours)
         reason: Optional[str] = None
         close_price: Optional[float] = None
 
-        if created < cutoff:
+        if is_past_max_hold(created, strategy):
             reason = "expired"
             close_price = price_map.get(sig["ticker"])   # record P/L at expiry
         else:

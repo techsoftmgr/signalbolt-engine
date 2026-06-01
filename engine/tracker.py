@@ -191,10 +191,9 @@ def _is_expired(signal: dict) -> bool:
     """
     try:
         created = datetime.fromisoformat(signal["created_at"].replace("Z", "+00:00"))
-        from engine.runner import STRATEGY_MAX_HOLD_HOURS
-        strategy   = signal.get("strategy_type") or "day_trade"
-        hold_hours = STRATEGY_MAX_HOLD_HOURS.get(strategy, 48.0)
-        return datetime.now(timezone.utc) - created > timedelta(hours=hold_hours)
+        from engine.runner import is_past_max_hold
+        strategy = signal.get("strategy_type") or "day_trade"
+        return is_past_max_hold(created, strategy)
     except Exception:
         return False
 
