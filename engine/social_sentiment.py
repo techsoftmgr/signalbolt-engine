@@ -32,6 +32,16 @@ HTTP_TIMEOUT = 8
 APEWISDOM_URL  = "https://apewisdom.io/api/v1.0/filter/all-stocks/page/1"
 STOCKTWITS_URL = "https://api.stocktwits.com/api/2/trending/symbols.json"
 
+# StockTwits' public endpoint now sits behind Cloudflare bot-protection that
+# blocks the requests library at the TLS-fingerprint level (returns a 403 HTML
+# challenge page). A browser User-Agent does NOT get past it, and defeating the
+# challenge would mean circumventing bot-detection — which we don't do. So this
+# source is BEST-EFFORT: if it answers we use it; if it's blocked/throttled
+# (403/429 or an HTML body) we soft-skip and serve Reddit-only for that cycle.
+# The legit way to restore StockTwits is their official/authenticated API.
+_STOCKTWITS_HEADERS  = {"User-Agent": "SignalBolt/1.0 (+https://signalbolt.app)"}
+_STOCKTWITS_THROTTLE = {403, 429}
+
 
 # ── Per-source fetchers (each returns ticker → partial record, or {} on error) ──
 
@@ -99,14 +109,14 @@ def _fetch_stocktwits() -> dict[str, dict]:
       }
     """
     try:
-        r = requests.get(STOCKTWITS_URL, timeout=HTTP_TIMEOUT, headers={"User-Agent": "SignalBolt/1.0"})
-        if r.status_code == 429:
-            logger.info("[social] stocktwits rate-limited, skipping")
+        r = requests.get(STOCKTWITS_URL, timeout=HTTP_TIMEOUT, headers=_STOCKTWITS_HEADERS)
+        if r.status_code in _STOCKTWITS_THROTTLE:
+            logger.info(f"[social] stocktwits unavailable ({r.status_code}, Cloudflare-gated) — Reddit-only this cycle")
             return {}
         r.raise_for_status()
-        symbols = r.json().get("symbols", []) or []
+        symbols = r.json().get("symbols", []) or []   # HTML challenge → json() raises → soft-skip below
     except Exception as e:
-        logger.warning(f"[social] stocktwits fetch failed: {e}")
+        logger.info(f"[social] stocktwits fetch failed: {e} — Reddit-only this cycle")
         return {}
 
     out: dict[str, dict] = {}
