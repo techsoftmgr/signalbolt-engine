@@ -43,8 +43,8 @@ _BUCKET_CFG = {
     "highVolumeDown": {"direction": "down", "needsTrigger": False, "label": "High Volume ▼ (Distribution)"},
     "vwapReclaim":    {"direction": "up",   "needsTrigger": False, "label": "VWAP Reclaim"},
     "oversoldBounce": {"direction": "up",   "needsTrigger": False, "label": "Oversold Bounce"},
-    "turnaround":     {"direction": "up",   "needsTrigger": False, "label": "Turnaround"},
-    "peak":           {"direction": "down", "needsTrigger": False, "label": "Peak / Distribution"},
+    "turnaround":     {"direction": "up",   "needsTrigger": False, "label": "Turnaround",          "horizonDays": 15},
+    "peak":           {"direction": "down", "needsTrigger": False, "label": "Peak / Distribution", "horizonDays": 15},
 }
 
 
@@ -164,7 +164,8 @@ def _episode_metrics(ep: dict, bars, spy_bars, cfg: dict) -> dict:
         anchor_ts = _parse(ep.get("entered_at"))
         anchor_px = float(ep.get("enter_price") or 0)
 
-    jp = judge_path(bars, anchor_ts, anchor_px, direction=cfg["direction"])
+    jp = judge_path(bars, anchor_ts, anchor_px, direction=cfg["direction"],
+                    horizon_days=int(cfg.get("horizonDays", HORIZON_DAYS)))
 
     # For trigger-required buckets (breakout/breakdown), a never-triggered
     # episode means the directional break never came → a loss. Other buckets
