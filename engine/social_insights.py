@@ -52,7 +52,7 @@ _CATALYST_TOP_N  = 10              # fetch "why trending" news for the top N onl
 _SPARK_POINTS    = 24             # sparkline resolution
 _VIRAL_Z         = 2.0            # z-score threshold for "going viral"
 _VIRAL_MIN_ABS   = 40             # ignore tiny-mention names regardless of z
-_BUZZ_UP_PCT     = 30.0          # mentions change considered "rising"
+_BUZZ_UP_PCT     = 20.0          # mentions change considered "rising"
 _BUZZ_HOT_PCT    = 100.0         # mentions change considered "spiking"
 _PRICE_UP_PCT    = 1.0           # 1d price move considered "up"
 _PRICE_DN_PCT    = -1.0          # 1d price move considered "down"
@@ -320,20 +320,22 @@ def _verdict(*, mentions_chg: Optional[float], price1d: Optional[float],
     p5 = price5d if price5d is not None else 0.0
     mc = mentions_chg
 
-    buzz_up  = (mc is not None and mc >= _BUZZ_UP_PCT) or viral
-    buzz_hot = (mc is not None and mc >= _BUZZ_HOT_PCT) or viral
-    price_up = p1 >= _PRICE_UP_PCT or (price5d is not None and p5 >= 3.0)
-    price_dn = p1 <= _PRICE_DN_PCT
+    buzz_up      = (mc is not None and mc >= _BUZZ_UP_PCT) or viral
+    buzz_hot     = (mc is not None and mc >= _BUZZ_HOT_PCT) or viral
+    price_up     = p1 >= _PRICE_UP_PCT or (price5d is not None and p5 >= 3.0)
+    price_strong = p1 >= 5.0 or (price5d is not None and p5 >= 10.0)
+    price_dn     = p1 <= _PRICE_DN_PCT
 
     if manip.get("flagged") and buzz_hot:
         key = "PUMP_RISK"
     elif sentiment is not None and sentiment >= 0.80 and price_dn and p5 >= 2.0:
         key = "CROWD_TRAP"
-    elif buzz_up and price_up:
+    elif (buzz_up and price_up) or (price_strong and (mc is None or mc >= 0)):
+        # buzz + price aligned, OR a strong price move that chatter isn't fighting
         key = "REAL_MOMENTUM"
     elif buzz_up and not price_up:
         key = "HYPE_FADING"
-    elif price_up and (mc is None or mc < 10) and not buzz_up:
+    elif price_up and not buzz_up:
         key = "UNDER_RADAR"
     else:
         key = "MIXED"
