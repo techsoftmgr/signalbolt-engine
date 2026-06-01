@@ -33,6 +33,7 @@ _cache: dict       = {}
 _cache_ts: float   = 0.0
 _CACHE_TTL: int    = int(os.environ.get("QUANT_CACHE_TTL", "60"))
 _REDIS_KEY         = "quant:dashboard:v1"   # cross-process precomputed result (worker → web)
+_SCORED_KEY        = "quant:scored:v1"      # FULL scored universe (for universe-wide alerts)
 
 # ~1y daily bars barely change intraday — cache them so we don't refetch
 # ~150×250 bars on every dashboard build.
@@ -403,6 +404,15 @@ def _build_dashboard(tickers: list[str]) -> dict:
             [x for x in scored if x.get("peakStage") in ("watch", "peak")],
             key=lambda x: -(x.get("peakScore") or 0),
         )[:_BUCKET_LIMIT]
+
+        # Persist the FULL scored universe (every name, not just the top-20
+        # allScored) so universe-wide consumers — the breakdown/heavy-selling
+        # alerts — can read each ticker's current state and reuse THIS scan
+        # instead of re-fetching ~90 names every 15 min.
+        try:
+            cache.kv.set_json(_SCORED_KEY, scored, _CACHE_TTL * 10)
+        except Exception:
+            pass
 
         return {
             "marketRegime": {

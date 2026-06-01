@@ -2700,6 +2700,30 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled watchlist state-change alerts every 15 min")
 
+    # ── Breakdown / heavy-selling alerts (universe-wide, 15-min) ─────────────
+    # Two-stage broadcast: EARLY (lost 20-day avg on heavy down-vol) + CONFIRMED
+    # (broke 20-day low on vol). Reuses the cached full quant scan; per-ticker
+    # transition state + per-day dedup + a hard per-run cap keep it from spamming.
+    def _run_breakdown_alerts():
+        try:
+            from engine.session_classifier import is_market_open_today
+            if not is_market_open_today():
+                return
+            from engine import breakdown_alerts
+            breakdown_alerts.run(_supabase())
+        except Exception as _e:
+            logger.error(f"[runner] breakdown alerts failed: {_e}")
+
+    scheduler.add_job(
+        _run_breakdown_alerts,
+        trigger=IntervalTrigger(minutes=15),
+        id="breakdown_alerts",
+        name="Breakdown / heavy-selling alerts (15-min)",
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=150),
+    )
+    logger.info("[runner] Scheduled breakdown alerts every 15 min")
+
     # ── Community social snapshot (hourly, 24/7) ────────────────────────────
     # Captures the merged trending feed + price-at-capture into social_snapshots.
     # This time-series is what powers going-viral z-scores, buzz velocity,
