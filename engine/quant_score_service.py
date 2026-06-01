@@ -690,6 +690,8 @@ def _score_ticker(
         "breakoutScore":       round(breakout_score, 1),
         "breakoutLevel":       round(high_20, 2),        # 20-day high being tested
         "distToBreakoutPct":   round(dist_to_high_pct, 2),  # negative = below the high
+        "ma20":                round(float(ma20), 2),     # 20-day avg — the rising trend support / "buy-the-dip" anchor
+        "atrPct":              round(float(atr_pct), 2),   # daily range as % of price (for a dip-zone band)
         "breakoutQuality":     breakout_quality,         # breakout-specific 0-100 (no vol penalty)
         "breakdownScore":      round(breakdown_score, 1),
         "breakdownLevel":      round(low_20, 2),          # 20-day low being tested
