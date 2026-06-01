@@ -130,20 +130,31 @@ def judge_path(bars, anchor_ts, anchor_px, *, horizon_days: int = HORIZON_DAYS,
     curve = []
 
     # ── Triple-barrier labelling (when win_mfe_pct is set, i.e. cycle buckets) ──
-    # Instead of judging at a fixed day, resolve at the FIRST of:
-    #   • target  (+win% favourable) → WIN, resolved early (a real swing fired)
-    #   • stop    (−win% adverse)    → LOSS, resolved early (knife / wrong level)
-    #   • horizon (vertical barrier) → judge on the net move (it just chopped)
-    # This makes the exact horizon length far less sensitive — clear winners and
-    # knives resolve in days/weeks; only sideways basers wait out the backstop.
+    # Resolve at the FIRST of:
+    #   • target  (+win% favourable)             → WIN  (a real swing fired)
+    #   • stop    (STRUCTURAL: base/cap. break)  → LOSS (thesis invalidated)
+    #   • horizon (vertical barrier)             → judge on the net move (chop)
+    # Clear winners and knives resolve in days/weeks; only sideways basers wait
+    # out the backstop, so the exact horizon length barely matters.
     tgt_px = stp_px = None
     if win_mfe_pct is not None:
-        if direction == "down":   # peak: win = price FALLS, stop = squeezed UP
+        # STRUCTURAL stop: a DECISIVE break of the base/capitulation extreme over
+        # the ~20 bars before entry — gives a confirmed swing room to breathe
+        # (HOOD can dip within its base) instead of a flat −8% that normal chop
+        # would trip. Floored so the stop is never tighter than 2% from entry.
+        _SLB = 20; _SBUF = 0.015
+        try:
+            _pre = bars[bars.index <= anchor_ts].tail(_SLB)
+        except Exception:
+            _pre = None
+        if direction == "down":   # peak: win = price FALLS; stop = squeezed UP through the base high
             tgt_px = anchor_px * (1 - win_mfe_pct / 100)
-            stp_px = anchor_px * (1 + win_mfe_pct / 100)
-        else:                     # turnaround: win = price RISES, stop = breaks DOWN
+            _base_hi = float(_pre["high"].max()) if (_pre is not None and len(_pre) >= 5) else anchor_px * (1 + win_mfe_pct / 100)
+            stp_px = max(_base_hi * (1 + _SBUF), anchor_px * 1.02)
+        else:                     # turnaround: win = price RISES; stop = break BELOW the base low
             tgt_px = anchor_px * (1 + win_mfe_pct / 100)
-            stp_px = anchor_px * (1 - win_mfe_pct / 100)
+            _base_lo = float(_pre["low"].min()) if (_pre is not None and len(_pre) >= 5) else anchor_px * (1 - win_mfe_pct / 100)
+            stp_px = min(_base_lo * (1 - _SBUF), anchor_px * 0.98)
     barrier = None; barrier_day = None; barrier_close = None
 
     for i, (ts, row) in enumerate(fwd.iterrows(), start=1):
@@ -192,6 +203,7 @@ def judge_path(bars, anchor_ts, anchor_px, *, horizon_days: int = HORIZON_DAYS,
         "outcome":   outcome,
         "resultPct": result,
         "grade":     _grade(grade_move),
+        "stopPct":   (round((stp_px / anchor_px - 1) * 100, 2) if stp_px else None),
         "mfePct":    mfe,
         "mfeDate":   hi_date or (curve[0]["date"] if curve else None),
         "maePct":    mae,
