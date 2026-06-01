@@ -315,6 +315,15 @@ def _ensure_stream_subscription(ticker: str, cap: int | None = None) -> None:
 
 def _write_signal(sb: Client, row: dict) -> str | None:
     """Insert signal row, log the 'fired' event, and return the new signal ID."""
+    # Capture the ORIGINAL stop at fire time. The monitors mutate stop_loss in
+    # place as they trail it, so without this the fired level is lost — and the
+    # UI can't show users that the stop was RAISED. Done here so every fire path
+    # (SMC, momentum, predictive, options…) is covered in one place.
+    try:
+        if isinstance(row.get("score_breakdown"), dict) and row.get("stop_loss") is not None:
+            row["score_breakdown"].setdefault("initial_stop", row["stop_loss"])
+    except Exception:
+        pass
     try:
         result = sb.table("signals").insert(row).execute()
         logger.info(

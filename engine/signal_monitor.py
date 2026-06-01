@@ -359,14 +359,45 @@ def _close_signal(
         logger.error(f"[monitor] Close failed for {sig_id}: {e}")
 
 
-def _update_sl(sb: Client, sig_id: str, new_sl: float) -> None:
-    """Move stop loss to new level (e.g. breakeven after T1 hit)."""
+def _update_sl(sb: Client, sig_id: str, new_sl: float, sig: dict | None = None) -> None:
+    """Move stop loss to new level (e.g. breakeven after T1 hit).
+
+    If `sig` (the pre-update signal row) is passed, also push a ONE-TIME alert
+    when this update is the moment the stop first crosses to breakeven-or-better
+    (old stop on the risk side of entry, new stop at/beyond entry). Because the
+    stop only ratchets in one direction, that crossing happens on exactly one
+    update — so the notification fires once, with no dedup state needed.
+    """
     try:
         sb.table("signals").update({
             "stop_loss": round(new_sl, 4),
         }).eq("id", sig_id).execute()
     except Exception as e:
         logger.error(f"[monitor] SL update failed for {sig_id}: {e}")
+        return
+
+    if not sig:
+        return
+    try:
+        entry  = float(sig.get("entry_price") or 0)
+        old_sl = float(sig.get("stop_loss") or 0)
+        if entry <= 0:
+            return
+        is_long = sig.get("direction") == "LONG"
+        eps = max(0.01, entry * 0.0005)
+        crossed = ((is_long and old_sl < entry - eps and new_sl >= entry - eps) or
+                   (not is_long and old_sl > entry + eps and new_sl <= entry + eps))
+        if crossed:
+            locked = abs(new_sl - entry) / entry * 100
+            from engine import push
+            push.send_stop_protected_alert(
+                sig.get("ticker", ""), sig.get("direction", "LONG"),
+                round(new_sl, 2), round(locked, 1), signal_id=str(sig_id),
+            )
+            logger.info(f"[monitor] {sig.get('ticker')} stop crossed to B/E "
+                        f"({old_sl:.2f} -> {new_sl:.2f}, entry {entry:.2f}) — pushed")
+    except Exception as e:
+        logger.debug(f"[monitor] stop-protected push check failed for {sig_id}: {e}")
 
 
 def _log_event(
@@ -766,7 +797,7 @@ def _monitor_stocks(sb: Client) -> None:
             if t1_hit and not t2_hit and sl_worse_than_be:
                 pct = abs(price - entry) / entry * 100
                 logger.info(f"[monitor] {ticker} T1 hit @ {price:.2f} — moving SL to breakeven")
-                _update_sl(sb, sig["id"], entry)
+                _update_sl(sb, sig["id"], entry, sig=sig)
                 _log_event(sb, sig["id"], "t1_hit", price=price,
                            note=f"🎯 T1 hit @ ${price:.2f} (+{pct:.1f}%) — stop moved to breakeven ${entry:.2f}")
                 try:
@@ -871,7 +902,7 @@ def _monitor_stocks(sb: Client) -> None:
                             trail = round(trail, 2)
                             locked = ((trail - entry) / entry * 100) if is_long \
                                      else ((entry - trail) / entry * 100)
-                            _update_sl(sb, sig_id, trail)
+                            _update_sl(sb, sig_id, trail, sig=sig)
                             _log_event(sb, sig_id, "be_move", price=price,
                                        note=(f"📈 Trail → ${trail:.2f} (below 15m swing, "
                                              f"rides 20-EMA, locks +{locked:.1f}%)"))
@@ -927,7 +958,7 @@ def _monitor_stocks(sb: Client) -> None:
                         trail = round(trail, 2)
                         locked = ((trail - entry) / entry * 100) if is_long \
                                  else ((entry - trail) / entry * 100)
-                        _update_sl(sb, sig_id, trail)
+                        _update_sl(sb, sig_id, trail, sig=sig)
                         _log_event(sb, sig_id, "be_move", price=price,
                                    note=(f"📈 Trailing stop → ${trail:.2f} "
                                          f"({trail_pct*100:.1f}% below peak ${peak:.2f}, "
@@ -1059,7 +1090,7 @@ def _monitor_stocks(sb: Client) -> None:
                     # stop alone so a clean trend can breathe. Once at breakeven,
                     # step 4b (trailing + convergence exit) takes over the ride.
                     elif decision["score"] >= _BE_PROTECT_SCORE and abs(sl - entry) > 0.01:
-                        _update_sl(sb, sig["id"], round(entry, 2))
+                        _update_sl(sb, sig["id"], round(entry, 2), sig=sig)
                         _log_event(sb, sig["id"], "be_move", price=price,
                                    note=(f"🛡 Stop → breakeven ${entry:.2f} — reversal pressure "
                                          f"{decision['score']}, protecting +{pnl_pct:.1f}% (riding, pre-T1)"))
