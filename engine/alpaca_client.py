@@ -56,8 +56,11 @@ def get_latest_price(ticker: str) -> Optional[float]:
         return None
     try:
         from alpaca.data.requests import StockLatestTradeRequest
+        # feed="sip" = full consolidated tape (same as our bars), so the live
+        # last-trade matches what ToS/brokers show. Without it the request used
+        # the account default (often IEX-only), which lags/differs from ToS.
         resp = _client.get_stock_latest_trade(
-            StockLatestTradeRequest(symbol_or_symbols=ticker)
+            StockLatestTradeRequest(symbol_or_symbols=ticker, feed="sip")
         )
         p = resp[ticker].price
         return float(p) if p else None
@@ -77,7 +80,7 @@ def get_latest_prices(tickers: list[str]) -> dict[str, float]:
     try:
         from alpaca.data.requests import StockLatestTradeRequest
         resp = _client.get_stock_latest_trade(
-            StockLatestTradeRequest(symbol_or_symbols=tickers)
+            StockLatestTradeRequest(symbol_or_symbols=tickers, feed="sip")
         )
         return {
             t: float(resp[t].price)
@@ -151,6 +154,7 @@ def get_bars(
             "15Min": TimeFrame(15, TimeFrameUnit.Minute),
             "1Hour": TimeFrame(1,  TimeFrameUnit.Hour),
             "1Day":  TimeFrame(1,  TimeFrameUnit.Day),
+            "1Week": TimeFrame(1,  TimeFrameUnit.Week),
         }
         tf    = tf_map.get(timeframe, TimeFrame(5, TimeFrameUnit.Minute))
         start = datetime.now(timezone.utc) - timedelta(days=days)
@@ -237,6 +241,7 @@ def get_multi_bars(
             "15Min": TimeFrame(15, TimeFrameUnit.Minute),
             "1Hour": TimeFrame(1,  TimeFrameUnit.Hour),
             "1Day":  TimeFrame(1,  TimeFrameUnit.Day),
+            "1Week": TimeFrame(1,  TimeFrameUnit.Week),
         }
         tf    = tf_map.get(timeframe, TimeFrame(1, TimeFrameUnit.Day))
         start = datetime.now(timezone.utc) - timedelta(days=days)

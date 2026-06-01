@@ -1321,8 +1321,15 @@ def get_chart_data(ticker: str, timeframe: str = "15Min", bars: int = 60):
     try:
         from engine.alpaca_client import get_bars as alpaca_get_bars
 
-        tf_to_days = {"5Min": 2, "15Min": 3, "1Hour": 7, "1Day": 60}
+        tf_to_days = {"5Min": 2, "15Min": 3, "1Hour": 7, "1Day": 60, "1Week": 120}
         days = tf_to_days.get(timeframe, 3)
+        # For daily/weekly, fetch enough calendar days to satisfy the requested
+        # bar count (lets the chart show 3-year / max history). ~1.5 calendar
+        # days per trading day; ~7.2 per weekly bar.
+        if timeframe == "1Day":
+            days = max(days, int(bars * 1.5) + 10)
+        elif timeframe == "1Week":
+            days = max(days, int(bars * 7.2) + 30)
 
         df = alpaca_get_bars(ticker, timeframe=timeframe, days=days)
 
