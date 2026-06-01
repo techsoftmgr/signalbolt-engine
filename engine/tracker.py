@@ -175,13 +175,26 @@ def _check_levels(signal: dict, price: float) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Expiry check (48h fallback)
+# Expiry check — per-strategy max hold
 # ---------------------------------------------------------------------------
 
 def _is_expired(signal: dict) -> bool:
+    """
+    Expire only when the signal exceeds its STRATEGY's max-hold window.
+
+    BUG FIX (2026-06-01): this used a flat 48h for EVERY strategy, which
+    force-expired swing trades (intended 240h / 10 days) and position trades
+    (720h) after just 2 days — whole batches of Friday swings died over the
+    weekend, closed grey as 'expired' with no P/L. Now mirrors the runner
+    closer and consults STRATEGY_MAX_HOLD_HOURS (lazy import to avoid the
+    tracker<->runner circular import, same pattern signal_monitor uses).
+    """
     try:
         created = datetime.fromisoformat(signal["created_at"].replace("Z", "+00:00"))
-        return datetime.now(timezone.utc) - created > timedelta(hours=48)
+        from engine.runner import STRATEGY_MAX_HOLD_HOURS
+        strategy   = signal.get("strategy_type") or "day_trade"
+        hold_hours = STRATEGY_MAX_HOLD_HOURS.get(strategy, 48.0)
+        return datetime.now(timezone.utc) - created > timedelta(hours=hold_hours)
     except Exception:
         return False
 
