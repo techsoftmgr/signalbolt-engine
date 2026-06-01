@@ -2676,6 +2676,30 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled community insights precompute every 5 min")
 
+    # ── Watchlist state-change alerts — every 15 min on trading days ──────
+    # Pushes a user when one of their watched tickers flips state (buy zone /
+    # topping / breakout / lost trend). Seeds baseline on first sight + per-day
+    # dedup so it never spams. Skips non-trading days.
+    def _run_watchlist_alerts():
+        try:
+            from engine.session_classifier import is_market_open_today
+            if not is_market_open_today():
+                return
+            from engine import watchlist_alerts
+            watchlist_alerts.run(_supabase())
+        except Exception as _e:
+            logger.error(f"[runner] watchlist alerts failed: {_e}")
+
+    scheduler.add_job(
+        _run_watchlist_alerts,
+        trigger=IntervalTrigger(minutes=15),
+        id="watchlist_alerts",
+        name="Watchlist state-change alerts (15-min)",
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=90),
+    )
+    logger.info("[runner] Scheduled watchlist state-change alerts every 15 min")
+
     # ── Community social snapshot (hourly, 24/7) ────────────────────────────
     # Captures the merged trending feed + price-at-capture into social_snapshots.
     # This time-series is what powers going-viral z-scores, buzz velocity,
