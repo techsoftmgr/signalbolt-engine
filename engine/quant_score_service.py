@@ -482,6 +482,42 @@ def _score_ticker(
     momentum_raw = rsi * 0.5 + _normalize(roc_5,  -10, 10) * 0.3 + _normalize(roc_10, -15, 15) * 0.2
     momentum_score = float(np.clip(momentum_raw, 0, 100))
 
+    # ── MACD(12,26,9) histogram — momentum ACCELERATION signal ────────────────
+    # The histogram (MACD line − signal line) is the single best read on whether
+    # momentum is BUILDING vs FADING, independent of how far price has already
+    # travelled. A rising histogram while price is extended above its average is
+    # the "trend in motion" signature — it's what lets the Game Plan and the
+    # quant verdicts distinguish "extended + still accelerating → ride it" from
+    # "extended + stalling → wait for the pullback". Needs ~35 bars to settle.
+    macd_hist = 0.0
+    macd_rising = False
+    macd_hist_series: list[float] = []
+    if len(closes) >= 35:
+        try:
+            c_ser       = pd.Series(closes)
+            ema12       = c_ser.ewm(span=12, adjust=False).mean()
+            ema26       = c_ser.ewm(span=26, adjust=False).mean()
+            macd_line   = ema12 - ema26
+            signal_line = macd_line.ewm(span=9, adjust=False).mean()
+            hist        = (macd_line - signal_line).values.astype(float)
+            macd_hist   = float(hist[-1])
+            tail        = hist[-3:]
+            # rising = latest bar higher than the prior bar AND the 3-bar window
+            # is in an up-sequence (momentum genuinely building, not a one-bar blip)
+            macd_rising = bool(
+                len(tail) >= 2 and tail[-1] > tail[-2] and tail[-1] >= tail[0]
+            )
+            macd_hist_series = [round(float(x), 4) for x in hist[-6:]]
+        except Exception:
+            pass
+
+    # Composite "accelerating" read used by the hub + quant verdicts + entry gate:
+    # a strong, intact uptrend whose MACD histogram is still building. This is the
+    # condition under which an EXTENDED name should be read as "ride it", not "wait".
+    momentum_accelerating = bool(
+        macd_rising and momentum_score >= 60 and trend_score >= 60
+    )
+
     # ── Volume Score (0-100) ──────────────────────────────────────────────────
     avg_vol    = float(np.mean(volumes[-20:])) if len(volumes) >= 20 else float(np.mean(volumes))
     today_vol  = 0.0
@@ -686,6 +722,10 @@ def _score_ticker(
         # Component scores (0-100)
         "trendScore":          round(trend_score, 1),
         "momentumScore":       round(momentum_score, 1),
+        "macdHist":            round(macd_hist, 4),       # latest MACD histogram bar
+        "macdRising":          macd_rising,               # histogram building 2+ bars
+        "macdHistSeries":      macd_hist_series,          # last 6 bars (for a sparkline)
+        "momentumAccelerating": momentum_accelerating,    # strong trend + MACD still building
         "volumeScore":         round(volume_score, 1),
         "breakoutScore":       round(breakout_score, 1),
         "breakoutLevel":       round(high_20, 2),        # 20-day high being tested
