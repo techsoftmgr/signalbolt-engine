@@ -195,6 +195,8 @@ STRATEGY_MAX_HOLD_HOURS = {
     "swing_trade":    240.0,  # 10 days
     "breakdown":      240.0,  # 10 days — bearish swing short/put from a breakdown
     "breakout":       240.0,  # 10 days — bullish swing long/call from a breakout
+    "turnaround":     240.0,  # 10 days — bullish swing long/call from a cycle bottom
+    "peak":           240.0,  # 10 days — bearish swing short/put from a cycle top
     "earnings":       48.0,   # 2 days — pre/post earnings move
     "short_squeeze":  24.0,   # 1 day — squeeze resolves quickly
     "position_trade": 720.0,  # 30 days — macro position
@@ -2783,6 +2785,34 @@ def start_scheduler() -> BackgroundScheduler:
         next_run_time=datetime.now(timezone.utc) + timedelta(seconds=180),
     )
     logger.info("[runner] Scheduled breakout alerts every 15 min")
+
+    # ── Cycle tracked cards — turnaround (LONG+CALL) + peak (SHORT+PUT) ───────
+    # The Buy-Zone / Peak PUSH alerts fire from the 5-min breakout-watch sync;
+    # this generates the TRADEABLE cards for those same names. State-based +
+    # deduped + capped, so a name that confirmed its turn overnight/pre-market
+    # is captured at the RTH open (mirrors breakdown/breakout alerts).
+    def _run_cycle_signals():
+        try:
+            # Regular trading hours ONLY — turnaround/peak SIGNALS (long/short +
+            # option cards) are generated here; you can't act on them when the
+            # market is closed, and options_scanner needs a live chain.
+            from engine.session_classifier import is_market_open_now
+            if not is_market_open_now():
+                return
+            from engine import cycle_signals
+            cycle_signals.run(_supabase())
+        except Exception as _e:
+            logger.error(f"[runner] cycle signals failed: {_e}")
+
+    scheduler.add_job(
+        _run_cycle_signals,
+        trigger=IntervalTrigger(minutes=15),
+        id="cycle_signals",
+        name="Cycle tracked cards — turnaround + peak (15-min)",
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=210),
+    )
+    logger.info("[runner] Scheduled cycle signals every 15 min")
 
     # ── Community social snapshot (hourly, 24/7) ────────────────────────────
     # Captures the merged trending feed + price-at-capture into social_snapshots.

@@ -80,6 +80,8 @@ TRAIL_PEAK_PCT = {
     "vwap_reclaim": 0.010,
     "breakdown":    0.025,   # daily swing short — extra room (far T1, ride bounces)
     "breakout":     0.025,   # daily swing long
+    "turnaround":   0.025,   # daily swing long off a cycle bottom
+    "peak":         0.025,   # daily swing short off a cycle top
 }
 TRAIL_DEFAULT_PCT  = 0.012
 TRAIL_MIN_MOVE_PCT = 0.005  # peak must be ≥0.5% beyond T1 before trailing starts
@@ -108,7 +110,7 @@ _BE_PROFIT_PCT = 2.0
 # between _BE_PROFIT_PCT and this %, move the stop only to BREAKEVEN (room to
 # ride, no loss); switch to the tight peak-trail once genuinely profitable.
 # Other strategies (no entry) keep the original "tight-trail at +2%" behaviour.
-_LOCK_TIGHT_PCT = {"breakdown": 3.0, "breakout": 3.0}
+_LOCK_TIGHT_PCT = {"breakdown": 3.0, "breakout": 3.0, "turnaround": 3.0, "peak": 3.0}
 # Near-expiry profit backstop: within this many hours of max-hold, book a still-
 # green position at market rather than let it ride to a flat/near-flat expiry.
 _NEAR_EXPIRY_HRS        = 3.0
