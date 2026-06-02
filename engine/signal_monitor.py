@@ -866,6 +866,19 @@ def _monitor_stocks(sb: Client) -> None:
                 if (not t1_hit) and progress < _TRAIL_ACTIVATE_FRAC \
                    and pnl_pct is not None and pnl_pct >= _BE_PROFIT_PCT:
                     _tp = TRAIL_PEAK_PCT.get(strategy, TRAIL_DEFAULT_PCT)
+                    # Volatility-aware band: a fixed 2% trail is too tight for a
+                    # high-ATR name — MSTR (ATR≈7%) got knocked out by a normal
+                    # ~2% bounce (exit @137.97) while it kept falling to 135.
+                    # Widen toward ~0.5×ATR for volatile names, capped at 3.5% so
+                    # it never gives back an absurd amount. Floored at the
+                    # per-strategy %, so low-vol names are unchanged.
+                    try:
+                        _atr_used = (sig.get("score_breakdown") or {}).get("atr_used")
+                        if _atr_used and entry:
+                            _atr_pct = float(_atr_used) / float(entry)
+                            _tp = max(_tp, min(0.5 * _atr_pct, 0.035))
+                    except Exception:
+                        pass
                     if is_long:
                         _tr = max(entry, peak * (1 - _tp)); _ratchet = _tr > sl + 0.01
                     else:
