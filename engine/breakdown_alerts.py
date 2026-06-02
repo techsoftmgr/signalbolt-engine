@@ -128,6 +128,18 @@ def run(sb=None) -> dict:
     for r in confirm_cands[:_MAX_CONFIRM]:
         if _fire(r, "confirmed"):
             stats["confirmed"] += 1
+        # Confirmed breakdown → also generate the tradeable bearish cards (SHORT
+        # equity + PUT option). Fires + pushes via send_signal_alert; the
+        # unique-active-signal index dedups so re-runs on the same episode no-op.
+        try:
+            from engine import breakdown_signals
+            res = breakdown_signals.generate(sb, r)
+            if res.get("short"):
+                stats["short"] = stats.get("short", 0) + 1
+            if res.get("put"):
+                stats["put"] = stats.get("put", 0) + 1
+        except Exception as _e:
+            logger.debug(f"[breakdown_alerts] signal gen failed: {_e}")
     for r in early_cands[:_MAX_EARLY]:
         if _fire(r, "early"):
             stats["early"] += 1

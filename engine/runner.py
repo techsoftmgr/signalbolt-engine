@@ -193,6 +193,7 @@ STRATEGY_MAX_HOLD_HOURS = {
     "gap_fill":       8.0,    # gap/ORB play — resolves same session
     "pre_market":     8.0,    # pre-market breakout — resolves at/after open
     "swing_trade":    240.0,  # 10 days
+    "breakdown":      240.0,  # 10 days — bearish swing short/put from a breakdown
     "earnings":       48.0,   # 2 days — pre/post earnings move
     "short_squeeze":  24.0,   # 1 day — squeeze resolves quickly
     "position_trade": 720.0,  # 30 days — macro position
