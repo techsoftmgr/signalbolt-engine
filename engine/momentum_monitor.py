@@ -30,9 +30,30 @@ from engine.signal_monitor import _update_sl, _close_signal, _log_event
 logger = logging.getLogger("signalbolt.momentum_monitor")
 
 _ATR_PERIOD   = 22
-_ATR_MULT     = 3.0     # chandelier distance
+_ATR_MULT     = 3.0     # base chandelier distance (let early trends breathe)
 _HIGH_WINDOW  = 22      # rolling extreme for the chandelier anchor
 _SMA_STRUCT   = 50      # structural trend backstop
+
+# ── Profit-scaled trail (locks more of an outsized gain) ──────────────────────
+# A pure 3×ATR chandelier on a high-vol name gives back a lot near the top —
+# MRVL ran +52% (entry 207 → 314) with the stop ~35 pts (3×ATR≈$72) below price,
+# locking only +17%. As the OPEN gain grows we step the ATR multiple DOWN, and
+# never let the stop sit more than _GIVEBACK_CAP below the latest daily close.
+# Tightens only the big winners; normal trends still ride on the full 3×ATR.
+# Still 100% daily-close — no intraday / after-hours wick exits (thin AH prints
+# would just shake a trend follower out, which is the opposite of the goal).
+_PROFIT_TIERS      = ((50.0, 2.0), (25.0, 2.5))  # (open-gain% ≥, atr_mult), high→low
+_GIVEBACK_CAP      = 0.20   # stop never sits >20% below the last close (long)…
+_GIVEBACK_MIN_GAIN = 25.0   # …once the trade is up at least this %
+
+
+def _atr_mult_for_gain(gain_pct: float) -> float:
+    """Tighten the chandelier as the open gain grows: ride early, lock more once
+    the move goes parabolic. Returns the ATR multiple for the current gain."""
+    for thr, mult in _PROFIT_TIERS:     # ordered high → low
+        if gain_pct >= thr:
+            return mult
+    return _ATR_MULT
 
 
 def _atr(df: pd.DataFrame, period: int = _ATR_PERIOD) -> float:
@@ -87,9 +108,23 @@ def manage(sb) -> dict:
             sma50 = float(np.mean(closes[-_SMA_STRUCT:]))
             price = alpaca_client.get_latest_price(ticker) or last_close
 
+            # Open gain off the DAILY close (never the live/AH price) so the
+            # trail stays a pure daily-close decision. The multiple tightens as
+            # the gain grows; the giveback floor caps how far below the close the
+            # stop may sit once deeply profitable.
+            gain_pct = ((last_close - entry) / entry * 100) if is_long \
+                       else ((entry - last_close) / entry * 100)
+            mult = _atr_mult_for_gain(gain_pct)
+            _mtxt = f"{mult:g}×ATR"
+
             if is_long:
                 roll_high  = float(np.max(df["high"].values.astype(float)[-_HIGH_WINDOW:]))
-                chandelier = roll_high - _ATR_MULT * atr
+                chandelier = roll_high - mult * atr
+                # Giveback floor: once up _GIVEBACK_MIN_GAIN, never let the stop
+                # sit more than _GIVEBACK_CAP below the last close. Always below
+                # last_close, so it can't force a spurious exit — only ratchets up.
+                if gain_pct >= _GIVEBACK_MIN_GAIN:
+                    chandelier = max(chandelier, last_close * (1 - _GIVEBACK_CAP))
                 # Exit only on a CONFIRMED daily close below the stop or the
                 # structural SMA50 (trend regime break). Wicks are ignored.
                 if last_close < chandelier or last_close < sma50:
@@ -100,13 +135,17 @@ def manage(sb) -> dict:
                 new_sl = round(max(sl, chandelier), 2)   # ratchet up only
                 if new_sl > sl + 0.01:
                     _update_sl(sb, sig_id, new_sl, sig=sig)
+                    _locked = (new_sl - entry) / entry * 100
                     _log_event(sb, sig_id, "be_move", price=price,
                                note=(f"📈 Chandelier trail → ${new_sl:.2f} "
-                                     f"(3×ATR below {roll_high:.2f}, rides the trend)"))
+                                     f"({_mtxt} below {roll_high:.2f}, locks "
+                                     f"{'+' if _locked >= 0 else ''}{_locked:.0f}%, rides the trend)"))
                     stats["trailed"] += 1
             else:  # SHORT
                 roll_low   = float(np.min(df["low"].values.astype(float)[-_HIGH_WINDOW:]))
-                chandelier = roll_low + _ATR_MULT * atr
+                chandelier = roll_low + mult * atr
+                if gain_pct >= _GIVEBACK_MIN_GAIN:
+                    chandelier = min(chandelier, last_close * (1 + _GIVEBACK_CAP))
                 if last_close > chandelier or last_close > sma50:
                     why = "chandelier" if last_close > chandelier else "SMA50 break"
                     _close_momentum(sb, sig_id, ticker, "SHORT", entry, price, why)
@@ -115,9 +154,11 @@ def manage(sb) -> dict:
                 new_sl = round(min(sl, chandelier), 2)
                 if new_sl < sl - 0.01:
                     _update_sl(sb, sig_id, new_sl, sig=sig)
+                    _locked = (entry - new_sl) / entry * 100
                     _log_event(sb, sig_id, "be_move", price=price,
                                note=(f"📉 Chandelier trail → ${new_sl:.2f} "
-                                     f"(3×ATR above {roll_low:.2f}, rides the trend)"))
+                                     f"({_mtxt} above {roll_low:.2f}, locks "
+                                     f"{'+' if _locked >= 0 else ''}{_locked:.0f}%, rides the trend)"))
                     stats["trailed"] += 1
         except Exception as e:
             logger.debug(f"[momentum_monitor] {sig.get('ticker')} error: {e}")
