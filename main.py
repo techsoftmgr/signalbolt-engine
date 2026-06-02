@@ -3683,6 +3683,26 @@ async def quant_dashboard(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/quant/snapshot")
+async def quant_snapshot(request: Request, tickers: str = ""):
+    """
+    Compact per-ticker quant read for the Watchlist — so each row can show a
+    plain-English "latest setup / trigger" line before the user taps in.
+    `tickers` is a comma-separated list (cap 50). Returns {snapshot: {TICKER: {...}}}.
+    Best-effort; unknown tickers are omitted.
+    """
+    _require_jwt(request)
+    tlist = [t.strip().upper() for t in tickers.split(",") if t.strip()][:50]
+    if not tlist:
+        return {"snapshot": {}}
+    try:
+        from engine.quant_score_service import snapshot as _snapshot
+        return {"snapshot": _snapshot(tlist)}
+    except Exception as e:
+        logger.error(f"GET /quant/snapshot error: {e}")
+        return {"snapshot": {}}
+
+
 @app.get("/quant/breakout-history")
 async def quant_breakout_history(request: Request, days: int = 30, bucket: str = "breakouts"):
     """
