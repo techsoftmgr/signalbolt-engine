@@ -29,6 +29,7 @@ _DEDUP_TTL   = 36 * 3600
 _MAX_CONFIRM = 3
 _MAX_EARLY   = 3
 _MAX_ACCUM   = 3
+_MAX_GEN     = 5               # cap tracked long/call cards generated per run
 
 
 def _strength(r: dict) -> float:
@@ -58,6 +59,8 @@ def run(sb=None) -> dict:
 
     stats = {"scanned": 0, "confirmed": 0, "early": 0, "accum": 0, "seeded": 0,
              "long": 0, "call": 0}
+
+    breakout_now: list[dict] = []   # names CURRENTLY broken out (for tracked cards)
 
     scored = None
     try:
@@ -92,6 +95,13 @@ def run(sb=None) -> dict:
             stats["seeded"] += 1
             continue
 
+        # Track every name currently broken out — used for tracked long/call card
+        # generation (state-based, deduped), so a breakout that confirmed
+        # overnight/pre-market still gets a card at the RTH open even though
+        # there's no fresh transition this scan (mirrors breakdown_alerts).
+        if cur["breakout"]:
+            breakout_now.append(r)
+
         if cur["breakout"] and not prev.get("breakout"):
             confirm_cands.append(r)
         elif (not cur["breakout"]) and cur["near"] and cur["heavyup"] and not prev.get("near"):
@@ -121,6 +131,7 @@ def run(sb=None) -> dict:
         except Exception:
             pass
 
+    # PUSH alerts — only on a genuine new transition (anti-spam), capped.
     for r in confirm_cands[:_MAX_CONFIRM]:
         tk = (r.get("ticker") or "").upper()
         dk = f"bo_alert:{tk}:confirmed:{today}"
@@ -129,14 +140,6 @@ def run(sb=None) -> dict:
             _mark(dk, n)
             if n:
                 stats["confirmed"] += 1
-        # Confirmed breakout → generate the tradeable LONG + CALL cards.
-        try:
-            from engine import breakout_signals
-            res = breakout_signals.generate(sb, r)
-            if res.get("long"): stats["long"] += 1
-            if res.get("call"): stats["call"] += 1
-        except Exception as _e:
-            logger.debug(f"[breakout_alerts] signal gen failed: {_e}")
 
     for r in early_cands[:_MAX_EARLY]:
         tk = (r.get("ticker") or "").upper()
@@ -155,6 +158,37 @@ def run(sb=None) -> dict:
             _mark(dk, n)
             if n:
                 stats["accum"] += 1
+
+    # Tracked bullish cards (LONG equity + CALL) for names CURRENTLY broken out —
+    # STATE-BASED, not just the one-time transition. run() is RTH-gated, so this
+    # fires the tracked card at the regular-session open even when the breakout
+    # confirmed overnight/pre-market or ranked outside the push cap.
+    # _has_active_signal dedups → fires once per episode; capped per run so a
+    # broad rally can't flood. options_scanner needs a live chain, exists at RTH.
+    if sb is not None and breakout_now:
+        breakout_now.sort(key=lambda r: -_strength(r))
+        try:
+            from engine import breakout_signals, runner as _runner
+        except Exception:
+            breakout_signals = None; _runner = None
+        if breakout_signals is not None and _runner is not None:
+            gen = 0
+            for r in breakout_now:
+                if gen >= _MAX_GEN:
+                    break
+                tk = (r.get("ticker") or "").upper()
+                try:
+                    if _runner._has_active_signal(sb, tk, "breakout"):
+                        continue   # already tracked this episode
+                    res = breakout_signals.generate(sb, r)
+                    if res.get("long") or res.get("call"):
+                        gen += 1
+                        if res.get("long"):
+                            stats["long"] += 1
+                        if res.get("call"):
+                            stats["call"] += 1
+                except Exception as _e:
+                    logger.debug(f"[breakout_alerts] signal gen failed for {tk}: {_e}")
 
     logger.info(f"[breakout_alerts] done {stats}")
     return stats
