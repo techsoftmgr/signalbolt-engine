@@ -26,6 +26,13 @@ import logging
 
 logger = logging.getLogger("signalbolt.breakdown_signals")
 
+# Stop-width guards. These detector cards bypass sl_tp_engine (which caps SL%),
+# so without this a post-parabolic name with a fat ATR gets an absurd stop —
+# e.g. MRVL ran +46% off its 20-day MA, ATR≈6%, so a flat 1.5·ATR stop was
+# −10% from entry. Clamp every stop into a sane [MIN, MAX]% band off entry.
+_MAX_STOP_PCT = 0.05    # never risk more than 5% on a 0.25x detector card
+_MIN_STOP_PCT = 0.015   # …but at least 1.5%, so normal noise can't nick us
+
 
 def _conf(r: dict) -> int:
     """Confidence in the SHORT, derived from the breakdown's selling pressure."""
@@ -61,7 +68,14 @@ def generate(sb, r: dict) -> dict:
     conf    = _conf(r)
 
     entry = round(float(price), 2)
-    stop  = round(entry + 1.5 * atr, 2)          # just above the broken level
+    # Stop above entry (short). Start from 1.5·ATR; if the broken level sits
+    # just above entry (price already below it), hug that level instead of a
+    # wider ATR stop; then clamp the risk into the [MIN, MAX]% band.
+    raw_stop = entry + 1.5 * atr
+    if lo and float(lo) > entry:                 # broken 20-day low above price
+        raw_stop = min(raw_stop, float(lo) + 0.3 * atr)
+    raw_stop = max(entry * (1 + _MIN_STOP_PCT), min(entry * (1 + _MAX_STOP_PCT), raw_stop))
+    stop  = round(raw_stop, 2)                    # just above the broken level
     t1    = round(entry - 1.5 * atr, 2)
     t2    = round(entry - 3.0 * atr, 2)
     rr    = round((entry - t1) / (stop - entry), 2) if stop > entry else None
