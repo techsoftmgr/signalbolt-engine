@@ -3710,7 +3710,12 @@ async def quant_snapshot(request: Request, tickers: str = ""):
         return {"snapshot": {}}
     try:
         from engine.quant_score_service import snapshot as _snapshot
-        return {"snapshot": _snapshot(tlist)}
+        try:
+            from engine.session_classifier import market_session
+            _session = market_session()
+        except Exception:
+            _session = None
+        return {"snapshot": _snapshot(tlist), "marketSession": _session}
     except Exception as e:
         logger.error(f"GET /quant/snapshot error: {e}")
         return {"snapshot": {}}
@@ -3955,14 +3960,23 @@ async def ticker_overview(request: Request, symbol: str):
     except Exception as e:
         logger.debug(f"GET /ticker/{sym}/overview earnings error: {e}")
 
+    # Session label so the hub can flag "confirmed after-hours — watch the open"
+    # without firing any overnight push (signals stay RTH-only).
+    try:
+        from engine.session_classifier import market_session
+        _session = market_session()
+    except Exception:
+        _session = None
+
     return {
-        "ticker":       sym,
-        "price":        price,
-        "quant":        quant,
-        "news":         news,
-        "performance":  performance,
-        "trackRecord":  track_record,
-        "nextEarnings": next_earnings,
+        "ticker":        sym,
+        "price":         price,
+        "quant":         quant,
+        "news":          news,
+        "performance":   performance,
+        "trackRecord":   track_record,
+        "nextEarnings":  next_earnings,
+        "marketSession": _session,
     }
 
 

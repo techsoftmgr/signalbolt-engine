@@ -217,6 +217,21 @@ def today_close_mins_et() -> int:
     return close_mins or (16 * 60)
 
 
+def market_session() -> str:
+    """Coarse session label for the UI — one of:
+        'open'       regular trading hours (9:30 → close)
+        'premarket'  a trading day, before the open
+        'afterhours' a trading day, after the close
+        'closed'     weekend / NYSE holiday (no session today)
+    Used to flag "confirmed after-hours — watch the open" heads-ups without
+    firing an overnight push (signals still fire RTH-only)."""
+    if is_market_open_now():
+        return "open"
+    if not is_market_open_today():
+        return "closed"
+    return "premarket" if _et_minutes() < MARKET_OPEN else "afterhours"
+
+
 def _fomc_active_now() -> bool:
     """FOMC announcement usually at 2:00 PM ET — block 1:30-2:30 PM window."""
     if not _is_fomc_day():
