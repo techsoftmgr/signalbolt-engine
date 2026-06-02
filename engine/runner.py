@@ -315,8 +315,33 @@ def _ensure_stream_subscription(ticker: str, cap: int | None = None) -> None:
         logger.debug(f"[runner] stream subscribe failed for {ticker}: {e}")
 
 
+_MIN_SIGNAL_PRICE = 2.0   # hard floor — penny/sub-penny names have wide spreads
+
+
+def _is_untradeable(ticker: str, price) -> bool:
+    """Block penny stocks and warrants/units/rights from EVER firing a signal.
+    Belt-and-suspenders behind the prescreener's mover filter — covers every
+    fire path (SMC, breakout/breakdown, momentum, predictive). HUBCW (a $0.05
+    warrant) lost -31.8% in 9 min; never again."""
+    sym = (ticker or "").upper()
+    if len(sym) == 5 and sym[-1] in ("W", "U", "R"):   # warrant / unit / rights
+        return True
+    try:
+        if price is not None and float(price) < _MIN_SIGNAL_PRICE:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
 def _write_signal(sb: Client, row: dict) -> str | None:
     """Insert signal row, log the 'fired' event, and return the new signal ID."""
+    if _is_untradeable(row.get("ticker", ""), row.get("entry_price")):
+        logger.info(
+            f"[runner] BLOCKED untradeable signal {row.get('ticker')} "
+            f"@ {row.get('entry_price')} (penny/warrant) — not firing"
+        )
+        return None
     # Capture the ORIGINAL stop at fire time. The monitors mutate stop_loss in
     # place as they trail it, so without this the fired level is lost — and the
     # UI can't show users that the stop was RAISED. Done here so every fire path
