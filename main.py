@@ -302,8 +302,12 @@ def _alpaca_stock_snapshots(symbols: list[str]) -> dict:
     try:
         from alpaca.data.requests import StockSnapshotRequest
 
+        # feed="sip" = full consolidated tape (paid plan), SAME as get_bars /
+        # get_latest_price. Without it the snapshot defaults to IEX (thin/partial
+        # feed) — so the displayed live price could disagree with the SIP-based
+        # signal engine and a broker (ThinkOrSwim) real-time quote.
         snapshots = _alpaca_data_client.get_stock_snapshot(
-            StockSnapshotRequest(symbol_or_symbols=symbols)
+            StockSnapshotRequest(symbol_or_symbols=symbols, feed="sip")
         )
 
         session = _market_session()
@@ -917,10 +921,19 @@ def get_prices(tickers: str):
             fresh.update(poly)
 
         # ── 3. yfinance last resort, one by one ───────────────────────
+        # NOTE: yfinance is DELAYED. If we're hitting this for liquid names,
+        # the paid Alpaca SIP feed failed — log loudly so we can see it (a
+        # silent fallback here is what makes prices disagree with the broker).
         still_missing = [s for s in to_fetch if s not in fresh]
+        if still_missing:
+            logger.warning(
+                f"[prices] Alpaca SIP + Polygon missed {still_missing} — "
+                f"falling back to DELAYED yfinance. Check Alpaca data entitlement/limits."
+            )
         for sym in still_missing:
             data = _yf_price(sym)
             if data:
+                data = {**data, "delayed": True, "source": "yfinance"}
                 fresh[sym] = data
 
         # ── Store in BOTH cache layers and merge into result ──────────
