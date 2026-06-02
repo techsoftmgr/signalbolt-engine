@@ -163,6 +163,23 @@ def _normalize(value: float, lo: float, hi: float) -> float:
     return float(np.clip((value - lo) / (hi - lo) * 100, 0, 100))
 
 
+def _empty_dashboard(warming: bool = False) -> dict:
+    """Full dashboard SHAPE with empty buckets — served on the web when the
+    precomputed cache isn't ready, so we never block on an inline rebuild. The
+    app renders empty buckets gracefully (and can show a 'warming up' hint)."""
+    return {
+        "marketRegime": {
+            "label":       "Neutral",
+            "description": "Refreshing market data…" if warming else _regime_description("Neutral"),
+            "color":       _regime_color("Neutral"),
+        },
+        "topMomentum": [], "pullbacks": [], "breakouts": [], "breakdowns": [],
+        "highVolumeUp": [], "highVolumeDown": [], "vwapReclaim": [],
+        "oversoldBounce": [], "turnaround": [], "peak": [], "allScored": [],
+        "warming": warming,
+    }
+
+
 def get_quant_dashboard(symbols: Optional[list[str]] = None, force: bool = False) -> dict:
     """
     Returns the full quant dashboard payload:
@@ -196,6 +213,15 @@ def get_quant_dashboard(symbols: Optional[list[str]] = None, force: bool = False
                 return cached
         except Exception:
             pass
+        # Cold cache (no in-process + no Redis) on a NON-force (web) call: do NOT
+        # rebuild inline. Scoring ~150 names — incl. the heavy turnaround / peak /
+        # cycle_context detectors — blocks the request 10-20s and trips the app's
+        # 6s timeout ("engine unreachable", e.g. the Cycle screen right after a
+        # deploy). Serve a lightweight 'warming' payload instead; the worker
+        # precompute (force=True, every 3 min) fills the real cache shortly. Only
+        # force, or an explicit custom symbol list, builds inline.
+        if symbols is None:
+            return _empty_dashboard(warming=True)
 
     result = _build_dashboard(symbols or _scan_universe())
     if result:
