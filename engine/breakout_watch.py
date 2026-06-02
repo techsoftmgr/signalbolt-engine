@@ -26,7 +26,12 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger("signalbolt.breakout_watch")
 
-EXPIRE_DAYS = 5          # WATCHING expires after this many days with no breakout
+EXPIRE_DAYS    = 5       # WATCHING expires after this many days with no breakout
+FADE_GRACE_MIN = 45      # keep a WATCHING episode open through brief flickers out
+                         # of the bucket; only FADE after it's been gone this long
+                         # (names hovering AT the level pop in/out each scan and
+                         # would otherwise spawn many tiny FADED episodes — e.g.
+                         # GOOGL logged 4 near its 20-day low in one session).
 _TABLE      = "breakout_watch_history"
 
 
@@ -124,8 +129,22 @@ def sync_watch(sb, watch_rows: list[dict], *, bucket: str = "breakouts",
             reason = "EXPIRED"
         elif not in_cur and state == "TRIGGERED":
             reason = "TRIGGERED"   # broke out then left — judge forward outcome later
+        elif not in_cur and state == "WATCHING":
+            # Grace period: a name hovering AT the level flickers in/out of the
+            # bucket between scans. Don't FADE on the first absence — keep the one
+            # watch open until it's been GONE for FADE_GRACE_MIN (collapses churn
+            # into a single episode instead of many tiny FADEs).
+            try:
+                last_seen = datetime.fromisoformat(
+                    (ep.get("last_seen_at") or ep["entered_at"]).replace("Z", "+00:00"))
+                gone_min = (now - last_seen).total_seconds() / 60.0
+            except Exception:
+                gone_min = 1e9
+            if gone_min < FADE_GRACE_MIN:
+                continue           # brief pop-out — keep the watch open
+            reason = "FADED"
         elif not in_cur:
-            reason = "FADED"       # left the bucket (never broke, or trigger-less bucket)
+            reason = "FADED"       # trigger-less bucket left the bucket
         else:
             continue               # still live and not stale — leave open
         try:
