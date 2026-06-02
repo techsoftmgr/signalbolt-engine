@@ -194,6 +194,7 @@ STRATEGY_MAX_HOLD_HOURS = {
     "pre_market":     8.0,    # pre-market breakout — resolves at/after open
     "swing_trade":    240.0,  # 10 days
     "breakdown":      240.0,  # 10 days — bearish swing short/put from a breakdown
+    "breakout":       240.0,  # 10 days — bullish swing long/call from a breakout
     "earnings":       48.0,   # 2 days — pre/post earnings move
     "short_squeeze":  24.0,   # 1 day — squeeze resolves quickly
     "position_trade": 720.0,  # 30 days — macro position
@@ -2730,6 +2731,29 @@ def start_scheduler() -> BackgroundScheduler:
         next_run_time=datetime.now(timezone.utc) + timedelta(seconds=150),
     )
     logger.info("[runner] Scheduled breakdown alerts every 15 min")
+
+    # ── Breakout / unusual-buying alerts (universe-wide, 15-min) ─────────────
+    # Bullish mirror: EARLY (pressing 20-day high on up-vol) + CONFIRMED (broke
+    # the high → also generates LONG + CALL cards) + ACCUMULATION (heavy buying).
+    def _run_breakout_alerts():
+        try:
+            from engine.session_classifier import is_market_open_now
+            if not is_market_open_now():
+                return
+            from engine import breakout_alerts
+            breakout_alerts.run(_supabase())
+        except Exception as _e:
+            logger.error(f"[runner] breakout alerts failed: {_e}")
+
+    scheduler.add_job(
+        _run_breakout_alerts,
+        trigger=IntervalTrigger(minutes=15),
+        id="breakout_alerts",
+        name="Breakout / unusual-buying alerts (15-min)",
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=180),
+    )
+    logger.info("[runner] Scheduled breakout alerts every 15 min")
 
     # ── Community social snapshot (hourly, 24/7) ────────────────────────────
     # Captures the merged trending feed + price-at-capture into social_snapshots.

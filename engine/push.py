@@ -37,6 +37,8 @@ _DEFAULT_PREFS = {
     "cycle_signals":  True,   # turnaround Buy-Zone / Peak distribution alerts
     "watchlist_alerts": True, # watched ticker changed state (buy zone / topping / breakout / trend lost)
     "breakdown_alerts": True, # universe-wide heavy-selling / breakdown-risk alerts
+    "breakout_alerts":  True, # universe-wide breakout alerts (broke 20-day high on vol)
+    "accumulation_alerts": True, # universe-wide unusual-buying (heavy up-volume) alerts
 }
 
 # Single Supabase client reused for the lifetime of the process
@@ -327,6 +329,96 @@ def send_breakdown_alert(
         return len(messages)
     except Exception as e:
         logger.debug(f"[push] breakdown alert failed for {ticker}: {e}")
+        return 0
+
+
+def send_breakout_alert(
+    ticker: str,
+    stage: str,
+    price: float | None = None,
+    extra: str = "",
+) -> int:
+    """
+    Broadcast a breakout alert to ALL users with 'breakout_alerts' on (default on).
+    Bullish mirror of send_breakdown_alert — universe-wide.
+
+      stage="early"     → approaching its 20-day high on strong up-volume (setup forming)
+      stage="confirmed" → broke its 20-day high on volume (breakout confirmed)
+
+    Educational momentum heads-up. Returns the number dispatched; caller handles
+    ranking, per-run caps and per-day dedup.
+    """
+    try:
+        px   = f" (${price:.2f})" if price else ""
+        suff = f" · {extra}" if extra else ""
+        if stage == "confirmed":
+            title = f"🚀 {ticker} — Breakout confirmed"
+            body  = f"{ticker} broke its 20-day high on volume{px}{suff}. Momentum breakout. Tap for the read."
+        else:
+            title = f"⏫ {ticker} — Breakout setup"
+            body  = f"{ticker} is pressing its 20-day high on strong buying{px}{suff}. A breakout may be forming. Tap for the read."
+
+        _record_alert("breakout", ticker, title, body, stage=stage,
+                      data={"ticker": ticker, "stage": stage})
+
+        tokens = _tokens_for("breakout_alerts", default=True)
+        if not tokens:
+            return 0
+        messages = [
+            {
+                "to":    t,
+                "title": title,
+                "body":  body,
+                "data":  {"type": "breakout_alert", "ticker": ticker, "stage": stage},
+                "sound": "default",
+                "badge": 1,
+            }
+            for t in tokens
+        ]
+        _dispatch(messages, f"BREAKOUT {stage} {ticker}")
+        return len(messages)
+    except Exception as e:
+        logger.debug(f"[push] breakout alert failed for {ticker}: {e}")
+        return 0
+
+
+def send_accumulation_alert(
+    ticker: str,
+    price: float | None = None,
+    extra: str = "",
+) -> int:
+    """
+    Broadcast an unusual-buying / accumulation alert to ALL users with
+    'accumulation_alerts' on (default on). A lighter heads-up than a breakout —
+    heavy UP-volume (big buyers stepping in) without a structural break yet.
+    Returns the number dispatched; caller handles caps + per-day dedup.
+    """
+    try:
+        px   = f" (${price:.2f})" if price else ""
+        suff = f" · {extra}" if extra else ""
+        title = f"🟢 {ticker} — Unusual buying"
+        body  = f"{ticker} is trading on heavy up-volume{px}{suff} — big buyers may be stepping in. Tap for the read."
+        _record_alert("accumulation", ticker, title, body,
+                      data={"ticker": ticker})
+
+        tokens = _tokens_for("accumulation_alerts", default=True)
+        if not tokens:
+            return 0
+        messages = [
+            {
+                "to":    t,
+                "title": title,
+                "body":  body,
+                "data":  {"type": "accumulation_alert", "ticker": ticker},
+                "sound": "default",
+                "badge": 1,
+            }
+            for t in tokens
+        ]
+        _dispatch(messages, f"ACCUM {ticker}")
+        return len(messages)
+    except Exception as e:
+        logger.debug(f"[push] accumulation alert failed for {ticker}: {e}")
         return 0
 
 
