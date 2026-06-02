@@ -34,6 +34,7 @@ _STATE_TTL   = 3 * 24 * 3600   # remember a ticker's state for 3 days
 _DEDUP_TTL   = 36 * 3600       # one alert per ticker/stage per ~day
 _MAX_EARLY   = 3               # cap EARLY pushes per run (anti-flood)
 _MAX_CONFIRM = 3               # cap CONFIRMED pushes per run
+_MAX_GEN     = 5               # cap tracked short/put cards generated per run
 
 
 def _heavy_down(r: dict) -> bool:
@@ -84,6 +85,7 @@ def run(sb=None) -> dict:
 
     early_cands: list[dict] = []
     confirm_cands: list[dict] = []
+    breakdown_now: list[dict] = []   # names CURRENTLY in breakdown (for tracked cards)
 
     for r in scored:
         tk = (r.get("ticker") or "").upper()
@@ -97,6 +99,13 @@ def run(sb=None) -> dict:
             cache.kv.set_json(f"bd_state:{tk}", cur, _STATE_TTL)
             stats["seeded"] += 1
             continue
+
+        # Track every name currently breaking down — used for tracked short/put
+        # card generation (state-based, deduped), so a breakdown that confirmed
+        # overnight/pre-market still gets a card at the RTH open even though
+        # there's no fresh transition this scan.
+        if cur["breakdown"]:
+            breakdown_now.append(r)
 
         # CONFIRMED: just entered the breakdown bucket (broke 20-day low on vol).
         if cur["breakdown"] and not prev.get("breakdown"):
@@ -125,24 +134,45 @@ def run(sb=None) -> dict:
             logger.info(f"[breakdown_alerts] {tk} {stage} -> pushed {n}")
         return n
 
+    # PUSH alerts — only on a genuine new transition (anti-spam), capped.
     for r in confirm_cands[:_MAX_CONFIRM]:
         if _fire(r, "confirmed"):
             stats["confirmed"] += 1
-        # Confirmed breakdown → also generate the tradeable bearish cards (SHORT
-        # equity + PUT option). Fires + pushes via send_signal_alert; the
-        # unique-active-signal index dedups so re-runs on the same episode no-op.
-        try:
-            from engine import breakdown_signals
-            res = breakdown_signals.generate(sb, r)
-            if res.get("short"):
-                stats["short"] = stats.get("short", 0) + 1
-            if res.get("put"):
-                stats["put"] = stats.get("put", 0) + 1
-        except Exception as _e:
-            logger.debug(f"[breakdown_alerts] signal gen failed: {_e}")
     for r in early_cands[:_MAX_EARLY]:
         if _fire(r, "early"):
             stats["early"] += 1
+
+    # Tracked bearish cards (SHORT equity + PUT) for names CURRENTLY breaking
+    # down — STATE-BASED, not just the one-time transition. run() is RTH-gated,
+    # so this fires the tracked card at the regular-session open even when the
+    # breakdown confirmed overnight/pre-market (the GOOGL case) or ranked outside
+    # the push cap. _has_active_signal dedups → fires once per episode; capped
+    # per run so a broad selloff can't flood. options_scanner needs a live chain,
+    # which exists at RTH.
+    if sb is not None and breakdown_now:
+        breakdown_now.sort(key=lambda r: -_pressure(r))
+        try:
+            from engine import breakdown_signals, runner as _runner
+        except Exception:
+            breakdown_signals = None; _runner = None
+        if breakdown_signals is not None and _runner is not None:
+            gen = 0
+            for r in breakdown_now:
+                if gen >= _MAX_GEN:
+                    break
+                tk = (r.get("ticker") or "").upper()
+                try:
+                    if _runner._has_active_signal(sb, tk, "breakdown"):
+                        continue   # already tracked this episode
+                    res = breakdown_signals.generate(sb, r)
+                    if res.get("short") or res.get("put"):
+                        gen += 1
+                        if res.get("short"):
+                            stats["short"] = stats.get("short", 0) + 1
+                        if res.get("put"):
+                            stats["put"] = stats.get("put", 0) + 1
+                except Exception as _e:
+                    logger.debug(f"[breakdown_alerts] signal gen failed for {tk}: {_e}")
 
     logger.info(f"[breakdown_alerts] done {stats}")
     return stats
