@@ -1699,12 +1699,26 @@ async def sync_subscription(request: Request):
     try:
         sb = _make_supabase()
 
-        res = sb.table("profiles").select("email, subscription_status, subscription_synced_at").eq("id", user_id).single().execute()
+        res = sb.table("profiles").select("email, subscription_status, subscription_synced_at, is_admin").eq("id", user_id).single().execute()
         row = res.data or {}
         if not email:
             email = row.get("email", "")
 
         current_status = row.get("subscription_status", "free")
+
+        # Comp access: admin / owner accounts are never downgraded by Stripe sync
+        # (they have no paid Stripe subscription but should retain full Pro+ for
+        # testing / internal use). Keep them pinned to pro_plus.
+        if row.get("is_admin") is True:
+            if current_status != "pro_plus":
+                from datetime import timezone as _tz0
+                sb.table("profiles").update({
+                    "subscription_status":   "pro_plus",
+                    "tier":                  "pro_plus",
+                    "free_ends_at":          None,
+                    "subscription_synced_at": datetime.now(_tz0.utc).isoformat(),
+                }).eq("id", user_id).execute()
+            return {"subscription_status": "pro_plus", "comp": True}
 
         # Skip Stripe call if synced within 6 hours and not forced
         if not force:
