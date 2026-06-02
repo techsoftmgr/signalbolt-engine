@@ -78,6 +78,8 @@ TRAIL_PEAK_PCT = {
     "dark_pool":    0.010,
     "swing_trade":  0.020,   # 2.0% below peak — room for multi-day breathing
     "vwap_reclaim": 0.010,
+    "breakdown":    0.020,   # daily swing short — same breathing room as swing
+    "breakout":     0.020,   # daily swing long
 }
 TRAIL_DEFAULT_PCT  = 0.012
 TRAIL_MIN_MOVE_PCT = 0.005  # peak must be ≥0.5% beyond T1 before trailing starts
@@ -94,6 +96,11 @@ _BE_PROTECT_SCORE = 40
 # for 2 days and expired ~flat). Floored at breakeven, ratchets up only, uses
 # the loose per-strategy TRAIL_PEAK_PCT so swings aren't whipsawed.
 _TRAIL_ACTIVATE_FRAC = 0.6
+# Absolute-profit early lock: once a position is up at least this %, ratchet the
+# stop (floored at breakeven) EVEN if it's nowhere near T1 — so a far-target
+# swing (breakdown short: T1 ≈ -1.5 ATR ≈ -10%+) doesn't round-trip a +2-3% gain
+# while waiting for the 60%-to-T1 trail. Tightens the stop only; never closes.
+_BE_PROFIT_PCT = 2.0
 # Near-expiry profit backstop: within this many hours of max-hold, book a still-
 # green position at market rather than let it ride to a flat/near-flat expiry.
 _NEAR_EXPIRY_HRS        = 3.0
@@ -849,6 +856,29 @@ def _monitor_stocks(sb: Client) -> None:
                 _denom   = (t1 - entry) if is_long else (entry - t1)
                 progress = (((peak - entry) if is_long else (entry - peak)) / _denom) if _denom else 0.0
                 t1_hit   = (is_long and price >= t1) or (not is_long and price <= t1)
+
+                # ── Pre-T1 ABSOLUTE-PROFIT lock ───────────────────────────────
+                # Far-target swings (breakdown shorts: T1 ≈ -10%+) would otherwise
+                # give back a +2-3% gain while waiting for the 60%-to-T1 trail. Once
+                # up _BE_PROFIT_PCT, ratchet the stop via the peak formula (floored
+                # at breakeven) so the gain is protected. Tightens only (never
+                # loosens, never closes). Direction-aware.
+                if (not t1_hit) and progress < _TRAIL_ACTIVATE_FRAC \
+                   and pnl_pct is not None and pnl_pct >= _BE_PROFIT_PCT:
+                    _tp = TRAIL_PEAK_PCT.get(strategy, TRAIL_DEFAULT_PCT)
+                    if is_long:
+                        _tr = max(entry, peak * (1 - _tp)); _ratchet = _tr > sl + 0.01
+                    else:
+                        _tr = min(entry, peak * (1 + _tp)); _ratchet = _tr < sl - 0.01
+                    if _ratchet:
+                        _tr = round(_tr, 2)
+                        _locked = ((_tr - entry) / entry * 100) if is_long else ((entry - _tr) / entry * 100)
+                        _update_sl(sb, sig["id"], _tr, sig=sig)
+                        _log_event(sb, sig["id"], "be_move", price=price,
+                                   note=(f"🔒 Early profit lock → ${_tr:.2f} "
+                                         f"(up {pnl_pct:.1f}%, locks +{_locked:.1f}%) — no need to wait for T1"))
+                        logger.info(f"[monitor] {ticker} early profit-lock → {_tr:.2f} "
+                                    f"(pnl {pnl_pct:+.1f}%, locks +{_locked:.1f}%)")
                 # EMA_RECLAIM trend-reclaim signals ride the move on the 15m
                 # 20-EMA and SKIP the convergence early-exit — the point is to
                 # not cut these winners early (HOOD/CRWD trend days).
