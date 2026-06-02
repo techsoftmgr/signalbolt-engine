@@ -212,6 +212,75 @@ def get_quant_dashboard(symbols: Optional[list[str]] = None, force: bool = False
     return result
 
 
+# Compact fields the watchlist needs to render a plain-English setup line.
+_SNAPSHOT_KEEP = (
+    "price", "ma20", "atrPct", "rsi", "relativeVolume", "dayChangePct",
+    "trendScore", "momentumScore", "macdRising", "momentumAccelerating",
+    "setupType", "setupReason", "watchStatus", "finalQuantScore",
+    "breakoutLevel", "breakdownLevel", "distToBreakoutPct",
+    "turnaroundStage", "peakStage",
+)
+
+
+def snapshot(tickers: list[str]) -> dict:
+    """Compact per-ticker quant read for the watchlist (price + current setup
+    signals) so each row can show a plain-English "latest setup" line WITHOUT a
+    per-ticker round trip. Reuses the cached full universe scan for names already
+    scored; scores any remaining (custom) tickers on demand in one batched fetch.
+    Best-effort — missing/failed tickers are simply omitted.
+    """
+    out: dict = {}
+    syms = [t.upper().strip() for t in (tickers or []) if t and t.strip()][:50]
+    if not syms:
+        return out
+
+    # 1) Reuse the cached full scan (refreshed every few min by the worker).
+    cached: dict = {}
+    try:
+        for r in (cache.kv.get_json(_SCORED_KEY) or []):
+            tk = r.get("ticker")
+            if tk:
+                cached[tk] = r
+    except Exception:
+        cached = {}
+
+    # 2) Score the ones not in the universe (custom watchlist tickers), batched.
+    missing = [t for t in syms if t not in cached]
+    scored_missing: dict = {}
+    if missing:
+        try:
+            from engine.alpaca_client import get_multi_bars, get_latest_prices
+            from engine import regime_detector
+            daily      = get_multi_bars(missing, timeframe="1Day", days=25) or {}
+            daily_long = _get_long_bars(missing) or {}
+            intraday   = get_multi_bars(missing, timeframe="5Min", days=2) or {}
+            prices     = get_latest_prices(missing) or {}
+            try:
+                regime_type = (regime_detector.detect() or {}).get("regime_type")
+            except Exception:
+                regime_type = None
+            spy_long = daily_long.get("SPY") if isinstance(daily_long, dict) else None
+            for tk in missing:
+                try:
+                    row = _score_ticker(
+                        tk, prices.get(tk), daily.get(tk), intraday.get(tk),
+                        daily_long_df=daily_long.get(tk), regime_type=regime_type,
+                        spy_long_df=spy_long,
+                    )
+                    if row:
+                        scored_missing[tk] = row
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"[quant.snapshot] scoring missing tickers failed: {e}")
+
+    for tk in syms:
+        r = cached.get(tk) or scored_missing.get(tk)
+        if r:
+            out[tk] = {k: r.get(k) for k in _SNAPSHOT_KEEP}
+    return out
+
+
 def _enrich_breakouts(result: dict) -> None:
     """Add lifecycle state + catalyst + R:R to each breakout row, plus a top-level
     Watch Accuracy summary. Best-effort — never breaks the dashboard."""
