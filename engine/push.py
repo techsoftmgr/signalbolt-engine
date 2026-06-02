@@ -597,6 +597,29 @@ def send_cycle_alert(ticker: str, kind: str, sb: Client | None = None) -> int:
         return 0
 
 
+# Terminal / result notifications that should ALSO land in the in-app Alerts feed
+# (Target Hit / Stop Hit / Time Exit / Market Close / book-profit / reversal).
+_FEED_RESULT_TYPES = {
+    "signal_closed", "market_close", "scalp_expired", "option_expired",
+    "book_profit", "reversal",
+}
+
+
+def _held_suffix(created_at: str | None) -> str:
+    """' · opened Jun 02 · 3d held' from a signal's created_at (UTC ISO) — so a
+    matured multi-day swing result doesn't read like a stale alert. '' on error."""
+    if not created_at:
+        return ""
+    try:
+        from datetime import datetime, timezone
+        dt   = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+        days = max(0, (datetime.now(timezone.utc) - dt).days)
+        held = f"{days}d held" if days >= 1 else "same day"
+        return f" · opened {dt.strftime('%b %d')} · {held}"
+    except Exception:
+        return ""
+
+
 def _send_raw(
     title: str,
     body: str,
@@ -613,6 +636,19 @@ def _send_raw(
     """
     payload = data or {}
     notif_type = payload.get("type", "")
+
+    # Terminal results: append a hold-duration suffix (so a matured multi-day
+    # swing doesn't read as stale) and record to the in-app Alerts feed — both
+    # independent of push delivery, so closes show in the Alerts tab too.
+    if notif_type in _FEED_RESULT_TYPES:
+        suffix = _held_suffix(payload.get("created_at"))
+        if suffix and suffix not in (body or ""):
+            body = f"{body}{suffix}"
+        try:
+            _record_alert("result", payload.get("ticker"), title, body,
+                          stage=payload.get("result") or notif_type, data=payload)
+        except Exception:
+            pass
 
     # Special case: signal_closed result=loss → stop_hit pref
     if notif_type == "signal_closed" and payload.get("result") == "loss":
