@@ -938,14 +938,14 @@ def _close_rt_signal(sig: dict, hit: str, price: float) -> None:
                     title=f"✅ T2 Hit — {ticker}  +{pnl_pct:.1f}%",
                     body=f"{sig['direction']} {(sig.get('strategy_type') or 'signal').replace('_',' ')} closed at full target.",
                     data={"type": "signal_closed", "result": "win", "ticker": ticker,
-                          "signal_id": str(sig["id"])},
+                          "signal_id": str(sig["id"]), "created_at": sig.get("created_at")},
                 )
             else:
                 _push._send_raw(
                     title=f"🔴 Stop Hit — {ticker}  {pnl_pct:.1f}%",
                     body=f"{sig['direction']} stopped out. Position closed.",
                     data={"type": "signal_closed", "result": "loss", "ticker": ticker,
-                          "signal_id": str(sig["id"])},
+                          "signal_id": str(sig["id"]), "created_at": sig.get("created_at")},
                 )
         except Exception as _push_e:
             logger.warning(f"[stream] RT close push failed for {sig.get('id')}: {_push_e}")

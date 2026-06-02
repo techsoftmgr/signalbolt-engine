@@ -455,6 +455,7 @@ def _detect_structure_reversal(ticker: str, direction: str) -> bool:
 def _push_market_close(
     ticker: str, direction: str, strategy: str,
     pnl_pct: float | None = None, signal_id: str | None = None,
+    created_at: str | None = None,
 ) -> None:
     if pnl_pct is not None and pnl_pct > 0:
         title = f"✅ {ticker} closed +{pnl_pct:.1f}% — Market Close"
@@ -468,6 +469,8 @@ def _push_market_close(
     data: dict = {"type": "market_close", "ticker": ticker}
     if signal_id:
         data["signal_id"] = signal_id
+    if created_at:
+        data["created_at"] = created_at
     push._send_raw(title=title, body=body, data=data)
 
 
@@ -547,18 +550,21 @@ def _push_scalp_expired(ticker: str, direction: str, signal_id: str | None = Non
     )
 
 
-def _push_closed(ticker: str, direction: str, result: str, pct: float) -> None:
+def _push_closed(ticker: str, direction: str, result: str, pct: float,
+                 created_at: str | None = None) -> None:
     if result == "win":
         push._send_raw(
             title=f"✅ Target Hit — {ticker} +{pct:.1f}%",
             body=f"{direction} signal closed with a win.",
-            data={"type": "signal_closed", "result": "win", "ticker": ticker},
+            data={"type": "signal_closed", "result": "win", "ticker": ticker,
+                  "created_at": created_at},
         )
     elif result == "loss":
         push._send_raw(
             title=f"🔴 Stop Hit — {ticker} {pct:.1f}%",
             body=f"{direction} signal stopped out.",
-            data={"type": "signal_closed", "result": "loss", "ticker": ticker},
+            data={"type": "signal_closed", "result": "loss", "ticker": ticker,
+                  "created_at": created_at},
         )
 
 
@@ -699,7 +705,8 @@ def _monitor_stocks(sb: Client) -> None:
                            note=f"Market closing — {direction} exited at ${price:.2f} {pnl_str}".strip()
                                 if price else f"Market closing — {direction} position force-closed")
                 try:
-                    _push_market_close(ticker, direction, strategy, pnl_pct, signal_id=sig_id_str)
+                    _push_market_close(ticker, direction, strategy, pnl_pct,
+                                       signal_id=sig_id_str, created_at=sig.get("created_at"))
                 except Exception as _pe:
                     logger.warning(f"[monitor] market-close push failed for {sig_id_str}: {_pe}")
                 continue
@@ -1248,7 +1255,8 @@ def _monitor_options(sb: Client) -> None:
                     _log_event(sb, sig["id"], event_type, price=price, note=event_note)
                     logger.info(f"[monitor] Option {ticker} {result} — premium {entry_prem:.2f}→{est_prem:.2f} ({pct:+.1f}%)")
                     try:
-                        _push_closed(ticker, direction, result, pct)
+                        _push_closed(ticker, direction, result, pct,
+                                     created_at=sig.get("created_at"))
                     except Exception:
                         pass
         except Exception as e:
