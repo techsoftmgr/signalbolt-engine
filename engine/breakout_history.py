@@ -211,6 +211,22 @@ def judge_path(bars, anchor_ts, anchor_px, *, horizon_days: int = HORIZON_DAYS,
         "daysHeld":  days_held,
         "curve":     curve,
     })
+
+    # Prepend the ENTRY day (anchor) as the curve's day-0 origin, so the track
+    # record visibly STARTS on the date you got in (e.g. June 1) at its 0%
+    # baseline. The forward curve deliberately begins the day AFTER entry (the
+    # real holding window) for outcome math — but hiding the entry day made it
+    # look like June 1 had "no %". This is display-only: outcome / resultPct /
+    # mfe / mae / daysHeld above are all computed from the forward window first.
+    try:
+        out["curve"] = [{
+            "day": 0,
+            "date": anchor_ts.date().isoformat(),
+            "close": round(anchor_px, 2),
+            "pctFromAnchor": 0.0,
+        }] + out["curve"]
+    except Exception:
+        pass
     return out
 
 
