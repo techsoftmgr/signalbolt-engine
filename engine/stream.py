@@ -1254,6 +1254,21 @@ def _warn_near_stop(sig: dict, price: float) -> None:
         logger.debug(f"[stream] Near-stop warn failed for {sig.get('id')}: {e}")
 
 
+def _is_rth_now() -> bool:
+    """Regular US trading hours (9:30 AM–4:00 PM ET, Mon–Fri). Cheap + real-time
+    (no calendar/network) — gates real-time EXITS so we don't close trades on
+    thin, unfillable pre/post-market prints that routinely reverse at the open.
+    Genuine gaps are still caught at the RTH open by the first in-session tick +
+    the 5-min monitor backstop."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    n = datetime.now(ZoneInfo("America/New_York"))
+    if n.weekday() >= 5:
+        return False
+    mins = n.hour * 60 + n.minute
+    return 570 <= mins < 960   # 9:30 (570) .. 16:00 (960)
+
+
 def _check_rt_levels(ticker: str, price: float) -> None:
     """
     Check a live trade price against all cached active signals for this ticker.
@@ -1267,6 +1282,12 @@ def _check_rt_levels(ticker: str, price: float) -> None:
       SL already at breakeven (T1 already hit) → only T2 / SL(=entry) matter
     """
     global _rt_cache, _rt_cache_ts
+
+    # Regular-hours only: don't close target/stop on extended-hours prints (thin,
+    # unfillable, and they whip back at the open). The 5-min monitor backstop is
+    # already RTH-gated; a real gap is enforced at the open by the first RTH tick.
+    if not _is_rth_now():
+        return
 
     # Refresh cache if stale
     if time.monotonic() - _rt_cache_ts > _RT_CACHE_TTL:
