@@ -59,6 +59,16 @@ _BULL_REGIMES      = {"EUPHORIA", "TRENDING_BULL", "RISK_ON"}
 _WATCH_MIN_SCORE   = 45       # overbought zone, not yet confirmed
 _PEAK_MIN_SCORE    = 62       # confirmed reversal
 
+# Parabolic-exhaustion fast-path: a +N% blow-off that prints its first big
+# distribution day is exhausting NOW — waiting for a full CHoCH (break of a
+# swing low) on a name this extended gives back most of the move (the SNOW
+# 2026-06-02 case: +116% run, RSI 75, climax, −8.7% reversal day, but no
+# structure break yet → silently stuck at "watch"). We grant confirmation on
+# the reversal day itself, but ONLY with a real buying climax present.
+_PARABOLIC_RU         = 80.0   # run-up % that qualifies as a parabolic blow-off
+_REVERSAL_CLOSE_FRAC  = 0.34   # close must be in the bottom third of the day range
+_REVERSAL_MIN_DROP    = -2.0   # and down at least this % vs prior close
+
 
 # ── Small indicator helpers (no shared module exists in this codebase) ───────
 def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
@@ -236,6 +246,27 @@ def score_peak(df: pd.DataFrame, *, regime_type: Optional[str] = None,
         confirm_pts = min(30.0, confirm_pts)
         confirmed = confirm_pts >= 8  # at least one real trigger
 
+        # ── 4b. Parabolic-exhaustion fast-path ───────────────────────────────
+        # A +80%+ blow-off (RSI≥overbought, real buying climax) that prints its
+        # FIRST big distribution day — closes in the bottom third of its range
+        # AND down hard vs the prior close AND below its open — is exhausting
+        # right here. Granting confirmation on this bar (rather than waiting for
+        # a swing-low break) catches blow-off tops near the turn. Gated on a real
+        # climax so it can never fire on a quiet drift, and the bull-trap guard
+        # below still applies (the climax is what lifts it).
+        day_rng   = float(high.iloc[-1] - low.iloc[-1])
+        close_pos = ((last - float(low.iloc[-1])) / day_rng) if day_rng > 0 else 0.5
+        prev_c    = float(close.iloc[-2])
+        pct_chg   = (last / prev_c - 1) * 100 if prev_c else 0.0
+        reversal_day = (close_pos <= _REVERSAL_CLOSE_FRAC and pct_chg <= _REVERSAL_MIN_DROP
+                        and last < float(df["open"].iloc[-1]))
+        parabolic_exhaustion = (run_up >= _PARABOLIC_RU and rsi >= _RSI_OVERBOUGHT
+                                and blowoff_climax and reversal_day)
+        if parabolic_exhaustion and not confirmed:
+            confirm_pts = min(30.0, confirm_pts + 12)
+            confirmed = True
+            reasons.append(f"parabolic exhaustion: {pct_chg:.0f}% reversal day off +{run_up:.0f}% blow-off")
+
         # ── 5. Resistance confluence (0-15) ──────────────────────────────────
         resist_pts = 0.0
         hi52 = float(high.tail(min(len(df), 252)).max())
@@ -267,7 +298,8 @@ def score_peak(df: pd.DataFrame, *, regime_type: Optional[str] = None,
         # ── Stage ────────────────────────────────────────────────────────────
         overbought_enough = overbought_pts >= 12
         if (confirmed and overbought_enough and score >= _PEAK_MIN_SCORE
-                and (regime_risk or resist_pts >= 6) and not bull_trap_blocked):
+                and (regime_risk or resist_pts >= 6 or parabolic_exhaustion)
+                and not bull_trap_blocked):
             stage = "peak"
         elif overbought_enough and (blowoff or at_resistance) and score >= _WATCH_MIN_SCORE:
             stage = "watch"
@@ -286,6 +318,7 @@ def score_peak(df: pd.DataFrame, *, regime_type: Optional[str] = None,
             "trendOk":          bool(trend_ok),
             "blowoff":          bool(blowoff),
             "confirmed":        bool(confirmed),
+            "parabolicExhaustion": bool(parabolic_exhaustion),
             "chochBearish":     bool(choch),
             "atResistance":     bool(at_resistance),
             "bullTrapBlocked":  bool(bull_trap_blocked),
