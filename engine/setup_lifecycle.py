@@ -77,14 +77,16 @@ MAX_SCANS_WITHOUT_IMPROVE = 8      # max re-evaluations before forced expiry
 
 # ── Grade classifiers ─────────────────────────────────────────────────────────
 
-def classify_state(score: float) -> SetupState:
+def classify_state(score: float) -> Optional[SetupState]:
     if score >= CONFIRMED_MIN:
         return SetupState.CONFIRMED_SIGNAL
     if score >= DEVELOPING_MIN:
         return SetupState.DEVELOPING
     if score >= WATCHLIST_MIN:
         return SetupState.WATCHLIST
-    return SetupState.EXPIRED
+    # Below watchlist: no trackable state (EXPIRED is a time-based lifecycle
+    # state, not a "score too low" sentinel — don't overload it here).
+    return None
 
 
 def classify_confidence_grade(score: float) -> ConfidenceGrade:
@@ -337,7 +339,7 @@ class SetupLifecycleManager:
         score     = score_result.get("total", 0)
         state     = classify_state(score)
 
-        if state == SetupState.EXPIRED:
+        if state is None:
             return None   # below 50 — not worth tracking
 
         if state == SetupState.CONFIRMED_SIGNAL:
@@ -601,7 +603,12 @@ def annotate_score(
     l3 = breakdown.get("l3_sentiment", 0)
     l6 = breakdown.get("l6_regime", 0)
 
-    strongest_layer  = max(breakdown, key=lambda k: breakdown.get(k, 0) if isinstance(breakdown.get(k), (int, float)) else 0)
+    # Guard: breakdown can be empty (e.g. detector cards / partial scores) —
+    # max() over an empty iterable raises ValueError.
+    strongest_layer  = (
+        max(breakdown, key=lambda k: breakdown.get(k, 0) if isinstance(breakdown.get(k), (int, float)) else 0)
+        if breakdown else None
+    )
     weakest_layer    = min(
         (k for k in ["l1_smc", "l2_technical", "l3_sentiment", "l4_risk", "l5_mtf"]),
         key=lambda k: breakdown.get(k, 0),
@@ -618,10 +625,11 @@ def annotate_score(
     return {
         "score":           score,
         "confidence_grade": grade.value,
-        "setup_state":     state.value,
+        "setup_state":     state.value if state else None,
         "regime_alignment": regime_align,
         "score_explanation": (
-            f"{grade.value} setup — strongest: {layer_names.get(strongest_layer, strongest_layer)}, "
+            f"{grade.value} setup — "
+            f"strongest: {layer_names.get(strongest_layer, strongest_layer) if strongest_layer else 'n/a'}, "
             f"weakest: {layer_names.get(weakest_layer, weakest_layer)}"
         ),
         "confidence_reason": _confidence_reason(grade, l1, l2, l3),

@@ -68,8 +68,12 @@ def _make_atr_compressing_df(n: int = 40) -> pd.DataFrame:
     rng  = np.random.default_rng(7)
     rows = []
     for i in range(n):
-        half      = n // 2
-        hl_range  = 3.0 if i < half else 0.50   # wide then narrow
+        # Narrow only the last 10 bars: the short(7) window is all-narrow while
+        # the long(20) window still spans wide bars, so the ratio compresses.
+        # (A 50/50 split left the whole long window inside the narrow half →
+        #  ratio ≈ 1.0 and no compression was detectable.)
+        narrow    = i >= (n - 10)
+        hl_range  = 0.50 if narrow else 3.0   # wide then narrow
         open_     = 100.0 + rng.uniform(-0.5, 0.5)
         direction = 1 if rng.random() > 0.5 else -1
         close     = open_ + direction * hl_range * 0.5
