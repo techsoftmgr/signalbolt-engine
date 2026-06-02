@@ -78,8 +78,8 @@ TRAIL_PEAK_PCT = {
     "dark_pool":    0.010,
     "swing_trade":  0.020,   # 2.0% below peak — room for multi-day breathing
     "vwap_reclaim": 0.010,
-    "breakdown":    0.020,   # daily swing short — same breathing room as swing
-    "breakout":     0.020,   # daily swing long
+    "breakdown":    0.025,   # daily swing short — extra room (far T1, ride bounces)
+    "breakout":     0.025,   # daily swing long
 }
 TRAIL_DEFAULT_PCT  = 0.012
 TRAIL_MIN_MOVE_PCT = 0.005  # peak must be ≥0.5% beyond T1 before trailing starts
@@ -101,6 +101,14 @@ _TRAIL_ACTIVATE_FRAC = 0.6
 # swing (breakdown short: T1 ≈ -1.5 ATR ≈ -10%+) doesn't round-trip a +2-3% gain
 # while waiting for the 60%-to-T1 trail. Tightens the stop only; never closes.
 _BE_PROFIT_PCT = 2.0
+
+# Breakdown/breakout target a FAR T1 (≈ ±5%+). At a modest +2% gain a tight
+# peak-trail gets knocked out by a NORMAL bounce before the move plays out
+# (CME breakdown: +2.3% peak, ~2.3% bounce → stopped at +0.4%). So for these,
+# between _BE_PROFIT_PCT and this %, move the stop only to BREAKEVEN (room to
+# ride, no loss); switch to the tight peak-trail once genuinely profitable.
+# Other strategies (no entry) keep the original "tight-trail at +2%" behaviour.
+_LOCK_TIGHT_PCT = {"breakdown": 3.0, "breakout": 3.0}
 # Near-expiry profit backstop: within this many hours of max-hold, book a still-
 # green position at market rather than let it ride to a flat/near-flat expiry.
 _NEAR_EXPIRY_HRS        = 3.0
@@ -865,33 +873,42 @@ def _monitor_stocks(sb: Client) -> None:
                 # loosens, never closes). Direction-aware.
                 if (not t1_hit) and progress < _TRAIL_ACTIVATE_FRAC \
                    and pnl_pct is not None and pnl_pct >= _BE_PROFIT_PCT:
-                    _tp = TRAIL_PEAK_PCT.get(strategy, TRAIL_DEFAULT_PCT)
-                    # Volatility-aware band: a fixed 2% trail is too tight for a
-                    # high-ATR name — MSTR (ATR≈7%) got knocked out by a normal
-                    # ~2% bounce (exit @137.97) while it kept falling to 135.
-                    # Widen toward ~0.5×ATR for volatile names, capped at 3.5% so
-                    # it never gives back an absurd amount. Floored at the
-                    # per-strategy %, so low-vol names are unchanged.
-                    try:
-                        _atr_used = (sig.get("score_breakdown") or {}).get("atr_used")
-                        if _atr_used and entry:
-                            _atr_pct = float(_atr_used) / float(entry)
-                            _tp = max(_tp, min(0.5 * _atr_pct, 0.035))
-                    except Exception:
-                        pass
-                    if is_long:
-                        _tr = max(entry, peak * (1 - _tp)); _ratchet = _tr > sl + 0.01
+                    # Confirmed breakdown/breakout: between +2% and +3% just guard
+                    # at BREAKEVEN so a normal bounce can't stop us out near flat
+                    # (CME). Only once genuinely profitable do we switch to the
+                    # tight peak-trail. Other strategies tight-trail from +2%.
+                    _tight_thresh = _LOCK_TIGHT_PCT.get(strategy)
+                    _go_tight = (_tight_thresh is None) or (pnl_pct >= _tight_thresh)
+                    if _go_tight:
+                        _tp = TRAIL_PEAK_PCT.get(strategy, TRAIL_DEFAULT_PCT)
+                        # Volatility-aware band: a fixed % trail is too tight for a
+                        # high-ATR name — MSTR (ATR≈7%) got knocked out by a normal
+                        # ~2% bounce while it kept falling. Widen toward ~0.5×ATR,
+                        # capped 3.5%, floored at the per-strategy %.
+                        try:
+                            _atr_used = (sig.get("score_breakdown") or {}).get("atr_used")
+                            if _atr_used and entry:
+                                _atr_pct = float(_atr_used) / float(entry)
+                                _tp = max(_tp, min(0.5 * _atr_pct, 0.035))
+                        except Exception:
+                            pass
+                        if is_long: _tr = max(entry, peak * (1 - _tp))
+                        else:       _tr = min(entry, peak * (1 + _tp))
+                        _note_lbl = "🔒 Early profit lock"
                     else:
-                        _tr = min(entry, peak * (1 + _tp)); _ratchet = _tr < sl - 0.01
+                        # Breakeven only — give the confirmed move room to ride.
+                        _tr = round(float(entry), 2)
+                        _note_lbl = "🛡️ Stop to breakeven"
+                    _ratchet = (_tr > sl + 0.01) if is_long else (_tr < sl - 0.01)
                     if _ratchet:
                         _tr = round(_tr, 2)
                         _locked = ((_tr - entry) / entry * 100) if is_long else ((entry - _tr) / entry * 100)
                         _update_sl(sb, sig["id"], _tr, sig=sig)
                         _log_event(sb, sig["id"], "be_move", price=price,
-                                   note=(f"🔒 Early profit lock → ${_tr:.2f} "
-                                         f"(up {pnl_pct:.1f}%, locks +{_locked:.1f}%) — no need to wait for T1"))
-                        logger.info(f"[monitor] {ticker} early profit-lock → {_tr:.2f} "
-                                    f"(pnl {pnl_pct:+.1f}%, locks +{_locked:.1f}%)")
+                                   note=(f"{_note_lbl} → ${_tr:.2f} "
+                                         f"(up {pnl_pct:.1f}%, locks {'+' if _locked >= 0 else ''}{_locked:.1f}%)"))
+                        logger.info(f"[monitor] {ticker} {_note_lbl} → {_tr:.2f} "
+                                    f"(pnl {pnl_pct:+.1f}%, locks {_locked:+.1f}%)")
                 # EMA_RECLAIM trend-reclaim signals ride the move on the 15m
                 # 20-EMA and SKIP the convergence early-exit — the point is to
                 # not cut these winners early (HOOD/CRWD trend days).

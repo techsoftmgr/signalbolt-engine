@@ -727,7 +727,7 @@ def _close_scalp_signal(sig: dict, hit: str, bar_price: float) -> None:
 
         entry    = float(sig["entry_price"])
         is_long  = sig["direction"] == "LONG"
-        result   = "win" if hit in ("t1", "t2") else "loss"
+        hit_target = hit in ("t1", "t2")
         hit_price = float(sig["target_one"] if hit == "t1" else
                           sig["target_two"] if hit == "t2" else
                           sig["stop_loss"])
@@ -736,13 +736,18 @@ def _close_scalp_signal(sig: dict, hit: str, bar_price: float) -> None:
                   ((entry - hit_price) / entry * 100)
         pnl_abs = hit_price - entry if is_long else entry - hit_price
 
+        # Classify by REALIZED P&L, not exit mechanism: a trailed / profit-locked
+        # stop that exits in the green is a WIN (was mislabeled a loss because
+        # any non-target exit was forced to "loss").
+        result = "win" if pnl_pct > 0 else "loss"
+
         update = {
             "status":        "closed",
             "result":        result,
             "hit_target":    hit,
             "result_pct":    round(pnl_pct, 4),
             "result_pnl":    round(pnl_abs, 4),
-            "closed_reason": "target_hit" if result == "win" else "stop_hit",
+            "closed_reason": "target_hit" if hit_target else "stop_hit",
             "closed_at":     datetime.now(timezone.utc).isoformat(),
         }
 
@@ -901,11 +906,16 @@ def _close_rt_signal(sig: dict, hit: str, price: float) -> None:
 
         entry    = float(sig["entry_price"])
         is_long  = sig["direction"] == "LONG"
-        result   = "win" if hit == "t2" else "loss"
-        hit_label = "Target 2" if hit == "t2" else "Stop Loss"
+        hit_target = hit == "t2"
 
         pnl_pct = ((price - entry) / entry * 100) if is_long else ((entry - price) / entry * 100)
         pnl_abs = (price - entry) if is_long else (entry - price)
+
+        # Classify by REALIZED P&L, not exit mechanism: a trailed / profit-locked
+        # stop that exits in the green is a WIN (the CME 2026-06-02 breakdown
+        # exited +0.4% but was mislabeled a loss — and counted against win rate).
+        result    = "win" if pnl_pct > 0 else "loss"
+        hit_label = "Target 2" if hit_target else ("Trailing stop" if result == "win" else "Stop Loss")
 
         sb.table("signals").update({
             "status":        "closed",
@@ -913,7 +923,7 @@ def _close_rt_signal(sig: dict, hit: str, price: float) -> None:
             "hit_target":    hit,
             "result_pct":    round(pnl_pct, 4),
             "result_pnl":    round(pnl_abs, 4),
-            "closed_reason": "target_hit" if result == "win" else "stop_hit",
+            "closed_reason": "target_hit" if hit_target else "stop_hit",
             "closed_at":     datetime.now(timezone.utc).isoformat(),
         }).eq("id", sig["id"]).execute()
 
