@@ -219,14 +219,50 @@ def judge_path(bars, anchor_ts, anchor_px, *, horizon_days: int = HORIZON_DAYS,
     # look like June 1 had "no %". This is display-only: outcome / resultPct /
     # mfe / mae / daysHeld above are all computed from the forward window first.
     try:
+        # Day-0 = the entry/trigger day itself, shown with its ACTUAL % (how it
+        # closed that day vs the anchor price) — not a flat 0%, which read as
+        # "no data" for the first day (e.g. June 1). For an intraday trigger this
+        # is the rest-of-day move after the break.
+        _ad = bars[bars.index <= anchor_ts]
+        _entry_close = float(_ad["close"].iloc[-1]) if len(_ad) else anchor_px
         out["curve"] = [{
             "day": 0,
             "date": anchor_ts.date().isoformat(),
-            "close": round(anchor_px, 2),
-            "pctFromAnchor": 0.0,
+            "close": round(_entry_close, 2),
+            "pctFromAnchor": round((_entry_close - anchor_px) / anchor_px * 100, 2),
         }] + out["curve"]
     except Exception:
         pass
+    return out
+
+
+def forming_curve(bars, forming_ts, forming_px, *, days: int = HORIZON_DAYS,
+                  direction: str = "up") -> dict:
+    """Daily % path anchored at the FORMING / flag point, INCLUSIVE of the flag
+    day (day 1). Answers "from the moment we flagged it forming, how did it move
+    each day?" — measures whether the early flag itself was predictive, alongside
+    the trigger-anchored follow-through curve. Returns {curve, resultPct, daysHeld}.
+    """
+    out = {"curve": [], "resultPct": None, "daysHeld": 0}
+    if bars is None or len(bars) == 0 or forming_ts is None or not forming_px or forming_px <= 0:
+        return out
+    start = forming_ts.replace(hour=0, minute=0, second=0, microsecond=0)
+    try:
+        fwd = bars[bars.index >= start].head(days)
+    except Exception:
+        return out
+    if len(fwd) == 0:
+        return out
+    curve = []
+    for i, (ts, row) in enumerate(fwd.iterrows(), start=1):
+        close = float(row["close"])
+        curve.append({
+            "day": i, "date": ts.date().isoformat(), "close": round(close, 2),
+            "pctFromForming": round((close - forming_px) / forming_px * 100, 2),
+        })
+    out["curve"]     = curve
+    out["resultPct"] = curve[-1]["pctFromForming"] if curve else None
+    out["daysHeld"]  = len(curve)
     return out
 
 
@@ -269,6 +305,24 @@ def _episode_metrics(ep: dict, bars, spy_bars, cfg: dict) -> dict:
         except Exception:
             pass
     jp["benchmark_pct"] = bench
+
+    # Forming-anchored path: from the WATCH/flag point (entered_at / enter_price),
+    # inclusive of the flag day. Separate from the trigger-anchored follow-through
+    # above — for breakouts the flag precedes the break, so this shows the run
+    # FROM when we first flagged it forming.
+    try:
+        f_ts = _parse(ep.get("entered_at"))
+        f_px = float(ep.get("enter_price") or 0)
+        fc = forming_curve(bars, f_ts, f_px,
+                           days=int(cfg.get("horizonDays", HORIZON_DAYS)) + 5,
+                           direction=cfg["direction"])
+        jp["formingCurve"]     = fc["curve"]
+        jp["formingResultPct"] = fc["resultPct"]
+        jp["formingDays"]      = fc["daysHeld"]
+    except Exception:
+        jp["formingCurve"] = []
+        jp["formingResultPct"] = None
+        jp["formingDays"] = 0
     return jp
 
 
@@ -393,6 +447,9 @@ def build_history(sb, days: int = 30, limit: int = 120, bucket: str = "breakouts
             "volRatio":      m.get("volRatio"),
             "volConfirmed":  m.get("volConfirmed"),
             "curve":         m["curve"],
+            "formingCurve":     m.get("formingCurve") or [],   # % from the forming/flag day (incl. day 1)
+            "formingResultPct": m.get("formingResultPct"),
+            "formingDays":      m.get("formingDays") or 0,
         })
 
     return {"episodes": enriched, "scorecard": _scorecard(enriched, days, cfg),
