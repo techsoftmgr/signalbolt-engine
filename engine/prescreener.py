@@ -31,6 +31,10 @@ _SCREEN_CACHE_TTL = 120   # 2 minutes
 # ── Movers cache: top gainers + losers from Alpaca, refreshed every 5 min ────
 # Separate from the snapshot cache so movers can be fetched independently.
 _movers_cache: tuple[Optional[list[str]], float] = (None, 0.0)
+
+# Minimum price for a dynamic mover to enter the scan universe. Below this,
+# spreads are wide and stops slip badly (penny stocks / warrants).
+_MIN_MOVER_PRICE = 5.0
 _MOVERS_CACHE_TTL = 300   # 5 minutes
 
 # ── Always include these regardless of pre-screen results ────────────────────
@@ -143,18 +147,37 @@ def fetch_movers(top: int = 30) -> list[str]:
             _movers_cache = ([], time.monotonic())
             return []
 
-        data     = resp.json()
-        gainers  = [item["symbol"] for item in data.get("gainers",  []) if item.get("symbol")]
-        losers   = [item["symbol"] for item in data.get("losers",   []) if item.get("symbol")]
-        movers   = gainers + losers
+        data = resp.json()
 
-        # Basic quality filter: skip OTC penny stocks (price < $5)
-        # and tickers with non-standard characters (warrants, units etc)
-        clean = [t for t in movers if t.isalpha() and len(t) <= 5]
+        # Quality filter. The price check used to be only a COMMENT — penny
+        # warrants like HUBCW ($0.05, 5 alpha chars) sailed through and fired a
+        # swing signal that lost -31.8% in 9 min (spread alone is ~20% at $0.05).
+        # Now actually enforce: real common shares only.
+        def _ok(item: dict) -> bool:
+            sym = (item.get("symbol") or "").upper()
+            if not sym or not sym.isalpha() or len(sym) > 5:
+                return False
+            # Warrant / unit / rights: a 5-letter symbol ending W/U/R is almost
+            # always a derivative (HUBCW, …), not a tradeable common share.
+            if len(sym) == 5 and sym[-1] in ("W", "U", "R"):
+                return False
+            # Skip sub-$MIN penny names — thin, wide spreads, stops slip badly.
+            price = item.get("price")
+            try:
+                if price is not None and float(price) < _MIN_MOVER_PRICE:
+                    return False
+            except (TypeError, ValueError):
+                pass
+            return True
+
+        gainers = [item["symbol"] for item in data.get("gainers", []) if _ok(item)]
+        losers  = [item["symbol"] for item in data.get("losers",  []) if _ok(item)]
+        clean   = gainers + losers
 
         logger.info(
-            f"[screener] Movers: {len(gainers)} gainers + {len(losers)} losers "
-            f"→ {len(clean)} after quality filter"
+            f"[screener] Movers: {len(data.get('gainers',[]))} gainers + "
+            f"{len(data.get('losers',[]))} losers → {len(clean)} after quality filter "
+            f"(min ${_MIN_MOVER_PRICE:.0f}, no warrants/units)"
         )
 
         _movers_cache = (clean, time.monotonic())
