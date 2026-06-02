@@ -2683,8 +2683,11 @@ def start_scheduler() -> BackgroundScheduler:
     # dedup so it never spams. Skips non-trading days.
     def _run_watchlist_alerts():
         try:
-            from engine.session_classifier import is_market_open_today
-            if not is_market_open_today():
+            # Regular trading hours only (9:30 AM ET → close) — not pre-market,
+            # after-hours, or overnight. Quant reads are stale when the tape is
+            # closed and users shouldn't get pushes at 2 AM.
+            from engine.session_classifier import is_market_open_now
+            if not is_market_open_now():
                 return
             from engine import watchlist_alerts
             watchlist_alerts.run(_supabase())
@@ -2707,8 +2710,11 @@ def start_scheduler() -> BackgroundScheduler:
     # transition state + per-day dedup + a hard per-run cap keep it from spamming.
     def _run_breakdown_alerts():
         try:
-            from engine.session_classifier import is_market_open_today
-            if not is_market_open_today():
+            # Regular trading hours ONLY — breakdown SIGNALS (short/put cards) are
+            # generated here, and you can't short / buy puts when the market is
+            # closed, plus options_scanner needs a live chain. No pre/post/overnight.
+            from engine.session_classifier import is_market_open_now
+            if not is_market_open_now():
                 return
             from engine import breakdown_alerts
             breakdown_alerts.run(_supabase())
