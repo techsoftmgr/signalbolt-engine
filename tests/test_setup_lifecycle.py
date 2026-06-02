@@ -195,9 +195,11 @@ class TestClassifySetupType:
         return {"mode": mode}
 
     def test_choch_ob_returns_correct_type(self):
+        # Real SMC analysis schema: flat boolean flags (choch_bullish, ob_bullish).
         analysis = {
-            "structure": {"type": "CHoCH"},
-            "obs": {"bullish": [{"price": 150}]},
+            "direction": "LONG",
+            "structure": {"choch_bullish": True, "bos_bullish": False},
+            "obs": {"ob_bullish": {"price": 150}},
             "fvgs": {},
             "liquidity_sweep": {"swept": False},
         }
@@ -243,18 +245,19 @@ class TestAnnotateScore:
         assert isinstance(result, dict)
 
     def test_includes_state_and_grade(self):
+        # annotate_score must not crash on an empty breakdown dict.
         result = annotate_score(80, {}, "LONG", "TRENDING_BULL")
-        assert "state" in result
+        assert "setup_state" in result
         assert "confidence_grade" in result
 
     def test_watchlist_score_correct_state(self):
         result = annotate_score(55, {}, "LONG", "RANGING")
-        assert result["state"] == SetupState.WATCHLIST.value or result["state"] == "WATCHLIST"
+        assert result["setup_state"] == SetupState.WATCHLIST.value or result["setup_state"] == "WATCHLIST"
 
     def test_confirmed_score_correct_state(self):
         result = annotate_score(82, {}, "LONG", "TRENDING_BULL")
         confirmed = SetupState.CONFIRMED_SIGNAL.value
-        assert result["state"] == confirmed or result["state"] == "CONFIRMED_SIGNAL"
+        assert result["setup_state"] == confirmed or result["setup_state"] == "CONFIRMED_SIGNAL"
 
 
 # ── SetupLifecycleManager ─────────────────────────────────────────────────────
