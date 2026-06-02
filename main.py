@@ -1361,25 +1361,43 @@ def get_chart_data(ticker: str, timeframe: str = "15Min", bars: int = 60):
         logger.warning(f"[chart-data] Alpaca path failed for {ticker}: {e} — trying yfinance")
 
     # ── yfinance fallback ──────────────────────────────────────────────────────
+    # Use Ticker().history() (flat columns) — yf.download() returns MultiIndex
+    # columns for a single ticker in current yfinance, which made float(row[col])
+    # throw → the chart silently 500'd ("chart unavailable", e.g. CME).
     try:
         import yfinance as yf
-        from datetime import timedelta, date
 
-        tf_yf_map   = {"5Min": "5m",  "15Min": "15m", "1Hour": "1h",  "1Day": "1d"}
-        tf_days_map  = {"5Min": 2,    "15Min": 5,     "1Hour": 20,    "1Day": 90}
-        yf_interval  = tf_yf_map.get(timeframe, "15m")
-        yf_days      = tf_days_map.get(timeframe, 5)
+        # (interval, period). yfinance caps intraday lookback; daily/weekly period
+        # is widened below to satisfy the requested bar count (3Y / Max views).
+        tf_yf = {
+            "5Min":  ("5m",  "5d"),
+            "15Min": ("15m", "1mo"),
+            "1Hour": ("1h",  "3mo"),
+            "1Day":  ("1d",  "2y"),
+            "1Week": ("1wk", "max"),
+        }
+        interval, period = tf_yf.get(timeframe, ("15m", "1mo"))
+        if timeframe == "1Day" and bars > 500:
+            period = "5y"
 
-        end   = date.today().isoformat()
-        start = (date.today() - timedelta(days=yf_days)).isoformat()
-
-        df = yf.download(ticker, start=start, end=end, interval=yf_interval,
-                         progress=False, auto_adjust=True)
-        if df.empty:
+        df = yf.Ticker(ticker).history(period=period, interval=interval)
+        if df is None or df.empty:
             return {"candles": [], "ticker": ticker, "timeframe": timeframe, "source": "none"}
 
+        # Defensive: flatten any MultiIndex columns back to single level.
+        if getattr(df.columns, "nlevels", 1) > 1:
+            df.columns = df.columns.get_level_values(0)
+
         df = df.tail(bars).reset_index()
-        date_col = "Datetime" if "Datetime" in df.columns else "Date"
+        date_col = ("Datetime" if "Datetime" in df.columns
+                    else "Date" if "Date" in df.columns else df.columns[0])
+
+        def _num(v, d=0.0):
+            try:
+                f = float(v)
+                return f if f == f else d   # NaN guard
+            except Exception:
+                return d
 
         candles = []
         for _, row in df.iterrows():
@@ -1387,18 +1405,19 @@ def get_chart_data(ticker: str, timeframe: str = "15Min", bars: int = 60):
             ts_str = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
             candles.append({
                 "t":  ts_str,
-                "o":  round(float(row["Open"]),   2),
-                "h":  round(float(row["High"]),   2),
-                "l":  round(float(row["Low"]),    2),
-                "c":  round(float(row["Close"]),  2),
-                "v":  int(row["Volume"]) if "Volume" in row else 0,
+                "o":  round(_num(row.get("Open")),   2),
+                "h":  round(_num(row.get("High")),   2),
+                "l":  round(_num(row.get("Low")),    2),
+                "c":  round(_num(row.get("Close")),  2),
+                "v":  int(_num(row.get("Volume"))),
             })
 
         return {"candles": candles, "ticker": ticker, "timeframe": timeframe, "source": "yfinance"}
 
     except Exception as e:
+        # Fail soft — the chart shows "unavailable" rather than a 500.
         logger.error(f"GET /chart-data/{ticker} fallback error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"candles": [], "ticker": ticker, "timeframe": timeframe, "source": "none"}
 
 
 class PushTokenRequest(BaseModel):
