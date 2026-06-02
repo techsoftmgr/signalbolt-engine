@@ -2615,11 +2615,15 @@ def start_scheduler() -> BackgroundScheduler:
                 except Exception:
                     pass
                 _sent = push.send_cycle_alert(_tk, _kind, sb=sb)
+                # Dedup per ticker/kind/day REGARDLESS of how many users were
+                # pushed — send_cycle_alert always records the alert row, so
+                # without this a name with no watchers (sent=0) re-records every
+                # 5-min scan (the TWLO×7/hr feed spam). Set the day-key always.
+                try:
+                    _cache.kv.set_json(_ck, {"sent": _sent}, 86400)
+                except Exception:
+                    pass
                 if _sent:
-                    try:
-                        _cache.kv.set_json(_ck, {"sent": _sent}, 86400)
-                    except Exception:
-                        pass
                     logger.info(f"[runner] cycle alert sent: {_tk} {_kind} ({_sent} users)")
         except Exception as _e:
             logger.error(f"[runner] setup-watch sync failed: {_e}")
