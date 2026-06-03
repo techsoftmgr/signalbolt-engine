@@ -85,3 +85,38 @@ class TestConfirmLevelCross:
         with patch.object(ac, "get_bars", return_value=_bars(105.0, 101.0)), \
              patch.object(ac, "get_latest_price", return_value=102.0):
             assert ac.confirm_level_cross("AAPL", 99.0, is_long=True, kind="stop") is False
+
+
+class TestSaneClosePrice:
+    """Bad-print guard for NON-level closes (EOD / time-stop / trend exit)."""
+
+    def test_gross_high_outlier_clamped(self):
+        """A close print far ABOVE the recent range is clamped to the high."""
+        with patch.object(ac, "get_bars", return_value=_bars(23.72, 23.58)):
+            # 26.50 is ~12% above the 23.72 high → clamp to 23.72
+            assert ac.sane_close_price("CMCSA", 26.50) == pytest.approx(23.72)
+
+    def test_gross_low_outlier_clamped(self):
+        """A close print far BELOW the recent range is clamped to the low."""
+        with patch.object(ac, "get_bars", return_value=_bars(760.0, 754.0)):
+            # SPY phantom 633 is ~16% below the 754 low → clamp to 754
+            assert ac.sane_close_price("SPY", 633.87) == pytest.approx(754.0)
+
+    def test_in_range_price_unchanged(self):
+        """A normal price within tolerance passes through untouched."""
+        with patch.object(ac, "get_bars", return_value=_bars(24.0, 23.5)):
+            assert ac.sane_close_price("CMCSA", 23.7) == pytest.approx(23.7)
+
+    def test_small_move_within_tolerance_unchanged(self):
+        """A price slightly outside the range (<5%) is a real move — kept."""
+        with patch.object(ac, "get_bars", return_value=_bars(24.0, 23.5)):
+            # 24.5 is ~2% above the high → within 5% tolerance → unchanged
+            assert ac.sane_close_price("CMCSA", 24.5) == pytest.approx(24.5)
+
+    def test_no_bars_returns_raw(self):
+        """Fail-open: no bars → return the raw price (never block a close)."""
+        with patch.object(ac, "get_bars", return_value=None):
+            assert ac.sane_close_price("CMCSA", 26.50) == pytest.approx(26.50)
+
+    def test_none_price_returns_none(self):
+        assert ac.sane_close_price("CMCSA", None) is None

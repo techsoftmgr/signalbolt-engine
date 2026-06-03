@@ -177,7 +177,7 @@ def _close_momentum(sb, sig_id, ticker, direction, entry, price, why: str) -> No
           else ((entry - price) / entry * 100)
     won = pnl > 0
     _close_signal(sb, sig_id, "target_hit" if won else "stop_hit",
-                  current_price=price, entry_price=entry, direction=direction)
+                  current_price=price, entry_price=entry, direction=direction, ticker=ticker)
     _log_event(sb, sig_id, "closed_win" if won else "closed_loss", price=price,
                note=(f"{'✅' if won else '🔴'} Trend exit ({why}) @ ${price:.2f} "
                      f"({'+' if pnl >= 0 else ''}{pnl:.1f}%) — rode the move"))
