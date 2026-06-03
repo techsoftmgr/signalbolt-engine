@@ -111,7 +111,9 @@ def publish_tick(ticker: str, price: float) -> None:
     """
     if not _REDIS_URL:
         return
-    _publish_buffer[ticker] = price
+    # Carry the worker's freshly-computed changePercent alongside the price, so the
+    # web doesn't have to recompute it from its own (often un-seeded) prev_close.
+    _publish_buffer[ticker] = (round(price, 4), (_prices.get(ticker) or {}).get("changePercent"))
 
 
 async def publish_batch_loop() -> None:
@@ -221,6 +223,11 @@ def seed(ticker: str, price: float, change_pct: float, session: str) -> None:
         "changePercent": round(change_pct, 3),
         "session":       session,
     }
+    # Seed prev_close too — without this, live ticks for this ticker fell to the
+    # "prev unknown → 0%" branch and broadcast changePercent=0, clobbering this
+    # correct REST value on the client (the HOOD "+0.00%" bug).
+    if price > 0 and change_pct is not None and change_pct != -100:
+        _prev_close[ticker] = price / (1 + change_pct / 100)
 
 
 # ── Session helper ────────────────────────────────────────────────────────────
@@ -254,25 +261,33 @@ def update(ticker: str, trade_price: float) -> None:
     publish_tick(ticker, trade_price)
 
 
-def update_from_remote(ticker: str, trade_price: float) -> None:
+def update_from_remote(ticker: str, trade_price: float, change_pct: float | None = None) -> None:
     """
     Apply a tick that arrived via Redis pub/sub from the worker.
     Same as update() but does NOT re-publish (avoids a loop where every
     web machine re-broadcasts every tick it receives back to Redis).
+    `change_pct` is the worker's authoritative value (it owns prev_close).
     """
-    _update_local(ticker, trade_price)
+    _update_local(ticker, trade_price, remote_chg=change_pct)
 
 
-def _update_local(ticker: str, trade_price: float) -> None:
+def _update_local(ticker: str, trade_price: float, remote_chg: float | None = None) -> None:
     """Shared logic for both local trade updates and remote (pub/sub) updates."""
-    prev    = _prev_close.get(ticker)
-    chg_pct = ((trade_price - prev) / prev * 100) if prev else 0.0
-
-    _prices[ticker] = {
-        "price":         round(trade_price, 2),
-        "changePercent": round(chg_pct, 3),
-        "session":       _market_session_now(),
-    }
+    entry: dict = {"price": round(trade_price, 2), "session": _market_session_now()}
+    prev = _prev_close.get(ticker)
+    if remote_chg is not None:
+        # Trust the worker's changePercent (it owns prev_close for streamed names).
+        entry["changePercent"] = round(remote_chg, 3)
+    elif prev:
+        entry["changePercent"] = round((trade_price - prev) / prev * 100, 3)
+    else:
+        # prev_close unknown — do NOT broadcast a misleading 0% (it would clobber
+        # the correct REST-seeded value on the client). Keep the last known value
+        # if any; otherwise omit changePercent so the client retains its /prices %.
+        last = (_prices.get(ticker) or {}).get("changePercent")
+        if last is not None:
+            entry["changePercent"] = last
+    _prices[ticker] = entry
 
     # Queue the dirty mark onto the event loop (thread-safe)
     if _loop and not _loop.is_closed():

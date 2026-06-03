@@ -90,9 +90,18 @@ async def run_subscriber() -> None:
                     # tickers bundled (see publish_batch_loop in price_store).
                     ticks = payload.get("ticks")
                     if isinstance(ticks, dict):
-                        for ticker, price in ticks.items():
+                        for ticker, val in ticks.items():
+                            # New format: [price, changePercent]; old: bare price.
+                            if isinstance(val, (list, tuple)):
+                                price = val[0]
+                                chg   = val[1] if len(val) > 1 else None
+                            else:
+                                price, chg = val, None
                             if ticker and price is not None:
-                                price_store.update_from_remote(ticker, float(price))
+                                price_store.update_from_remote(
+                                    ticker, float(price),
+                                    float(chg) if chg is not None else None,
+                                )
                     else:
                         # Backward-compat for single-tick format (in case the
                         # worker is mid-deploy and still sending old format)
