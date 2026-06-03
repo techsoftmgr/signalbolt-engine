@@ -568,20 +568,32 @@ def _push_scalp_expired(ticker: str, direction: str, signal_id: str | None = Non
 
 
 def _push_closed(ticker: str, direction: str, result: str, pct: float,
-                 created_at: str | None = None) -> None:
+                 created_at: str | None = None, is_option: bool = False,
+                 contract: str | None = None, signal_id: str | None = None) -> None:
+    # Option closes MUST read as option closes. An option's premium-based P&L
+    # (e.g. -28.3% on a ~-1% underlying move, via delta) otherwise looks like it
+    # belongs to the STOCK signal on the same ticker — which may still be open or
+    # only moved -1.4% (the IWM confusion). Label "Option", name the contract, and
+    # tag signal_type so the tap routes to the Options tab.
+    kind = "Option " if is_option else ""
+    subj = (f"{ticker} {contract}" if (is_option and contract) else f"{direction} signal")
+    data: dict = {"type": "signal_closed", "result": result, "ticker": ticker,
+                  "created_at": created_at}
+    if is_option:
+        data["signal_type"] = "option"
+    if signal_id:
+        data["signal_id"] = signal_id
     if result == "win":
         push._send_raw(
-            title=f"✅ Target Hit — {ticker} +{pct:.1f}%",
-            body=f"{direction} signal closed with a win.",
-            data={"type": "signal_closed", "result": "win", "ticker": ticker,
-                  "created_at": created_at},
+            title=f"✅ {kind}Target Hit — {ticker} +{pct:.1f}%",
+            body=f"{subj} closed with a win.",
+            data=data,
         )
     elif result == "loss":
         push._send_raw(
-            title=f"🔴 Stop Hit — {ticker} {pct:.1f}%",
-            body=f"{direction} signal stopped out.",
-            data={"type": "signal_closed", "result": "loss", "ticker": ticker,
-                  "created_at": created_at},
+            title=f"🔴 {kind}Stop Hit — {ticker} {pct:.1f}%",
+            body=f"{subj} stopped out.",
+            data=data,
         )
 
 
@@ -1317,8 +1329,13 @@ def _monitor_options(sb: Client) -> None:
                     _log_event(sb, sig["id"], event_type, price=price, note=event_note)
                     logger.info(f"[monitor] Option {ticker} {result} — premium {entry_prem:.2f}→{est_prem:.2f} ({pct:+.1f}%)")
                     try:
+                        _ct = (sig.get("contract_type") or "").capitalize()
+                        _k  = sig.get("strike_price")
+                        _contract = (f"${float(_k):g} {_ct}".strip() if _k else (_ct or None))
                         _push_closed(ticker, direction, result, pct,
-                                     created_at=sig.get("created_at"))
+                                     created_at=sig.get("created_at"),
+                                     is_option=True, contract=_contract,
+                                     signal_id=str(sig.get("id")))
                     except Exception:
                         pass
         except Exception as e:
