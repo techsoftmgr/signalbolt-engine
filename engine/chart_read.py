@@ -202,25 +202,33 @@ def _patterns(df: pd.DataFrame, hi_idx: list[int], lo_idx: list[int], tl: dict) 
     lows = df["low"].values.astype(float)
     px = float(df["close"].iloc[-1])
 
-    # Double top / bottom — two comparable swings (~within 3%) with a valley/peak between.
+    # Double top / bottom — two comparable swings (~within 3%) with a valley/peak
+    # between. GATED: the pattern must be RECENT (≤40 bars) AND price must still be
+    # NEAR it (≤10%) — otherwise it's an old, already-resolved base far from the
+    # current price (the SNOW bug: a ~155 double-bottom while price is 245).
+    last = len(df) - 1
     if len(hi_idx) >= 2:
         a, b = hi_idx[-2], hi_idx[-1]
-        if abs(highs[a] - highs[b]) / highs[b] <= 0.03 and b - a >= 3:
+        if (abs(highs[a] - highs[b]) / highs[b] <= 0.03 and b - a >= 3
+                and (last - b) <= 40 and abs(px - highs[b]) / px <= 0.10):
             neck = float(np.min(lows[a:b + 1]))
             out.append({"type": "Double Top", "tone": "bearish", "confidence": 0.6,
                         "level": round(float(highs[b]), 2), "neckline": round(neck, 2),
                         "target": round(neck - (float(highs[b]) - neck), 2)})
     if len(lo_idx) >= 2:
         a, b = lo_idx[-2], lo_idx[-1]
-        if abs(lows[a] - lows[b]) / lows[b] <= 0.03 and b - a >= 3:
+        if (abs(lows[a] - lows[b]) / lows[b] <= 0.03 and b - a >= 3
+                and (last - b) <= 40 and abs(px - lows[b]) / px <= 0.10):
             neck = float(np.max(highs[a:b + 1]))
             out.append({"type": "Double Bottom", "tone": "bullish", "confidence": 0.6,
                         "level": round(float(lows[b]), 2), "neckline": round(neck, 2),
                         "target": round(neck + (neck - float(lows[b])), 2)})
 
-    # Triangle — converging support & resistance trendlines.
+    # Triangle — converging support & resistance trendlines, with price INSIDE/near
+    # the apex (else the lines are stale relative to current price).
     res, sup = tl.get("resistance"), tl.get("support")
-    if res and sup and res["atLast"] > sup["atLast"]:
+    if (res and sup and res["atLast"] > sup["atLast"]
+            and sup["atLast"] * 0.95 <= px <= res["atLast"] * 1.05):
         rs, ss = res["slope"], sup["slope"]
         converging = (rs < -1e-6 and ss > 1e-6) or (abs(rs) < 1e-6 and ss > 1e-6) or (rs < -1e-6 and abs(ss) < 1e-6)
         if converging or (rs < 0 and ss > 0):
