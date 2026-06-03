@@ -299,13 +299,20 @@ def analyze(symbol: str) -> Optional[dict]:
     elif dns >= 2: mtf, mtf_dir = "leaning", "down"
     else:          mtf, mtf_dir = "mixed", "none"
 
-    # ── Overall bias — ANCHORED to the hub's daily quant verdict ──────────────
-    # The hub Game Plan (planVerdict) is the headline. To stop the Expert Read
-    # from CONTRADICTING it ("agree sometimes, opposite sometimes"), we anchor the
-    # bias to the SAME daily quant row the hub reads, then let chart-read context
-    # (1h / patterns / volume) only DOWNGRADE to neutral on divergence — never FLIP
-    # the daily direction. Divergence is surfaced as an explicit note, not a flip.
-    qrow = None
+    # ── Two INDEPENDENT verdicts, then COMPARE ───────────────────────────────
+    # (1) TA verdict — purely the chart structure (daily trend + 1h + patterns +
+    #     volume). NOT derived from the quant data — a genuine second opinion.
+    # (2) QUANT verdict — the SAME cached row the hub Game Plan reads.
+    # We surface BOTH + whether they AGREE: agreement = confirmation; DISAGREEMENT
+    # is the interesting case to verify (and, later, to measure which side was right).
+    ta_score = {"up": 2, "down": -2}.get(trend_d, 0)
+    ta_score += {"up": 1, "down": -1}.get(t1h, 0)
+    for p in pats:
+        ta_score += {"bullish": 1, "bearish": -1}.get(p.get("tone"), 0)
+    ta_score += {"accumulation": 1, "distribution": -1}.get(vol, 0)
+    ta_bias = "bullish" if ta_score >= 2 else "bearish" if ta_score <= -2 else "neutral"
+
+    quant_bias = None
     try:
         from engine import quant_score_service as _qs
         qrow, _as_of = _qs.cached_score(sym)
@@ -314,34 +321,38 @@ def analyze(symbol: str) -> Optional[dict]:
     if qrow:
         _ma = qrow.get("ma20"); _ts = float(qrow.get("trendScore") or 0); _setup = qrow.get("setupType")
         if qrow.get("peakStage") == "peak" or _setup == "breakdown":
-            primary = "bearish"
+            quant_bias = "bearish"
         elif qrow.get("turnaroundStage") == "buyzone" or _setup == "breakout":
-            primary = "bullish"
+            quant_bias = "bullish"
         elif _ma and px > _ma and _ts >= 55:
-            primary = "bullish"
+            quant_bias = "bullish"
         elif _ma and px < _ma:
-            primary = "bearish"
+            quant_bias = "bearish"
         else:
-            primary = "neutral"
+            quant_bias = "neutral"
+
+    if quant_bias is None:
+        agreement = "n/a"
+    elif ta_bias == "neutral" or quant_bias == "neutral":
+        agreement = "partial"
+    elif ta_bias == quant_bias:
+        agreement = "agree"
     else:
-        primary = {"up": "bullish", "down": "bearish"}.get(trend_d, "neutral")
+        agreement = "disagree"
 
-    # Chart-read context modifier (shorter timeframe + patterns + volume).
-    mod = {"up": 1, "down": -1}.get(t1h, 0)
-    for p in pats:
-        mod += {"bullish": 1, "bearish": -1}.get(p.get("tone"), 0)
-    mod += {"accumulation": 1, "distribution": -1}.get(vol, 0)
+    bias = ta_bias   # the Expert Read's OWN, independent technical call
+    conf = int(min(90, 52 + min(16, abs(ta_score) * 4)
+                   + (16 if agreement == "agree" else -14 if agreement == "disagree" else 0)))
 
-    diverges = (primary == "bullish" and mod <= -2) or (primary == "bearish" and mod >= 2)
-    bias = "neutral" if diverges else primary
-    agree = ((primary == "bullish" and mod > 0) or (primary == "bearish" and mod < 0))
-    conf = int(min(88, 52 + (12 if agree else 0) + min(16, abs(mod) * 4)))
-
-    # Plain-English narrative
+    # Plain-English narrative — LEAD with the agreement vs the quant read.
     bullets: list[str] = []
-    if diverges:
-        bullets.append(f"⚠️ Daily verdict is {primary}, but shorter timeframes / patterns / volume "
-                       f"are pulling the other way — MIXED right now; wait for them to align.")
+    if agreement == "agree":
+        bullets.append(f"✅ Technicals AGREE with the quant read — both {ta_bias}. Confirmation; higher confidence.")
+    elif agreement == "disagree":
+        bullets.append(f"⚠️ Technicals DISAGREE with the quant read — TA says {ta_bias}, quant says {quant_bias}. "
+                       f"Conflicting — treat as low-confidence and watch which side resolves.")
+    elif agreement == "partial":
+        bullets.append(f"Technicals {ta_bias} vs quant {quant_bias} — only partial overlap (one is neutral).")
     bullets.append(f"Daily trend: {trend_d}; MTF {mtf} {mtf_dir if mtf_dir!='none' else ''}".strip()
                    + f" (15m {t15} · 1h {t1h} · 1D {trend_d}).")
     if ch:
@@ -364,6 +375,7 @@ def analyze(symbol: str) -> Optional[dict]:
     return {
         "ticker": sym, "price": round(px, 2),
         "bias": bias, "confidence": int(conf),
+        "taBias": ta_bias, "quantBias": quant_bias, "agreement": agreement,
         "trend": {"d1": trend_d, "h1": t1h, "m15": t15},
         "mtf": {"state": mtf, "dir": mtf_dir},
         "channel": ch, "trendlines": tl, "levels": lv,
