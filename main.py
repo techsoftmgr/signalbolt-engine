@@ -2709,7 +2709,9 @@ async def admin_close_signal(request: Request, signal_id: str, asset: str = "sto
             up = float(row.get("underlying_price") or 0)
             if ep and px and up and dl:
                 est = ep + dl * (px - up)
-                payload["result"] = "win" if est >= ep else "loss"
+                payload["result"]     = "win" if est >= ep else "loss"
+                payload["result_pct"] = round((est - ep) / ep * 100, 4)
+                payload["result_pnl"] = round(est - ep, 4)
         except Exception:
             pass
     else:
