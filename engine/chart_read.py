@@ -330,9 +330,21 @@ def analyze(symbol: str) -> Optional[dict]:
         short_term = "diverging"
 
     quant_bias = None
+    qrow = None
     try:
         from engine import quant_score_service as _qs
         qrow, _as_of = _qs.cached_score(sym)
+        if qrow is None:
+            # Not in the cached universe scan (e.g. DRAM) — score it on-demand so
+            # the AGREE/DISAGREE comparison still works (mirrors the hub's live
+            # overview, which also live-scores non-universe tickers). Reuses the
+            # daily bars we already fetched.
+            try:
+                from engine.alpaca_client import get_bars as _gb
+                _idf = _gb(sym, "15Min", days=5)
+                qrow = _qs._score_ticker(sym, px, daily, _idf, daily_long_df=daily)
+            except Exception:
+                qrow = None
     except Exception:
         qrow = None
     if qrow:
