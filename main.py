@@ -2745,6 +2745,25 @@ async def admin_close_signal(request: Request, signal_id: str, asset: str = "sto
     return {"ok": True, "id": signal_id, **payload}
 
 
+@app.get("/admin/phantom-audit")
+async def admin_phantom_audit(request: Request, days: int = 1):
+    """
+    EOD data-integrity audit — closed signals whose recorded exit the 1-min tape
+    never printed (PHANTOM), result/result_pct MISMATCH, NO_PNL, or OVERSHOOT.
+    Same check the scheduler runs daily at 4:50 PM ET. Admin-only.
+    """
+    _user_id, sb = _require_admin_jwt(request)
+    days = max(1, min(days, 30))
+    try:
+        from engine import phantom_audit
+        return phantom_audit.audit(sb, days=days)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GET /admin/phantom-audit error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/admin/gate-rejections")
 async def admin_gate_rejections(request: Request, hours: int = 24, limit: int = 200):
     """
