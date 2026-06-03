@@ -2816,7 +2816,15 @@ async def admin_close_signal(request: Request, signal_id: str, asset: str = "sto
     try:
         sb.table(table).update(payload).eq("id", signal_id).execute()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"close failed: {e}")
+        # The P&L columns may not exist yet on option_signals (migration
+        # supabase-option-result-pct.sql). Never let that block a close — retry
+        # without the analytics fields.
+        retry = {k: v for k, v in payload.items() if k not in ("result_pct", "result_pnl")}
+        try:
+            sb.table(table).update(retry).eq("id", signal_id).execute()
+            payload = retry
+        except Exception as e2:
+            raise HTTPException(status_code=500, detail=f"close failed: {e2}")
     try:
         won = payload.get("result") == "win"
         pct = payload.get("result_pct")
