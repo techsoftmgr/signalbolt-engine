@@ -2423,6 +2423,23 @@ def _run_weight_optimization() -> None:
         logger.error(f"[runner] Weight optimization failed: {e}", exc_info=True)
 
 
+def _run_phantom_audit() -> None:
+    """
+    EOD data-integrity audit. Verifies every signal closed today against the
+    real 1-min tape so a bad-price / phantom close (the 2026-06-03 incident)
+    can't silently rot the track record. Logs a summary and pushes an
+    ADMIN-ONLY alert (clean or flagged). Runs ~4:50 PM ET, post-close.
+    """
+    try:
+        from engine import phantom_audit
+        res = phantom_audit.run_and_alert(days=1)
+        logger.info(f"[runner] ═══ Phantom audit done — {res['audited']} audited, "
+                    f"{res['serious_count']} serious, {res['flagged_count']} flagged ═══")
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        logger.error(f"[runner] Phantom audit failed: {e}", exc_info=True)
+
+
 def _run_gate_validator() -> None:
     """
     Nightly entry-gate rejection validator. Walks unjudged rows in
@@ -3013,6 +3030,18 @@ def start_scheduler() -> BackgroundScheduler:
         replace_existing=True,
     )
     logger.info("[runner] Scheduled entry-gate validator (4:15 PM ET, post-close)")
+
+    # ── EOD phantom-data audit — 4:50 PM ET ──────────────────────────────
+    # Verify the day's closes against the real 1-min tape so bad-price/phantom
+    # closes are caught same-day (not a month later). Admin-only alert.
+    scheduler.add_job(
+        _run_phantom_audit,
+        trigger=CronTrigger(hour=16, minute=50, timezone="America/New_York"),
+        id="phantom_audit",
+        name="SignalBolt EOD phantom-data audit",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled phantom-data audit (4:50 PM ET, post-close)")
 
     # ── Overnight armed-zone clear — 12:30 AM ET ─────────────────────────
     # Zones are no longer cleared at the 4PM close so the admin can analyze

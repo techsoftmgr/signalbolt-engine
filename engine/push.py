@@ -741,6 +741,44 @@ def _send_raw(
     _dispatch(messages, title)
 
 
+# Admin-only ops alerts (internal monitoring — NEVER broadcast to users).
+ADMIN_EMAIL = "techsoftmgr@gmail.com"
+
+
+def send_admin_alert(title: str, body: str, data: dict | None = None) -> bool:
+    """
+    Push to the ADMIN's device ONLY (never a broadcast). For internal ops alerts
+    such as the daily phantom-data audit. Returns True if an admin token was
+    found and dispatched (False = logged only, e.g. no token registered).
+    """
+    try:
+        rows = (
+            _supabase().table("profiles")
+            .select("push_token")
+            .eq("email", ADMIN_EMAIL)
+            .neq("push_token", None)
+            .execute().data
+        ) or []
+        tokens = [
+            r["push_token"] for r in rows
+            if (r.get("push_token") or "").startswith("ExponentPushToken[")
+        ]
+        if not tokens:
+            logger.info("[push] admin alert: no admin push token registered — logged only")
+            return False
+        messages = [
+            {"to": t, "title": title, "body": body,
+             "data": {**(data or {}), "type": "admin_ops"},
+             "sound": "default", "badge": 1}
+            for t in tokens
+        ]
+        _dispatch(messages, title)
+        return True
+    except Exception as e:
+        logger.warning(f"[push] admin alert failed: {e}")
+        return False
+
+
 def _dispatch(messages: list[dict], label: str) -> None:
     """Fire messages to Expo Push API and log results."""
     if not messages:
