@@ -277,7 +277,7 @@ def snapshot(tickers: list[str]) -> dict:
         try:
             from engine.alpaca_client import get_multi_bars, get_latest_prices
             from engine import regime_detector
-            daily      = get_multi_bars(missing, timeframe="1Day", days=25) or {}
+            daily      = get_multi_bars(missing, timeframe="1Day", days=60) or {}  # ≥20 trading bars for ma20 (see _build_dashboard)
             daily_long = _get_long_bars(missing) or {}
             intraday   = get_multi_bars(missing, timeframe="5Min", days=2) or {}
             prices     = get_latest_prices(missing) or {}
@@ -392,7 +392,14 @@ def _build_dashboard(tickers: list[str]) -> dict:
     from engine import regime_detector
 
     try:
-        daily_bars    = get_multi_bars(tickers, timeframe="1Day", days=25)
+        # 60 CALENDAR days ≈ 40 TRADING bars. The old days=25 yielded only ~16
+        # trading bars (weekends + holidays) — below the 20 needed for the 20-day
+        # MA, so _score_ticker fell back to ma20=price, which collapsed trendScore
+        # and skewed the 20-day high/low for the WHOLE cached scan. That made the
+        # watchlist one-liner (fed by this scan) read "no clear setup" while the
+        # live hub (400-day fetch) correctly read e.g. "healthy uptrend". Keep this
+        # safely above 20 trading bars so the cache matches the hub.
+        daily_bars    = get_multi_bars(tickers, timeframe="1Day", days=60)
         # Turnaround scoring needs ~1y of dailies (200-day trend gate, drawdown,
         # swing structure) — a separate, longer fetch from the 25-bar set above.
         daily_long    = _get_long_bars(tickers)
