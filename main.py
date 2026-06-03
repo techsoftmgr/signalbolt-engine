@@ -2528,6 +2528,223 @@ def _require_admin_jwt(request: Request):
         raise HTTPException(status_code=401, detail="Token verification failed")
 
 
+# ── Manual override / management control (admin-only) ──────────────────────────
+# Create, edit, and close stock + option signals by hand, and flip each between
+# 'manual' (engine leaves it alone) and 'engine' (engine manages normally). The
+# engine skips management of any signal with management_mode='manual' (see the
+# guards in signal_monitor / momentum_monitor / stream). Powers manual overrides
+# now and agentic trade control later.
+
+class ManualSignalIn(BaseModel):
+    asset: str = "stock"               # 'stock' | 'option'
+    ticker: str
+    direction: str                     # 'LONG' | 'SHORT'
+    entry_price: float | None = None   # stock entry (defaults to live price)
+    stop_loss: float | None = None
+    target_one: float | None = None
+    target_two: float | None = None
+    strategy_type: str = "manual"
+    management_mode: str = "manual"    # 'manual' | 'engine'
+    confidence_score: int | None = None
+    note: str | None = None
+    # option-only
+    contract_type: str | None = None   # 'call' | 'put'
+    strike_price: float | None = None
+    expiry_date: str | None = None
+    entry_premium: float | None = None
+    target_premium: float | None = None
+    stop_premium: float | None = None
+
+
+class SignalPatchIn(BaseModel):
+    asset: str = "stock"
+    stop_loss: float | None = None
+    target_one: float | None = None
+    target_two: float | None = None
+    management_mode: str | None = None   # 'manual' | 'engine'
+    stop_premium: float | None = None    # option-only
+    target_premium: float | None = None  # option-only
+
+
+@app.post("/admin/signals/manual")
+async def admin_create_manual_signal(request: Request, body: ManualSignalIn):
+    """Raise a stock or option signal by hand. origin='manual'; management_mode
+    defaults to 'manual' (you control it) but can be 'engine' to hand it to the
+    engine. Returns the new id."""
+    _uid, sb = _require_admin_jwt(request)
+    tk = (body.ticker or "").upper().strip()
+    direction = (body.direction or "").upper().strip()
+    if not tk or direction not in ("LONG", "SHORT"):
+        raise HTTPException(status_code=400, detail="ticker and direction (LONG/SHORT) required")
+    mode = body.management_mode if body.management_mode in ("manual", "engine") else "manual"
+
+    # Live price for sensible defaults / underlying.
+    live_px = None
+    try:
+        from engine.alpaca_client import get_latest_price
+        live_px = get_latest_price(tk)
+    except Exception:
+        live_px = None
+
+    if body.asset == "option":
+        row = {
+            "ticker": tk, "direction": direction,
+            "contract_type": (body.contract_type or ("call" if direction == "LONG" else "put")),
+            "strike_price": body.strike_price,
+            "expiry_date": body.expiry_date,
+            "entry_premium": body.entry_premium,
+            "target_premium": body.target_premium,
+            "stop_premium": body.stop_premium,
+            "underlying_price": (body.entry_price or live_px),
+            "confidence_score": body.confidence_score or 70,
+            "strategy_type": body.strategy_type or "manual",
+            "status": "active",
+            "ai_explanation": body.note or "Manually created option signal.",
+            "management_mode": mode, "origin": "manual",
+        }
+        table = "option_signals"
+    else:
+        entry = body.entry_price if body.entry_price is not None else live_px
+        if entry is None:
+            raise HTTPException(status_code=400, detail="entry_price required (no live price available)")
+        row = {
+            "ticker": tk, "direction": direction,
+            "entry_price": entry, "stop_loss": body.stop_loss,
+            "target_one": body.target_one, "target_two": body.target_two,
+            "confidence_score": body.confidence_score or 70,
+            "timeframe": "1Day", "strategy_type": body.strategy_type or "manual",
+            "status": "active",
+            "ai_explanation": body.note or "Manually created signal.",
+            "management_mode": mode, "origin": "manual",
+            "score_breakdown": {"detector_source": "MANUAL", "initial_stop": body.stop_loss},
+        }
+        table = "signals"
+
+    try:
+        res = sb.table(table).insert(row).execute()
+        new_id = res.data[0]["id"] if res.data else None
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"insert failed: {e}")
+
+    # An engine-managed stock signal needs the live trade subscription so its
+    # stop/target fire on a tick (same as engine-fired signals).
+    if mode == "engine" and body.asset != "option" and new_id:
+        try:
+            from engine import runner
+            runner._ensure_stream_subscription(tk, cap=200)
+        except Exception:
+            pass
+
+    logger.info(f"[admin] manual {body.asset} signal created {tk} {direction} mode={mode} id={new_id}")
+    return {"ok": True, "id": new_id, "asset": body.asset, "management_mode": mode}
+
+
+@app.patch("/admin/signals/{signal_id}")
+async def admin_update_signal(request: Request, signal_id: str, body: SignalPatchIn):
+    """Edit an existing signal's stop/targets and/or flip management_mode.
+    Only the provided fields change. Works for stock (asset='stock') and option."""
+    _uid, sb = _require_admin_jwt(request)
+    table = "option_signals" if body.asset == "option" else "signals"
+    patch: dict = {}
+    if body.management_mode in ("manual", "engine"):
+        patch["management_mode"] = body.management_mode
+    if body.asset == "option":
+        if body.stop_premium   is not None: patch["stop_premium"]   = body.stop_premium
+        if body.target_premium is not None: patch["target_premium"] = body.target_premium
+    else:
+        if body.stop_loss  is not None: patch["stop_loss"]  = body.stop_loss
+        if body.target_one is not None: patch["target_one"] = body.target_one
+        if body.target_two is not None: patch["target_two"] = body.target_two
+    if not patch:
+        raise HTTPException(status_code=400, detail="nothing to update")
+    try:
+        sb.table(table).update(patch).eq("id", signal_id).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"update failed: {e}")
+
+    # Flipping a stock back to engine management → re-subscribe to the RT stream.
+    if patch.get("management_mode") == "engine" and body.asset != "option":
+        try:
+            r = sb.table("signals").select("ticker").eq("id", signal_id).single().execute().data
+            if r and r.get("ticker"):
+                from engine import runner
+                runner._ensure_stream_subscription(r["ticker"], cap=200)
+        except Exception:
+            pass
+
+    try:
+        note = "✏️ Manual update: " + ", ".join(f"{k}={v}" for k, v in patch.items())
+        sb.table("signal_events").insert({"signal_id": signal_id, "event_type": "manual_update", "note": note}).execute()
+    except Exception:
+        pass
+    return {"ok": True, "id": signal_id, "updated": patch}
+
+
+@app.post("/admin/signals/{signal_id}/close")
+async def admin_close_signal(request: Request, signal_id: str, asset: str = "stock"):
+    """Manually close a signal, recording realized P&L from the live price
+    (closed_reason='manual')."""
+    _uid, sb = _require_admin_jwt(request)
+    table = "option_signals" if asset == "option" else "signals"
+    try:
+        row = sb.table(table).select("*").eq("id", signal_id).single().execute().data
+    except Exception:
+        row = None
+    if not row:
+        raise HTTPException(status_code=404, detail="signal not found")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    payload: dict = {"status": "closed", "closed_reason": "manual", "closed_at": now_iso}
+    px = None
+    try:
+        from engine.alpaca_client import get_latest_price
+        px = get_latest_price(row.get("ticker"))
+    except Exception:
+        px = None
+    direction = (row.get("direction") or "LONG").upper()
+
+    if asset == "option":
+        try:
+            ep = float(row.get("entry_premium") or 0); dl = float(row.get("delta") or 0)
+            up = float(row.get("underlying_price") or 0)
+            if ep and px and up and dl:
+                est = ep + dl * (px - up)
+                payload["result"] = "win" if est >= ep else "loss"
+        except Exception:
+            pass
+    else:
+        try:
+            entry = float(row.get("entry_price") or 0)
+            if entry and px:
+                raw = (px - entry) / entry * 100
+                pnl = raw if direction == "LONG" else -raw
+                payload["result"]     = "win" if pnl > 0 else "loss"
+                payload["result_pct"] = round(pnl, 4)
+                payload["result_pnl"] = round((px - entry) if direction == "LONG" else (entry - px), 4)
+        except Exception:
+            pass
+
+    try:
+        sb.table(table).update(payload).eq("id", signal_id).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"close failed: {e}")
+    try:
+        won = payload.get("result") == "win"
+        pct = payload.get("result_pct")
+        note = f"✋ Manually closed @ ${px:.2f}" if px else "✋ Manually closed"
+        if pct is not None:
+            note += f" ({'+' if pct >= 0 else ''}{pct:.1f}%)"
+        sb.table("signal_events").insert({
+            "signal_id": signal_id,
+            "event_type": "closed_win" if won else "closed_loss",
+            "price": px, "note": note,
+        }).execute()
+    except Exception:
+        pass
+    logger.info(f"[admin] manual close {asset} {row.get('ticker')} id={signal_id} -> {payload.get('result')}")
+    return {"ok": True, "id": signal_id, **payload}
+
+
 @app.get("/admin/gate-rejections")
 async def admin_gate_rejections(request: Request, hours: int = 24, limit: int = 200):
     """

@@ -624,6 +624,11 @@ def _monitor_stocks(sb: Client) -> None:
     now_utc     = datetime.now(timezone.utc)
 
     for sig in rows:
+        # MANUAL override: the admin owns this signal. The engine must not trail,
+        # move the stop, EOD-close, time-stop, or reverse-exit it — nothing — until
+        # it's flipped back to engine management. (Manual create + agentic control.)
+        if (sig.get("management_mode") or "engine") == "manual":
+            continue
         # TREND_MOMENTUM signals are fully owned by engine.momentum_monitor
         # (chandelier trail, daily-close trend-break exit, no fixed targets /
         # breakeven / EOD). Skip them here so the two managers don't conflict.
@@ -1225,6 +1230,9 @@ def _monitor_options(sb: Client) -> None:
     now_utc     = datetime.now(timezone.utc)
 
     for sig in rows:
+        # MANUAL override: engine leaves admin-owned option signals untouched.
+        if (sig.get("management_mode") or "engine") == "manual":
+            continue
         ticker   = sig["ticker"]
         strategy = sig.get("strategy_type") or "day_trade"
         direction = sig.get("direction", "LONG")

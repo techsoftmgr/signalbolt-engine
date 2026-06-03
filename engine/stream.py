@@ -864,7 +864,7 @@ def _refresh_rt_cache() -> None:
         sb = _sc(os.environ["SUPABASE_URL"], key)
         rows = (
             sb.table("signals")
-            .select("id, ticker, direction, entry_price, stop_loss, target_one, target_two, strategy_type, created_at, score_breakdown")
+            .select("id, ticker, direction, entry_price, stop_loss, target_one, target_two, strategy_type, created_at, score_breakdown, management_mode")
             .eq("status", "active")
             .neq("strategy_type", "scalping")   # scalping handled by bar checker
             .execute()
@@ -873,6 +873,10 @@ def _refresh_rt_cache() -> None:
 
         new_cache: dict[str, list[dict]] = {}
         for r in rows:
+            # MANUAL override: admin owns it — never close it on a tick. Keep it
+            # out of the real-time SL/TP cache entirely.
+            if (r.get("management_mode") or "engine") == "manual":
+                continue
             # TREND_MOMENTUM exits on DAILY closes via momentum_monitor — never
             # on an intraday tick. Keep it out of the real-time SL/TP path so a
             # wick can't close it.
