@@ -2786,6 +2786,30 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled breakout alerts every 15 min")
 
+    # ── Premarket disaster-gap alerts (notification-only, 8:00–9:30 AM ET) ────
+    # Heads-up for OPEN overnight positions (swing/breakout/breakdown/TREND) that
+    # gapped hard AGAINST the signal before the open. NEVER closes a position or
+    # records a result on a premarket print (thin/wicky, options shut, often
+    # reverses by 9:30) — purely "watch the open". The module gates itself to the
+    # 8:00–9:30 AM ET window (no earlier — respects the no-overnight-push rule)
+    # with per-signal-per-day dedup.
+    def _run_premarket_alerts():
+        try:
+            from engine import premarket_alerts
+            premarket_alerts.run(_supabase())
+        except Exception as _e:
+            logger.error(f"[runner] premarket alerts failed: {_e}")
+
+    scheduler.add_job(
+        _run_premarket_alerts,
+        trigger=IntervalTrigger(minutes=15),
+        id="premarket_alerts",
+        name="Premarket disaster-gap alerts (8:00–9:30 AM ET)",
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=210),
+    )
+    logger.info("[runner] Scheduled premarket disaster-gap alerts every 15 min (8:00–9:30 AM ET gate)")
+
     # ── Cycle tracked cards — turnaround (LONG+CALL) + peak (SHORT+PUT) ───────
     # The Buy-Zone / Peak PUSH alerts fire from the 5-min breakout-watch sync;
     # this generates the TRADEABLE cards for those same names. State-based +

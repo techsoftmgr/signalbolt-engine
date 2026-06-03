@@ -39,6 +39,7 @@ _DEFAULT_PREFS = {
     "breakdown_alerts": True, # universe-wide heavy-selling / breakdown-risk alerts
     "breakout_alerts":  True, # universe-wide breakout alerts (broke 20-day high on vol)
     "accumulation_alerts": True, # universe-wide unusual-buying (heavy up-volume) alerts
+    "premarket_gap_alerts": True, # premarket disaster-gap heads-up for open overnight positions (notification only)
 }
 
 # Single Supabase client reused for the lifetime of the process
@@ -329,6 +330,70 @@ def send_breakdown_alert(
         return len(messages)
     except Exception as e:
         logger.debug(f"[push] breakdown alert failed for {ticker}: {e}")
+        return 0
+
+
+def send_premarket_gap_alert(
+    ticker: str,
+    direction: str,
+    strategy: str,
+    gap_pct: float,
+    price: float,
+    stop_loss: float | None = None,
+    through_stop: bool = False,
+    signal_id: str | None = None,
+) -> int:
+    """
+    Notification-ONLY premarket disaster-gap heads-up for an OPEN overnight
+    position that gapped hard AGAINST the signal before the 9:30 open.
+
+    The engine does NOT close the position or record a result on a premarket
+    print — those are thin and wicky, options don't trade premarket, and the gap
+    often reverses by the open. This is purely a "watch the open" warning so a
+    holder isn't blindsided. Broadcast to ALL users with the 'premarket_gap_alerts'
+    pref on (default on). Returns the number dispatched; the caller handles the
+    per-signal-per-day dedup and the 8:00 AM ET earliest-fire gate.
+    """
+    try:
+        is_long   = (direction or "").upper() == "LONG"
+        arrow     = "📉" if is_long else "📈"
+        strat_lbl = (strategy or "").replace("_", " ").strip() or "position"
+        if through_stop and stop_loss:
+            sl_txt = f" It's already through your ${stop_loss:.2f} stop — the open will re-price it."
+        elif stop_loss:
+            sl_txt = f" Your stop is ${stop_loss:.2f}."
+        else:
+            sl_txt = ""
+        title = f"{arrow} {ticker} gapped {gap_pct:+.1f}% premarket"
+        body  = (f"Your {direction} {strat_lbl} on {ticker} is moving against you "
+                 f"premarket (${price:.2f}).{sl_txt} No action taken — watch the 9:30 open.")
+
+        _record_alert("premarket_gap", ticker, title, body,
+                      data={"ticker": ticker, "direction": direction,
+                            "gapPct": gap_pct, "throughStop": through_stop,
+                            "signal_id": signal_id})
+
+        tokens = _tokens_for("premarket_gap_alerts", default=True)
+        if not tokens:
+            return 0
+        data: dict = {"type": "premarket_gap", "ticker": ticker, "direction": direction}
+        if signal_id:
+            data["signal_id"] = signal_id
+        messages = [
+            {
+                "to":    t,
+                "title": title,
+                "body":  body,
+                "data":  data,
+                "sound": "default",
+                "badge": 1,
+            }
+            for t in tokens
+        ]
+        _dispatch(messages, f"PREMARKET-GAP {ticker} {gap_pct:+.1f}%")
+        return len(messages)
+    except Exception as e:
+        logger.debug(f"[push] premarket gap alert failed for {ticker}: {e}")
         return 0
 
 
