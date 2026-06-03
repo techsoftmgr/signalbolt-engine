@@ -2652,6 +2652,30 @@ def start_scheduler() -> BackgroundScheduler:
                     pass
                 if _sent:
                     logger.info(f"[runner] cycle alert sent: {_tk} {_kind} ({_sent} users)")
+
+            # ── PEAK_FORMING / TURN_FORMING — EARLY anticipatory tracked cards ──
+            # Fire off the cycle 'watch' stage (topping / bottoming FORMING, before
+            # the confirmed Peak / Buy-Zone) so we catch the swing earlier. Separate
+            # measured experiments; deduped + sized down inside forming_signals.
+            try:
+                from engine import forming_signals as _fs
+                _peak_watch = [r for r in (dash.get("peak") or [])
+                               if r.get("peakStage") == "watch"]
+                _turn_watch = [r for r in (dash.get("turnaround") or [])
+                               if r.get("turnaroundStage") == "watch"]
+                _peak_watch.sort(key=lambda r: -(r.get("peakScore") or 0))
+                _turn_watch.sort(key=lambda r: -(r.get("turnaroundScore") or 0))
+                _fg = 0
+                for _r in _peak_watch[:3]:
+                    if _fs.generate(sb, _r, "peak").get("stock"):
+                        _fg += 1
+                for _r in _turn_watch[:3]:
+                    if _fs.generate(sb, _r, "turn").get("stock"):
+                        _fg += 1
+                if _fg:
+                    logger.info(f"[runner] forming cycle cards generated: {_fg}")
+            except Exception as _fe:
+                logger.debug(f"[runner] forming cycle gen skipped: {_fe}")
         except Exception as _e:
             logger.error(f"[runner] setup-watch sync failed: {_e}")
 
