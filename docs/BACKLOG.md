@@ -173,6 +173,33 @@ or skip `asset_class='commodity'`). DON'T tune on small samples — breakdown wa
 ~17 closed in 30 days. Historical expectancy is also noisy (phantom-price corruption,
 fixed + corrected on 2026-06-03 — see `reference_signalbolt_phantom_price_guard`).
 
+### Also measure: regime-conditioned expectancy (breakdown AND breakout)
+
+Early (2026-06-03, ~3 days, single regime) BREAKDOWN ran 82% / +0.94%/trade while
+the MIRROR BREAKOUT ran 35% / −0.40%/trade. Likely cause is **market regime, not
+detector quality**: the tape was soft/choppy (SPY & IWM below their 10-day MA), which
+rewards shorts (breakdown) and punishes longs (breakout — failed breakouts / bull
+traps). The two also have different payoff shapes: breakdown = high win-rate, small
+wins/losses (+1.3% / −0.8%); breakout = low win-rate (35%) but big wins/losses
+(+3.5% / −2.5%) → a trend-following profile that needs a trending-UP market to pay.
+
+So segment expectancy by `score_breakdown->>'regime_type'` (the engine already tags
+it) for BOTH detectors:
+```sql
+SELECT score_breakdown->>'detector_source' AS det,
+       regime_type, COUNT(*) AS n,
+       AVG(CASE WHEN result='win' THEN 1.0 ELSE 0 END) AS win_rate,
+       AVG(result_pct) AS expectancy_pct
+FROM signals
+WHERE status='closed' AND score_breakdown->>'detector_source' IN ('BREAKDOWN','BREAKOUT')
+GROUP BY 1, 2 ORDER BY 1, 2;
+```
+**Likely fix (if confirmed):** gate **breakouts to bullish regimes** and **breakdowns
+to bearish/weak regimes** — i.e. don't fire counter-trend. Should lift BOTH win rates.
+Needs both an up AND a down regime in the sample before concluding; do NOT judge a
+detector on a single-regime window. (Related: the deferred "extend market-regime
+filter to SMC signals" backlog note.)
+
 ---
 
 ## How to use this backlog
