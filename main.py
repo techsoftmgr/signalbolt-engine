@@ -3871,7 +3871,7 @@ def _ticker_track_record(sb, sym: str) -> Optional[dict]:
 
 
 @app.get("/ticker/{symbol}/overview")
-async def ticker_overview(request: Request, symbol: str):
+async def ticker_overview(request: Request, symbol: str, refresh: bool = False):
     """
     Ticker Hub overview — one call returns {ticker, price, quant, news,
     performance, trackRecord, nextEarnings} for a single symbol so the
@@ -3893,40 +3893,52 @@ async def ticker_overview(request: Request, symbol: str):
         logger.debug(f"GET /ticker/{sym}/overview price error: {e}")
 
     # ── Quant + cycle read ──────────────────────────────────────────────────
+    # Default: serve the SAME cached universe scan the watchlist reads (kept warm
+    # by the worker every ~3 min) so the hub verdict and the watchlist one-liner
+    # can't disagree, and return quantAsOf so the hub can show "updated HH:MM".
+    # ?refresh=1 (pull-to-refresh) forces a fresh live recompute; tickers outside
+    # the scanned universe always recompute live.
     quant = None
+    quant_as_of = None
     daily_df = None
     try:
         from engine.alpaca_client import get_bars
         from engine import quant_score_service, regime_detector
 
-        daily_df    = get_bars(sym, "1Day", days=400)
-        intraday_df = get_bars(sym, "15Min", days=5)
+        if not refresh:
+            cached_row, _as_of = quant_score_service.cached_score(sym)
+            if cached_row:
+                quant       = cached_row
+                quant_as_of = _as_of
 
-        # Market regime — the turnaround/peak falling-knife gates use it.
-        try:
-            regime_raw  = regime_detector.detect()
-            regime_type = (regime_raw.get("regime_type") or regime_raw.get("regime") or "NEUTRAL")
-        except Exception:
-            regime_type = None
+        # 52-week range / performance below needs the daily history either way.
+        daily_df = get_bars(sym, "1Day", days=400)
 
-        # SPY long history for the cycle driver (best-effort).
-        try:
-            spy_long_df = get_bars("SPY", "1Day", days=400)
-        except Exception:
-            spy_long_df = None
-
-        quant = quant_score_service._score_ticker(
-            sym,
-            price,
-            daily_df,
-            intraday_df,
-            daily_long_df=daily_df,
-            regime_type=regime_type,
-            spy_long_df=spy_long_df,
-        )
+        if quant is None:
+            intraday_df = get_bars(sym, "15Min", days=5)
+            # Market regime — the turnaround/peak falling-knife gates use it.
+            try:
+                regime_raw  = regime_detector.detect()
+                regime_type = (regime_raw.get("regime_type") or regime_raw.get("regime") or "NEUTRAL")
+            except Exception:
+                regime_type = None
+            # SPY long history for the cycle driver (best-effort).
+            try:
+                spy_long_df = get_bars("SPY", "1Day", days=400)
+            except Exception:
+                spy_long_df = None
+            quant = quant_score_service._score_ticker(
+                sym,
+                price,
+                daily_df,
+                intraday_df,
+                daily_long_df=daily_df,
+                regime_type=regime_type,
+                spy_long_df=spy_long_df,
+            )
+            quant_as_of = datetime.now(timezone.utc).isoformat()
     except Exception as e:
         logger.debug(f"GET /ticker/{sym}/overview quant error: {e}")
-        quant = None
 
     # ── News (latest headlines — same shape as /quant/news/{ticker}) ─────────
     news: list[dict] = []
@@ -3981,6 +3993,7 @@ async def ticker_overview(request: Request, symbol: str):
         "ticker":        sym,
         "price":         price,
         "quant":         quant,
+        "quantAsOf":     quant_as_of,
         "news":          news,
         "performance":   performance,
         "trackRecord":   track_record,

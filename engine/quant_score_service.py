@@ -34,6 +34,7 @@ _cache_ts: float   = 0.0
 _CACHE_TTL: int    = int(os.environ.get("QUANT_CACHE_TTL", "60"))
 _REDIS_KEY         = "quant:dashboard:v1"   # cross-process precomputed result (worker → web)
 _SCORED_KEY        = "quant:scored:v1"      # FULL scored universe (for universe-wide alerts)
+_SCORED_TS_KEY     = "quant:scored:v1:asOf" # ISO timestamp of the last universe scan (hub "updated" label)
 
 # ~1y daily bars barely change intraday — cache them so we don't refetch
 # ~150×250 bars on every dashboard build.
@@ -307,6 +308,29 @@ def snapshot(tickers: list[str]) -> dict:
     return out
 
 
+def cached_score(ticker: str) -> tuple[Optional[dict], Optional[str]]:
+    """Return (full _score_ticker row, asOf-ISO) for a ticker from the cached
+    universe scan, or (None, None) if it isn't in the scan.
+
+    This is the SAME snapshot the watchlist one-liner reads (quant:scored:v1), so
+    when the hub serves from here the two views can't disagree. The worker keeps
+    it warm (~3 min); asOf lets the hub show "updated HH:MM". A live recompute is
+    still done on demand (?refresh=1) and for tickers outside the scan.
+    """
+    tk = (ticker or "").upper().strip()
+    if not tk:
+        return None, None
+    try:
+        rows = cache.kv.get_json(_SCORED_KEY) or []
+        as_of = cache.kv.get_json(_SCORED_TS_KEY)
+    except Exception:
+        return None, None
+    for r in rows:
+        if (r.get("ticker") or "").upper() == tk:
+            return r, as_of
+    return None, None
+
+
 def _enrich_breakouts(result: dict) -> None:
     """Add lifecycle state + catalyst + R:R to each breakout row, plus a top-level
     Watch Accuracy summary. Best-effort — never breaks the dashboard."""
@@ -512,7 +536,11 @@ def _build_dashboard(tickers: list[str]) -> dict:
         # alerts — can read each ticker's current state and reuse THIS scan
         # instead of re-fetching ~90 names every 15 min.
         try:
+            from datetime import datetime as _dt, timezone as _tz
             cache.kv.set_json(_SCORED_KEY, scored, _CACHE_TTL * 10)
+            # Stamp when this scan ran so the hub + watchlist can show "updated HH:MM"
+            # and prove they're reading the same snapshot.
+            cache.kv.set_json(_SCORED_TS_KEY, _dt.now(_tz.utc).isoformat(), _CACHE_TTL * 10)
         except Exception:
             pass
 
