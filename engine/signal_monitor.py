@@ -784,21 +784,41 @@ def _monitor_stocks(sb: Client) -> None:
             t2_cross = (price >= t2) if is_long else (price <= t2)
             sl_cross = (price <= sl) if is_long else (price >= sl)
             if t2_cross or sl_cross:
-                won = pnl_pct >= 0
-                _close_signal(sb, sig["id"], "target_hit" if t2_cross else "stop_hit",
-                              current_price=price, entry_price=entry, direction=direction)
-                if t2_cross:
-                    note = f"🎯 Target hit @ ${price:.2f} (+{pnl_pct:.1f}%)"
-                elif won:
-                    note = f"✅ Stop reached in profit @ ${price:.2f} (+{pnl_pct:.1f}%) — locked the gain"
+                # CONFIRM the cross before closing. A single bad/out-of-sequence
+                # SIP last-trade print must not book a fake stop at a price the
+                # tape never printed (2026-06-03 phantom-stop incident). Confirm
+                # against recent 1-min bars or a fresh 2nd read; if unconfirmed,
+                # skip the close this pass (re-checks next pass).
+                _level = t2 if t2_cross else sl
+                if not _alpaca.confirm_level_cross(ticker, _level, is_long,
+                                                   "target" if t2_cross else "stop"):
+                    logger.warning(
+                        f"[monitor] {ticker} {'T2' if t2_cross else 'SL'} cross @ "
+                        f"{price:.2f} NOT confirmed by bars/2nd-read — skipping "
+                        f"(likely bad print; level={_level:.2f})"
+                    )
                 else:
-                    note = f"🔴 Stop hit @ ${price:.2f} ({pnl_pct:.1f}%) — stopped out"
-                _log_event(sb, sig["id"], "closed_win" if won else "closed_loss", price=price, note=note)
-                _STATUS_CACHE.pop(sig["id"], None)
-                _SWING_PEAK.pop(sig["id"], None)
-                logger.info(f"[monitor] {ticker} BACKSTOP close "
-                            f"({'T2' if t2_cross else 'SL'}) @ {price:.2f} ({pnl_pct:+.1f}%)")
-                continue
+                    # Record the exit at the LEVEL, never the overshoot print, so
+                    # realized P&L reflects the actual stop/target (a stop at -3.9%
+                    # books -3.9%, not -11.8%).
+                    exit_px  = _level
+                    pnl_exit = ((exit_px - entry) / entry * 100) if is_long else ((entry - exit_px) / entry * 100)
+                    won      = pnl_exit >= 0
+                    _close_signal(sb, sig["id"], "target_hit" if t2_cross else "stop_hit",
+                                  current_price=exit_px, entry_price=entry, direction=direction)
+                    if t2_cross:
+                        note = f"🎯 Target hit @ ${exit_px:.2f} (+{pnl_exit:.1f}%)"
+                    elif won:
+                        note = f"✅ Stop reached in profit @ ${exit_px:.2f} (+{pnl_exit:.1f}%) — locked the gain"
+                    else:
+                        note = f"🔴 Stop hit @ ${exit_px:.2f} ({pnl_exit:.1f}%) — stopped out"
+                    _log_event(sb, sig["id"], "closed_win" if won else "closed_loss", price=exit_px, note=note)
+                    _STATUS_CACHE.pop(sig["id"], None)
+                    _SWING_PEAK.pop(sig["id"], None)
+                    logger.info(f"[monitor] {ticker} BACKSTOP close "
+                                f"({'T2' if t2_cross else 'SL'}) @ {exit_px:.2f} ({pnl_exit:+.1f}%) "
+                                f"[trigger {price:.2f}]")
+                    continue
         except Exception as e:
             logger.debug(f"[monitor] backstop close error for {ticker}: {e}")
 

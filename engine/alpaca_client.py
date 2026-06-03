@@ -184,6 +184,61 @@ def get_bars(
         return None
 
 
+# ── Stop/target breach confirmation ───────────────────────────────────────────
+
+def confirm_level_cross(
+    ticker: str,
+    level: float,
+    is_long: bool,
+    kind: str,          # "stop" | "target"
+    lookback: int = 5,
+) -> bool:
+    """
+    Confirm a stop/target level was REALLY reached before closing a position.
+
+    Guards against a single bad/out-of-sequence SIP last-trade print (or a brief
+    feed glitch) closing a trade at a price the tape never actually printed — the
+    2026-06-03 phantom-stop incident (CMCSA booked "stop @ 26.50" while the 1-min
+    high was 23.72; BA "stop @ 230" while its whole-day high was 217.72).
+
+    A cross is confirmed if EITHER corroborating source agrees the level was
+    touched:
+      1) the high/low of the last `lookback` completed 1-min bars, OR
+      2) a fresh, independent last-trade read (a real move persists across two
+         reads; a one-off bad print reverts).
+
+    Returns False when neither source corroborates — the caller must then NOT
+    close (it re-checks next tick/pass). Also False if no data is available at
+    all (fail-closed: never fabricate a close).
+    """
+    def _breach(hi: float, lo: float) -> bool:
+        if kind == "stop":
+            return (lo <= level) if is_long else (hi >= level)
+        return (hi >= level) if is_long else (lo <= level)   # target
+
+    # 1) recent completed 1-min bars (bar aggregation excludes most bad prints,
+    #    and is what the user's chart shows)
+    try:
+        df = get_bars(ticker, timeframe="1Min", days=1)
+        if df is not None and len(df) > 0 and {"high", "low"}.issubset(df.columns):
+            recent = df.tail(max(1, lookback))
+            if _breach(float(recent["high"].max()), float(recent["low"].min())):
+                return True
+    except Exception as e:
+        logger.debug(f"[alpaca] confirm_level_cross bars({ticker}) failed: {e}")
+
+    # 2) fresh independent last-trade read — a sustained move still breaches;
+    #    a transient bad print has reverted by now.
+    try:
+        p2 = get_latest_price(ticker)
+        if p2 is not None:
+            return _breach(float(p2), float(p2))
+    except Exception as e:
+        logger.debug(f"[alpaca] confirm_level_cross 2nd-read({ticker}) failed: {e}")
+
+    return False
+
+
 # ── News helper ───────────────────────────────────────────────────────────────
 
 def get_news(ticker: str, limit: int = 6) -> list[dict]:
