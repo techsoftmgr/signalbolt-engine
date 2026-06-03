@@ -4219,6 +4219,22 @@ async def ticker_overview(request: Request, symbol: str, refresh: bool = False):
     }
 
 
+@app.get("/ticker/{symbol}/chart-read")
+async def ticker_chart_read(request: Request, symbol: str):
+    """Phase-1 Expert Read — programmatic technical analysis computed from OHLCV
+    (trend, regression channel, swing trendlines, key S/R, chart patterns, gaps,
+    volume regime, multi-timeframe confluence). Read-only; best-effort."""
+    _require_jwt(request)
+    sym = symbol.upper().strip()
+    try:
+        from engine import chart_read
+        r = chart_read.analyze(sym)
+        return r or {"ticker": sym, "unavailable": True}
+    except Exception as e:
+        logger.debug(f"GET /ticker/{sym}/chart-read error: {e}")
+        return {"ticker": sym, "unavailable": True}
+
+
 # ── News Reaction Feed ────────────────────────────────────────────────────────
 
 @app.get("/news/reaction")
