@@ -299,19 +299,49 @@ def analyze(symbol: str) -> Optional[dict]:
     elif dns >= 2: mtf, mtf_dir = "leaning", "down"
     else:          mtf, mtf_dir = "mixed", "none"
 
-    # Overall bias + confidence (simple, transparent blend).
-    score = 0
-    score += {"up": 2, "down": -2}.get(trend_d, 0)
-    score += {"up": 1, "down": -1}.get(t1h, 0)
+    # ── Overall bias — ANCHORED to the hub's daily quant verdict ──────────────
+    # The hub Game Plan (planVerdict) is the headline. To stop the Expert Read
+    # from CONTRADICTING it ("agree sometimes, opposite sometimes"), we anchor the
+    # bias to the SAME daily quant row the hub reads, then let chart-read context
+    # (1h / patterns / volume) only DOWNGRADE to neutral on divergence — never FLIP
+    # the daily direction. Divergence is surfaced as an explicit note, not a flip.
+    qrow = None
+    try:
+        from engine import quant_score_service as _qs
+        qrow, _as_of = _qs.cached_score(sym)
+    except Exception:
+        qrow = None
+    if qrow:
+        _ma = qrow.get("ma20"); _ts = float(qrow.get("trendScore") or 0); _setup = qrow.get("setupType")
+        if qrow.get("peakStage") == "peak" or _setup == "breakdown":
+            primary = "bearish"
+        elif qrow.get("turnaroundStage") == "buyzone" or _setup == "breakout":
+            primary = "bullish"
+        elif _ma and px > _ma and _ts >= 55:
+            primary = "bullish"
+        elif _ma and px < _ma:
+            primary = "bearish"
+        else:
+            primary = "neutral"
+    else:
+        primary = {"up": "bullish", "down": "bearish"}.get(trend_d, "neutral")
+
+    # Chart-read context modifier (shorter timeframe + patterns + volume).
+    mod = {"up": 1, "down": -1}.get(t1h, 0)
     for p in pats:
-        score += {"bullish": 1, "bearish": -1}.get(p.get("tone"), 0)
-    if vol == "accumulation": score += 1
-    if vol == "distribution": score -= 1
-    bias = "bullish" if score >= 2 else "bearish" if score <= -2 else "neutral"
-    conf = min(90, 50 + abs(score) * 8)
+        mod += {"bullish": 1, "bearish": -1}.get(p.get("tone"), 0)
+    mod += {"accumulation": 1, "distribution": -1}.get(vol, 0)
+
+    diverges = (primary == "bullish" and mod <= -2) or (primary == "bearish" and mod >= 2)
+    bias = "neutral" if diverges else primary
+    agree = ((primary == "bullish" and mod > 0) or (primary == "bearish" and mod < 0))
+    conf = int(min(88, 52 + (12 if agree else 0) + min(16, abs(mod) * 4)))
 
     # Plain-English narrative
     bullets: list[str] = []
+    if diverges:
+        bullets.append(f"⚠️ Daily verdict is {primary}, but shorter timeframes / patterns / volume "
+                       f"are pulling the other way — MIXED right now; wait for them to align.")
     bullets.append(f"Daily trend: {trend_d}; MTF {mtf} {mtf_dir if mtf_dir!='none' else ''}".strip()
                    + f" (15m {t15} · 1h {t1h} · 1D {trend_d}).")
     if ch:
