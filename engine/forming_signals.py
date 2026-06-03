@@ -42,6 +42,9 @@ _CONFIG = {
     "breakdown": ("SHORT", "BREAKDOWN_FORMING", "breakdown_forming", "SHORT"),
     "peak":      ("SHORT", "PEAK_FORMING",      "peak_forming",      "SHORT"),
     "turn":      ("LONG",  "TURN_FORMING",      "turn_forming",      "LONG"),
+    # Volume-leads-price: the EARLIEST tell, before any structural break.
+    "accum":     ("LONG",  "ACCUM_FORMING",     "accum_forming",     "LONG"),
+    "distrib":   ("SHORT", "DISTRIB_FORMING",   "distrib_forming",   "SHORT"),
 }
 
 
@@ -93,6 +96,7 @@ def _conf(kind: str, r: dict) -> int:
     score_field = {
         "breakout":  "breakoutScore", "breakdown": "breakdownScore",
         "peak":      "peakScore",     "turn":      "turnaroundScore",
+        "accum":     "volumeScore",   "distrib":   "volumeScore",
     }[kind]
     raw = float(r.get(score_field) or r.get("volumeScore") or 58.0)
     return int(min(80, max(55, round(raw))))   # capped below confirmed — unproven
@@ -133,6 +137,8 @@ def generate(sb, r: dict, kind: str) -> dict:
         "breakdown": "forming breakdown (lost the 20-day average)",
         "peak":      "forming top (exhaustion + first lower high)",
         "turn":      "forming bottom (first higher low / reclaim)",
+        "accum":     "high-volume accumulation (big buyers stepping in)",
+        "distrib":   "high-volume distribution (heavy selling stepping in)",
     }[kind]
 
     signal_row = {

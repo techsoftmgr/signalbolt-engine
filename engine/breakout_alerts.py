@@ -84,6 +84,7 @@ def run(sb=None) -> dict:
     early_cands:   list[dict] = []
     accum_cands:   list[dict] = []
     forming_now:   list[dict] = []   # EARLY bullish state (BREAKOUT_FORMING)
+    accum_now:     list[dict] = []   # heavy up-vol, not yet near the high (ACCUM_FORMING)
 
     for r in scored:
         tk = (r.get("ticker") or "").upper()
@@ -106,6 +107,10 @@ def run(sb=None) -> dict:
         # → BREAKOUT_FORMING tracked card (state-based).
         elif cur["near"] and cur["heavyup"]:
             forming_now.append(r)
+        # EARLIEST bullish tell: heavy up-volume (big buyers) in an uptrend but not
+        # yet pressing the high → ACCUM_FORMING (volume leads price).
+        elif cur["heavyup"]:
+            accum_now.append(r)
 
         if cur["breakout"] and not prev.get("breakout"):
             confirm_cands.append(r)
@@ -217,6 +222,26 @@ def run(sb=None) -> dict:
                         stats["forming"] = stats.get("forming", 0) + 1
                 except Exception as _e:
                     logger.debug(f"[breakout_alerts] forming gen failed for {tk}: {_e}")
+
+    # ACCUM_FORMING — earliest bullish tell (heavy accumulation before any break).
+    if sb is not None and accum_now:
+        accum_now.sort(key=lambda r: -float(r.get("volumeScore") or 0))
+        try:
+            from engine import forming_signals as _fs2
+        except Exception:
+            _fs2 = None
+        if _fs2 is not None:
+            gen = 0
+            for r in accum_now:
+                if gen >= _MAX_GEN:
+                    break
+                tk = (r.get("ticker") or "").upper()
+                try:
+                    if _fs2.generate(sb, r, "accum").get("stock"):
+                        gen += 1
+                        stats["accumForming"] = stats.get("accumForming", 0) + 1
+                except Exception as _e:
+                    logger.debug(f"[breakout_alerts] accum forming gen failed for {tk}: {_e}")
 
     logger.info(f"[breakout_alerts] done {stats}")
     return stats
