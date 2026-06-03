@@ -40,6 +40,45 @@ def _conf(r: dict) -> int:
     return int(min(85, max(58, round(bd))))
 
 
+# ── Asset classification (LOGGING-ONLY) ─────────────────────────────────────
+# Tags each breakdown card with its instrument class so we can LATER measure
+# whether commodity / bond / broad-ETF breakdowns (which mean-revert around
+# macro levels) earn their keep vs single-name equity breakdowns. This is PURE
+# metadata written to score_breakdown — it does NOT gate, size, re-price, or
+# alter any signal in any way. Curated, extensible lists; anything unknown
+# defaults to "equity" so a normal stock's behaviour is never changed.
+_COMMODITY_ETFS = {
+    "GLD", "IAU", "GLDM", "SGOL", "SLV", "SIVR", "PSLV", "GDX", "GDXJ", "SIL",
+    "USO", "BNO", "UNG", "UGA", "DBC", "DBA", "DBO", "PPLT", "PALL", "CPER",
+    "WEAT", "CORN", "SOYB", "GLTR", "COMT", "PDBC", "USCI",
+}
+_BOND_ETFS = {
+    "TLT", "IEF", "SHY", "IEI", "GOVT", "BIL", "LQD", "HYG", "JNK", "AGG",
+    "BND", "BNDX", "TIP", "VTIP", "MUB", "EMB", "TLH", "EDV", "SHV",
+}
+_BROAD_EQUITY_ETFS = {
+    "SPY", "VOO", "IVV", "QQQ", "QQQM", "IWM", "DIA", "VTI", "ITOT", "RSP",
+    "MDY", "VTV", "VUG", "SCHB", "SCHX", "SPLG", "IWB", "IWV",
+}
+_SECTOR_ETFS = {
+    "XLE", "XLF", "XLK", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE",
+    "XLC", "SMH", "SOXX", "XBI", "IBB", "KRE", "XME", "XOP", "ITB", "XRT",
+}
+
+
+def classify_asset(ticker: str) -> dict:
+    """Logging-only instrument classification. Returns {'asset_class', 'is_etf'}.
+    Unknown / single-name tickers default to 'equity' so this never reclassifies
+    or alters a stock signal."""
+    t = (ticker or "").upper()
+    if t in _COMMODITY_ETFS:      asset_class = "commodity"
+    elif t in _BOND_ETFS:         asset_class = "bond"
+    elif t in _BROAD_EQUITY_ETFS: asset_class = "broad_etf"
+    elif t in _SECTOR_ETFS:       asset_class = "sector_etf"
+    else:                         asset_class = "equity"
+    return {"asset_class": asset_class, "is_etf": asset_class != "equity"}
+
+
 def generate(sb, r: dict) -> dict:
     """From a confirmed-breakdown quant row, fire a SHORT + PUT card.
 
@@ -118,6 +157,11 @@ def generate(sb, r: dict) -> dict:
             "ma20":            round(float(ma), 2) if ma else None,
             "atr_used":        round(atr, 4),
             "initial_stop":    stop,
+            # Logging-only metadata for the breakdown-quality study (does NOT
+            # gate or change firing). Lets us later segment realized expectancy
+            # by entry volume and instrument class.
+            "relativeVolume":  round(float(rvol), 2) if isinstance(rvol, (int, float)) else None,
+            **classify_asset(tk),
         },
         "confidence_grade":    "B",
         "risk_grade":          "HIGH",
