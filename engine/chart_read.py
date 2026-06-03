@@ -48,18 +48,24 @@ def _swings(df: pd.DataFrame, n: int = _SWING_N) -> tuple[list[int], list[int]]:
 
 # ── Trend ─────────────────────────────────────────────────────────────────────
 def _trend(df: pd.DataFrame) -> str:
-    """'up' / 'down' / 'sideways' from EMA20 vs EMA50 + slope + price position."""
-    if df is None or len(df) < 50:
+    """'up' / 'down' / 'sideways' from EMA20 (vs EMA50 when available) + slope."""
+    if df is None or len(df) < 20:
         return "sideways"
     c = df["close"]
     ema20 = c.ewm(span=20, adjust=False).mean()
-    ema50 = c.ewm(span=50, adjust=False).mean()
-    px = float(c.iloc[-1])
-    e20, e50 = float(ema20.iloc[-1]), float(ema50.iloc[-1])
+    px = float(c.iloc[-1]); e20 = float(ema20.iloc[-1])
     slope20 = (e20 - float(ema20.iloc[-10])) / float(ema20.iloc[-10]) * 100 if len(ema20) >= 10 else 0.0
-    if px > e20 > e50 and slope20 > 0.2:
+    if len(df) >= 50:
+        e50 = float(c.ewm(span=50, adjust=False).mean().iloc[-1])
+        if px > e20 > e50 and slope20 > 0.2:
+            return "up"
+        if px < e20 < e50 and slope20 < -0.2:
+            return "down"
+        return "sideways"
+    # Newer ticker (<50 bars, e.g. DRAM): EMA20 + slope only.
+    if px > e20 and slope20 > 0.2:
         return "up"
-    if px < e20 < e50 and slope20 < -0.2:
+    if px < e20 and slope20 < -0.2:
         return "down"
     return "sideways"
 
@@ -275,7 +281,7 @@ def analyze(symbol: str) -> Optional[dict]:
     except Exception as e:
         logger.debug(f"[chart_read] {sym} bars fetch failed: {e}")
         return None
-    if daily is None or len(daily) < 50:
+    if daily is None or len(daily) < 30:   # ~6 weeks — covers newer listings (DRAM)
         return None
 
     px = float(daily["close"].iloc[-1])
