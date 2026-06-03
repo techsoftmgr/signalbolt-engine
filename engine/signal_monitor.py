@@ -1359,16 +1359,27 @@ def _monitor_options(sb: Client) -> None:
 
                 if result:
                     pct = ((est_prem - entry_prem) / entry_prem * 100) if entry_prem else 0
-                    sb.table("option_signals").update({
+                    base = {
                         "status":        "closed",
                         "closed_reason": "target_hit" if result == "win" else "stop_hit",
                         "result":        result,
-                        # realized premium P&L% — needed to measure PUT/CALL
-                        # expectancy (options were win/loss-only before).
-                        "result_pct":    round(pct, 4),
-                        "result_pnl":    round(est_prem - entry_prem, 4),
                         "closed_at":     now_utc.isoformat(),
-                    }).eq("id", sig["id"]).execute()
+                    }
+                    # realized premium P&L% — needed to measure PUT/CALL expectancy.
+                    # Try WITH the P&L cols; if they don't exist yet (migration
+                    # supabase-option-result-pct.sql not run), still close the
+                    # signal WITHOUT them — a close must never fail on a missing
+                    # analytics column.
+                    try:
+                        sb.table("option_signals").update({
+                            **base,
+                            "result_pct": round(pct, 4),
+                            "result_pnl": round(est_prem - entry_prem, 4),
+                        }).eq("id", sig["id"]).execute()
+                    except Exception as _col_e:
+                        logger.warning(f"[monitor] option P&L cols missing for {ticker} "
+                                       f"({_col_e}); closing without result_pct/pnl")
+                        sb.table("option_signals").update(base).eq("id", sig["id"]).execute()
                     event_type = "closed_win" if result == "win" else "closed_loss"
                     event_note = (
                         f"Target hit — premium ${entry_prem:.2f}→${est_prem:.2f} (+{pct:.1f}%)"
