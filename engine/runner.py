@@ -197,6 +197,16 @@ STRATEGY_MAX_HOLD_HOURS = {
     "breakout":       240.0,  # 10 days — bullish swing long/call from a breakout
     "turnaround":     240.0,  # 10 days — bullish swing long/call from a cycle bottom
     "peak":           240.0,  # 10 days — bearish swing short/put from a cycle top
+    # Predictive "forming" detectors are swing entries that fire EARLIER than the
+    # confirmed move — they target the same multi-day move, so they inherit the
+    # parent's 10-day swing window (without this they fell back to the 48h default
+    # and were time-expired before the pattern could resolve). 0.25x size; real
+    # exits are still thesis-driven (stop / target / trail / structure-reversal).
+    "breakdown_forming": 240.0,
+    "distrib_forming":   240.0,
+    "peak_forming":      240.0,
+    "turn_forming":      240.0,
+    "accum_forming":     240.0,
     "earnings":       48.0,   # 2 days — pre/post earnings move
     "short_squeeze":  24.0,   # 1 day — squeeze resolves quickly
     "position_trade": 720.0,  # 30 days — macro position
