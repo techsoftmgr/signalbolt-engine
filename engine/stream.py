@@ -911,9 +911,32 @@ def _close_rt_signal(sig: dict, hit: str, price: float) -> None:
         entry    = float(sig["entry_price"])
         is_long  = sig["direction"] == "LONG"
         hit_target = hit == "t2"
+        level    = float(sig["target_two"]) if hit_target else float(sig["stop_loss"])
 
-        pnl_pct = ((price - entry) / entry * 100) if is_long else ((entry - price) / entry * 100)
-        pnl_abs = (price - entry) if is_long else (entry - price)
+        # CONFIRM the cross before booking it. A single bad/out-of-sequence SIP
+        # print on the live stream must not fake-close a trade at a price the tape
+        # never printed (2026-06-03 phantom-stop incident). If neither recent
+        # 1-min bars nor a fresh 2nd read corroborate the level, skip — the signal
+        # stays active and re-checks on the next tick.
+        try:
+            from engine import alpaca_client as _ac
+            if not _ac.confirm_level_cross(sig.get("ticker", ""), level, is_long,
+                                           "target" if hit_target else "stop"):
+                logger.warning(
+                    f"[stream] {sig.get('ticker')} {'T2' if hit_target else 'SL'} "
+                    f"cross @ {price:.2f} NOT confirmed by bars/2nd-read — skipping "
+                    f"(likely bad print; level={level:.2f})"
+                )
+                return
+        except Exception as _ce:
+            logger.debug(f"[stream] level-cross confirm error for {sig.get('ticker')}: {_ce}")
+
+        # Record the exit at the LEVEL, not the overshoot tick, so realized P&L
+        # reflects the actual stop/target (caps phantom overshoot; books a trailed
+        # stop at its trail level).
+        exit_px = level
+        pnl_pct = ((exit_px - entry) / entry * 100) if is_long else ((entry - exit_px) / entry * 100)
+        pnl_abs = (exit_px - entry) if is_long else (entry - exit_px)
 
         # Classify by REALIZED P&L, not exit mechanism: a trailed / profit-locked
         # stop that exits in the green is a WIN (the CME 2026-06-02 breakdown
@@ -934,13 +957,13 @@ def _close_rt_signal(sig: dict, hit: str, price: float) -> None:
         # Timeline event
         sign_str = "+" if pnl_pct > 0 else ""
         note = (
-            f"{hit_label} hit @ ${price:.2f} — closed {sign_str}{pnl_pct:.1f}% "
+            f"{hit_label} hit @ ${exit_px:.2f} — closed {sign_str}{pnl_pct:.1f}% "
             f"({'win' if result == 'win' else 'loss'})"
         )
         sb.table("signal_events").insert({
             "signal_id":  sig["id"],
             "event_type": "closed_win" if result == "win" else "closed_loss",
-            "price":      price,
+            "price":      exit_px,
             "note":       note,
         }).execute()
 
@@ -977,7 +1000,7 @@ def _close_rt_signal(sig: dict, hit: str, price: float) -> None:
 
         logger.info(
             f"[stream] ⚡ RT CLOSE {ticker} {sig['direction']} "
-            f"hit={hit.upper()} price={price:.2f} pnl={pnl_pct:+.2f}%"
+            f"hit={hit.upper()} @ {exit_px:.2f} pnl={pnl_pct:+.2f}% [trigger {price:.2f}]"
         )
 
     except Exception as e:
