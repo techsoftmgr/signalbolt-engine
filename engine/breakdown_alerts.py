@@ -87,6 +87,7 @@ def run(sb=None) -> dict:
     confirm_cands: list[dict] = []
     breakdown_now: list[dict] = []   # names CURRENTLY in breakdown (for tracked cards)
     forming_now: list[dict]   = []   # names in the EARLY bearish state (BREAKDOWN_FORMING)
+    distrib_now: list[dict]   = []   # heavy down-vol but still above MA (DISTRIB_FORMING)
 
     for r in scored:
         tk = (r.get("ticker") or "").upper()
@@ -111,6 +112,10 @@ def run(sb=None) -> dict:
         # confirmed breakdown) → BREAKDOWN_FORMING tracked card (state-based).
         elif cur["belowMA"] and _heavy_down(r):
             forming_now.append(r)
+        # EARLIEST bearish tell: heavy down-volume while still above the MA
+        # (distribution into strength) → DISTRIB_FORMING. NOISIEST of the set.
+        elif _heavy_down(r):
+            distrib_now.append(r)
 
         # CONFIRMED: just entered the breakdown bucket (broke 20-day low on vol).
         if cur["breakdown"] and not prev.get("breakdown"):
@@ -202,6 +207,26 @@ def run(sb=None) -> dict:
                         stats["forming"] = stats.get("forming", 0) + 1
                 except Exception as _e:
                     logger.debug(f"[breakdown_alerts] forming gen failed for {tk}: {_e}")
+
+    # DISTRIB_FORMING — earliest bearish tell (heavy selling while still above MA).
+    if sb is not None and distrib_now:
+        distrib_now.sort(key=lambda r: -float(r.get("volumeScore") or 0))
+        try:
+            from engine import forming_signals as _fs2
+        except Exception:
+            _fs2 = None
+        if _fs2 is not None:
+            gen = 0
+            for r in distrib_now:
+                if gen >= _MAX_GEN:
+                    break
+                tk = (r.get("ticker") or "").upper()
+                try:
+                    if _fs2.generate(sb, r, "distrib").get("stock"):
+                        gen += 1
+                        stats["distribForming"] = stats.get("distribForming", 0) + 1
+                except Exception as _e:
+                    logger.debug(f"[breakdown_alerts] distrib forming gen failed for {tk}: {_e}")
 
     logger.info(f"[breakdown_alerts] done {stats}")
     return stats
