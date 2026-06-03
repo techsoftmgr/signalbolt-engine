@@ -200,6 +200,25 @@ Needs both an up AND a down regime in the sample before concluding; do NOT judge
 detector on a single-regime window. (Related: the deferred "extend market-regime
 filter to SMC signals" backlog note.)
 
+**3-state regime → detector map (theory to TEST per regime cell):**
+
+| Regime | Favor (positive expectancy expected) | Suppress / down-weight |
+|--------|--------------------------------------|------------------------|
+| **Bull trend** | breakout (+ turnaround for pullback bottoms) | breakdown, peak |
+| **Bear / weak** | breakdown (+ peak) | breakout, turnaround |
+| **Chop / range** | mean-reversion: `vwap_reclaim`, `gap_fill`; fade-extremes: `turnaround` at strong support, `peak` at strong resistance; SMC liquidity-sweep reversals | **breakout & breakdown** (false breaks); also size DOWN — chop is low-edge for all |
+
+Notes:
+- Continuation detectors (breakout/breakdown) fail in chop (false breaks revert) —
+  this is the leading explanation for breakout's early 35% / −0.40%/trade.
+- Mean-reversion / fade-extremes carry **negative skew** in chop: many small wins
+  until the range breaks into a trend → one big loss (short the top of what becomes
+  a breakout). Measure expectancy AND tail, not just win-rate.
+- Chop is low-edge for everyone; the right response may be "trade less / size down",
+  not "switch detectors". Validate before gating.
+- Verdict per cell needs adequate n IN THAT regime (≥~15). Don't conclude on a
+  single-regime window. THEORY ONLY until the segmented `regime_type` data confirms it.
+
 ### Also: the OPTION (PUT/CALL) leg needs a higher bar + DTE/moneyness alignment
 
 The breakdown stock short ran ~82% early, but the paired PUT did NOT (tiny sample:
