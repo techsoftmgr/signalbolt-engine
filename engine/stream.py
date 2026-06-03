@@ -732,6 +732,21 @@ def _close_scalp_signal(sig: dict, hit: str, bar_price: float) -> None:
                           sig["target_two"] if hit == "t2" else
                           sig["stop_loss"])
 
+        # CONFIRM the level was really reached (guards a bad-print bar high/low
+        # from booking a fake scalp close). Records at the level already, but a
+        # phantom trigger would still close prematurely without this.
+        try:
+            from engine import alpaca_client as _ac
+            if not _ac.confirm_level_cross(sig.get("ticker", ""), hit_price, is_long,
+                                           "target" if hit_target else "stop"):
+                logger.warning(
+                    f"[stream] {sig.get('ticker')} scalp {hit.upper()} cross @ "
+                    f"{bar_price:.2f} NOT confirmed (level {hit_price:.2f}) — skipping bad print"
+                )
+                return
+        except Exception as _ce:
+            logger.debug(f"[stream] scalp confirm error for {sig.get('ticker')}: {_ce}")
+
         pnl_pct = ((hit_price - entry) / entry * 100) if is_long else \
                   ((entry - hit_price) / entry * 100)
         pnl_abs = hit_price - entry if is_long else entry - hit_price

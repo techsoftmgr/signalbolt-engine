@@ -239,6 +239,47 @@ def confirm_level_cross(
     return False
 
 
+def sane_close_price(
+    ticker: str,
+    raw_price: Optional[float],
+    lookback: int = 5,
+    max_dev_pct: float = 5.0,
+) -> Optional[float]:
+    """
+    Reject a gross bad-print close price. Used by NON-level closes (EOD,
+    time-stop, near-expiry, trend exit) that record `get_latest_price()` directly
+    — a single bad SIP print there would mis-record P&L the same way the phantom
+    stop-outs did.
+
+    If `raw_price` sits more than `max_dev_pct` OUTSIDE the recent `lookback`-bar
+    1-min range, clamp it to the nearest real extreme (a real move that large
+    would itself appear in the bars, so it would NOT be clamped — only out-of-tape
+    prints are). Returns `raw_price` unchanged when within tolerance or when bars
+    are unavailable (fail-open: never block a legitimate close).
+    """
+    if raw_price is None:
+        return raw_price
+    try:
+        df = get_bars(ticker, timeframe="1Min", days=1)
+        if df is None or len(df) == 0 or not {"high", "low"}.issubset(df.columns):
+            return raw_price
+        recent = df.tail(max(1, lookback))
+        hi = float(recent["high"].max())
+        lo = float(recent["low"].min())
+        if raw_price > hi * (1 + max_dev_pct / 100):
+            logger.warning(f"[alpaca] {ticker} close price {raw_price:.2f} > recent "
+                           f"high {hi:.2f}+{max_dev_pct}% — bad print, clamped to {hi:.2f}")
+            return hi
+        if raw_price < lo * (1 - max_dev_pct / 100):
+            logger.warning(f"[alpaca] {ticker} close price {raw_price:.2f} < recent "
+                           f"low {lo:.2f}-{max_dev_pct}% — bad print, clamped to {lo:.2f}")
+            return lo
+        return raw_price
+    except Exception as e:
+        logger.debug(f"[alpaca] sane_close_price({ticker}) failed: {e}")
+        return raw_price
+
+
 # ── News helper ───────────────────────────────────────────────────────────────
 
 def get_news(ticker: str, limit: int = 6) -> list[dict]:

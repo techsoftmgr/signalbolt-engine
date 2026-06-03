@@ -341,13 +341,23 @@ def _close_signal(
     current_price: float | None = None,
     entry_price: float | None = None,
     direction: str = "LONG",
+    ticker: str | None = None,
 ) -> None:
     """
     Write closed status to Supabase.
     When current_price + entry_price are provided (e.g. market_close, time_limit)
     the actual P&L is recorded so history shows win/loss — not just 'expired'.
+
+    When `ticker` is given, the recorded price is run through
+    alpaca_client.sane_close_price() so a single bad SIP print can't mis-record
+    P&L on a non-level close (EOD / time-stop / near-expiry / trend exit). Level
+    closes (stop/target) already cap at the level upstream.
     """
     table = "option_signals" if close_type == "option" else "signals"
+
+    # Bad-print guard for stock closes that book a live market price.
+    if ticker and current_price is not None and close_type != "option":
+        current_price = _alpaca.sane_close_price(ticker, current_price)
 
     result    = "expired"
     pnl_pct   = None
@@ -650,7 +660,7 @@ def _monitor_stocks(sb: Client) -> None:
             _close_signal(sb, sig["id"], "time_limit",
                           current_price=price,
                           entry_price=float(sig.get("entry_price") or 0),
-                          direction=direction)
+                          direction=direction, ticker=ticker)
             _log_event(sb, sig["id"], "time_limit",
                        price=price,
                        note=f"30-min scalp window expired — position exited at ${price:.2f}" if price else
@@ -734,7 +744,7 @@ def _monitor_stocks(sb: Client) -> None:
                     else ""
                 )
                 _close_signal(sb, sig["id"], "market_close",
-                              current_price=price, entry_price=entry, direction=direction)
+                              current_price=price, entry_price=entry, direction=direction, ticker=ticker)
                 _log_event(sb, sig["id"], "market_close", price=price,
                            note=f"Market closing — {direction} exited at ${price:.2f} {pnl_str}".strip()
                                 if price else f"Market closing — {direction} position force-closed")
@@ -981,7 +991,7 @@ def _monitor_stocks(sb: Client) -> None:
                             logger.info(f"[monitor] {ticker} EMA_RECLAIM trend exit — 15m close "
                                         f"{last_close:.2f} {'<' if is_long else '>'} 20-EMA {ema20:.2f}")
                             _close_signal(sb, sig_id, "target_hit",
-                                          current_price=price, entry_price=entry, direction=direction)
+                                          current_price=price, entry_price=entry, direction=direction, ticker=ticker)
                             _log_event(sb, sig_id, "closed_win", price=price,
                                        note=(f"📉 20-EMA close lost @ ${price:.2f} (+{pnl_x:.1f}%) — "
                                              f"trend exit, rode the move"))
@@ -1035,7 +1045,7 @@ def _monitor_stocks(sb: Client) -> None:
                             logger.info(f"[monitor] {ticker} INTELLIGENT EXIT score={decision['score']} "
                                         f"pnl={decision['pnl_pct']}% — {reasons_str}")
                             _close_signal(sb, sig_id, "target_hit",
-                                          current_price=price, entry_price=entry, direction=direction)
+                                          current_price=price, entry_price=entry, direction=direction, ticker=ticker)
                             _log_event(sb, sig_id, "closed_win", price=price,
                                        note=(f"🧠 Intelligent exit @ ${price:.2f} "
                                              f"(+{decision['pnl_pct']}%) — {reasons_str}"))
@@ -1089,7 +1099,7 @@ def _monitor_stocks(sb: Client) -> None:
                 logger.info(f"[monitor] {ticker} near-expiry profit book +{pnl_pct:.1f}% "
                             f"(age {_age_h:.1f}/{_hold_h}h)")
                 _close_signal(sb, sig["id"], "target_hit",
-                              current_price=price, entry_price=entry, direction=direction)
+                              current_price=price, entry_price=entry, direction=direction, ticker=ticker)
                 _log_event(sb, sig["id"], "closed_win", price=price,
                            note=f"⏳ Near-expiry book @ ${price:.2f} (+{pnl_pct:.1f}%) — banked before expiry")
                 _STATUS_CACHE.pop(sig["id"], None)
@@ -1116,7 +1126,7 @@ def _monitor_stocks(sb: Client) -> None:
                     logger.info(f"[monitor] {ticker} TIME-STOP — no progress in {_age_m:.0f}m "
                                 f"@ {price:.2f} ({pnl_pct:+.1f}%)")
                     _close_signal(sb, sig["id"], "time_limit",
-                                  current_price=price, entry_price=entry, direction=direction)
+                                  current_price=price, entry_price=entry, direction=direction, ticker=ticker)
                     _log_event(sb, sig["id"], "closed_loss" if pnl_pct < 0 else "closed_win", price=price,
                                note=(f"⏳ Time-stop @ ${price:.2f} ({pnl_pct:+.1f}%) — no progress "
                                      f"in {_age_m:.0f} min, cut to limit the drag"))
@@ -1178,7 +1188,7 @@ def _monitor_stocks(sb: Client) -> None:
                                   else f"stalling {age_mins:.0f} min — protecting gains")
                         logger.info(f"[monitor] {ticker} EARLY BOOK (convergence) — {reason} pnl={pnl_pct:.1f}%")
                         _close_signal(sb, sig["id"], "target_hit",
-                                      current_price=price, entry_price=entry, direction=direction)
+                                      current_price=price, entry_price=entry, direction=direction, ticker=ticker)
                         _log_event(sb, sig["id"], "closed_win", price=price,
                                    note=f"💡 Profit booked @ ${price:.2f} (+{pnl_pct:.1f}%) — {reason}")
                         _STATUS_CACHE.pop(sig["id"], None)
@@ -1210,7 +1220,7 @@ def _monitor_stocks(sb: Client) -> None:
             if _detect_structure_reversal(ticker, direction):
                 logger.info(f"[monitor] {ticker} structure reversed — closing {direction} early")
                 _close_signal(sb, sig["id"], "structure_reversal",
-                              current_price=price, entry_price=entry, direction=direction)
+                              current_price=price, entry_price=entry, direction=direction, ticker=ticker)
                 opposite = "bearish" if direction == "LONG" else "bullish"
                 _log_event(sb, sig["id"], "reversal", price=price,
                            note=f"⚠️ {opposite.capitalize()} CHoCH detected — {direction} closed early @ ${price:.2f} ({'+' if pnl_pct >= 0 else ''}{pnl_pct:.1f}%)")
