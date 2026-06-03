@@ -305,12 +305,23 @@ def analyze(symbol: str) -> Optional[dict]:
     # (2) QUANT verdict — the SAME cached row the hub Game Plan reads.
     # We surface BOTH + whether they AGREE: agreement = confirmation; DISAGREEMENT
     # is the interesting case to verify (and, later, to measure which side was right).
+    # Headline TA verdict = DAILY/SWING horizon ONLY — matches the quant verdict's
+    # horizon so AGREE/DISAGREE is apples-to-apples. 1h/15m are NOT in the headline;
+    # they're reported separately as short-term CONFIRMATION (context).
     ta_score = {"up": 2, "down": -2}.get(trend_d, 0)
-    ta_score += {"up": 1, "down": -1}.get(t1h, 0)
     for p in pats:
         ta_score += {"bullish": 1, "bearish": -1}.get(p.get("tone"), 0)
     ta_score += {"accumulation": 1, "distribution": -1}.get(vol, 0)
     ta_bias = "bullish" if ta_score >= 2 else "bearish" if ta_score <= -2 else "neutral"
+
+    # Short-term (1h + 15m) confirmation of the DAILY verdict — context, not headline.
+    _st = {"up": 1, "down": -1}.get(t1h, 0) + {"up": 1, "down": -1}.get(t15, 0)
+    if ta_bias == "neutral" or _st == 0:
+        short_term = "neutral"
+    elif (ta_bias == "bullish" and _st > 0) or (ta_bias == "bearish" and _st < 0):
+        short_term = "confirming"
+    else:
+        short_term = "diverging"
 
     quant_bias = None
     try:
@@ -324,9 +335,11 @@ def analyze(symbol: str) -> Optional[dict]:
             quant_bias = "bearish"
         elif qrow.get("turnaroundStage") == "buyzone" or _setup == "breakout":
             quant_bias = "bullish"
-        elif _ma and px > _ma and _ts >= 55:
+        # ±0.5% hysteresis band around the 20-day MA so the verdict doesn't flicker
+        # when price hovers right at it.
+        elif _ma and px > _ma * 1.005 and _ts >= 55:
             quant_bias = "bullish"
-        elif _ma and px < _ma:
+        elif _ma and px < _ma * 0.995:
             quant_bias = "bearish"
         else:
             quant_bias = "neutral"
@@ -353,8 +366,8 @@ def analyze(symbol: str) -> Optional[dict]:
                        f"Conflicting — treat as low-confidence and watch which side resolves.")
     elif agreement == "partial":
         bullets.append(f"Technicals {ta_bias} vs quant {quant_bias} — only partial overlap (one is neutral).")
-    bullets.append(f"Daily trend: {trend_d}; MTF {mtf} {mtf_dir if mtf_dir!='none' else ''}".strip()
-                   + f" (15m {t15} · 1h {t1h} · 1D {trend_d}).")
+    bullets.append(f"Daily trend: {trend_d} (the verdict horizon). Short-term 1h/15m is "
+                   f"{short_term} it (15m {t15} · 1h {t1h}).")
     if ch:
         bullets.append(f"{ch['dir'].capitalize()} regression channel — price in the {ch['position']} "
                        f"(~{int(ch['posPct'])}% up the channel; {ch['lower']}–{ch['upper']}).")
@@ -376,6 +389,7 @@ def analyze(symbol: str) -> Optional[dict]:
         "ticker": sym, "price": round(px, 2),
         "bias": bias, "confidence": int(conf),
         "taBias": ta_bias, "quantBias": quant_bias, "agreement": agreement,
+        "shortTerm": short_term,
         "trend": {"d1": trend_d, "h1": t1h, "m15": t15},
         "mtf": {"state": mtf, "dir": mtf_dir},
         "channel": ch, "trendlines": tl, "levels": lv,
