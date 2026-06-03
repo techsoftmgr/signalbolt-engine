@@ -17,6 +17,11 @@ CREATE TABLE IF NOT EXISTS chart_read_log (
   short_term         text,                     -- confirming | diverging | neutral
   price              numeric NOT NULL,
   created_at         timestamptz NOT NULL DEFAULT now(),
+  -- UTC calendar day, for the one-row-per-ticker-per-day unique guarantee.
+  -- A DEFAULT may be non-immutable (evaluated at insert); an index expression
+  -- may NOT — so we store the day in a plain column instead of indexing
+  -- (created_at::date), which is only STABLE and triggers 42P17.
+  day                date NOT NULL DEFAULT (now() AT TIME ZONE 'UTC')::date,
   -- filled later by the forward-outcome scorer:
   horizon_days       int,
   forward_price      numeric,
@@ -25,9 +30,10 @@ CREATE TABLE IF NOT EXISTS chart_read_log (
   scored_at          timestamptz
 );
 
--- One snapshot per ticker per day (the logger upserts on this).
+-- One snapshot per ticker per day (backstop; the logger also dedups by SELECT).
+-- Index on the plain `day` column — immutable, unlike (created_at::date).
 CREATE UNIQUE INDEX IF NOT EXISTS uq_chart_read_log_ticker_day
-  ON chart_read_log (ticker, (created_at::date));
+  ON chart_read_log (ticker, day);
 
 -- Fast lookups for the scorer (unscored rows past their horizon) + reads.
 CREATE INDEX IF NOT EXISTS idx_chart_read_log_unscored
