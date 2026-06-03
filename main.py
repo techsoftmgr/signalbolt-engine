@@ -316,12 +316,21 @@ def _alpaca_stock_snapshots(symbols: list[str]) -> dict:
         for sym, snap in snapshots.items():
             try:
                 # ── Regular session price ─────────────────────────────
-                trade_price = float(snap.latest_trade.price) if snap.latest_trade else 0.0
-                prev_close  = float(snap.previous_daily_bar.close) if snap.previous_daily_bar else 0.0
-                day_close   = float(snap.daily_bar.close) if snap.daily_bar else trade_price
+                trade_price  = float(snap.latest_trade.price) if snap.latest_trade else 0.0
+                prev_close   = float(snap.previous_daily_bar.close) if snap.previous_daily_bar else 0.0
+                day_close    = float(snap.daily_bar.close) if snap.daily_bar else trade_price
+                minute_close = float(snap.minute_bar.close) if snap.minute_bar else 0.0
 
-                # Use latest trade during market; daily bar close outside hours
-                reg_price = trade_price if session == "market" else (day_close or trade_price)
+                # Primary price = the most recent ACTUAL trade, across ALL sessions.
+                # latest_trade.price is the SIP last print (regular + pre/post + after
+                # the 8 PM close) — the SAME value the signal engine uses
+                # (get_latest_price), so the card matches the broker. Previously this
+                # used the RTH daily_bar.close outside market hours, which (a) ignored
+                # the after-hours move the user is watching and (b) could return a
+                # stale/forming daily bar (e.g. MRVL showed 290.79 at 10:44 PM ET while
+                # the real last AH trade was 318.83). Fall back to the latest 1-min bar,
+                # then the RTH close, then prev close.
+                reg_price = trade_price or minute_close or day_close or prev_close
 
                 if reg_price <= 0:
                     continue
