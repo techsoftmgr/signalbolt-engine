@@ -3043,6 +3043,28 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled momentum monitor (4:25 PM ET, Mon-Fri)")
 
+    # ── Chart-read agreement track record — 4:40 PM ET (after the daily bar) ──
+    # Logs each universe ticker's TA-vs-Quant read (one row/ticker/day) and scores
+    # snapshots whose horizon has elapsed, so we learn which method is right when
+    # they disagree. Best-effort; no-ops until chart_read_log table exists.
+    def _run_chart_read_log():
+        try:
+            from engine import chart_read, quant_score_service
+            sb = _supabase()
+            chart_read.log_snapshot(sb, quant_score_service.DEFAULT_TICKERS)
+            chart_read.score_snapshots(sb)
+        except Exception as e:
+            logger.error(f"[runner] chart-read log/score failed: {e}")
+
+    scheduler.add_job(
+        _run_chart_read_log,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=16, minute=40, timezone="America/New_York"),
+        id="chart_read_log",
+        name="Chart-read agreement track record (4:40 PM ET)",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled chart-read agreement log (4:40 PM ET, Mon-Fri)")
+
     scheduler.start()
     logger.info(
         "[runner] Scheduler started — "

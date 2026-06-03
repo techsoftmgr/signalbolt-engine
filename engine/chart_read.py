@@ -357,6 +357,43 @@ def analyze(symbol: str) -> Optional[dict]:
     conf = int(min(90, 52 + min(16, abs(ta_score) * 4)
                    + (16 if agreement == "agree" else -14 if agreement == "disagree" else 0)))
 
+    # ── Actionable idea (educational) from the TA structure — gated on a decisive,
+    # non-conflicting read. This is why the hub can always offer SOMETHING even when
+    # no tracked signal has fired (the #3 gap). Conflicting/neutral → "wait".
+    idea = {"action": "WAIT",
+            "text": "No clean idea — read is neutral or the TA & Quant verdicts conflict. Wait for alignment."}
+    if bias != "neutral" and agreement != "disagree":
+        if bias == "bullish":
+            _sup = lv.get("support") or (ch and ch.get("lower"))
+            _raw = (_sup * 0.99) if _sup else px * 0.95
+            _stop = round(max(px * 0.92, min(_raw, px * 0.985)), 2)   # clamp risk to 1.5–8%
+            _patt = next((p["target"] for p in pats if p.get("tone") == "bullish" and p.get("target")), None)
+            _tgt = round(float(_patt or lv.get("resistance") or (ch and ch.get("upper")) or px * 1.06), 2)
+            _rr = (_tgt - px) / (px - _stop) if px > _stop else 0
+            if _rr >= 1.0:
+                idea = {"action": "LONG", "option": "CALL", "entry": round(px, 2), "stop": _stop,
+                        "target": _tgt, "rr": round(_rr, 1),
+                        "text": f"Long idea — near {round(px,2)}, stop {_stop} (below support), target {_tgt} "
+                                f"(R:R {round(_rr,1)}). Call buys leverage with defined risk."}
+            else:
+                idea = {"action": "WAIT", "text": f"Bullish, but risk/reward is poor at {round(px,2)} "
+                        f"(little room to resistance / far from support) — wait for a pullback toward {_stop}."}
+        else:
+            _res = lv.get("resistance") or (ch and ch.get("upper"))
+            _raw = (_res * 1.01) if _res else px * 1.05
+            _stop = round(min(px * 1.08, max(_raw, px * 1.015)), 2)   # clamp risk to 1.5–8%
+            _patt = next((p["target"] for p in pats if p.get("tone") == "bearish" and p.get("target")), None)
+            _tgt = round(float(_patt or lv.get("support") or (ch and ch.get("lower")) or px * 0.94), 2)
+            _rr = (px - _tgt) / (_stop - px) if _stop > px else 0
+            if _rr >= 1.0:
+                idea = {"action": "SHORT", "option": "PUT", "entry": round(px, 2), "stop": _stop,
+                        "target": _tgt, "rr": round(_rr, 1),
+                        "text": f"Short idea — near {round(px,2)}, stop {_stop} (above resistance), target {_tgt} "
+                                f"(R:R {round(_rr,1)}). Put for defined-risk downside."}
+            else:
+                idea = {"action": "WAIT", "text": f"Bearish, but risk/reward is poor at {round(px,2)} "
+                        f"— wait for a bounce toward {_stop}."}
+
     # Plain-English narrative — LEAD with the agreement vs the quant read.
     bullets: list[str] = []
     if agreement == "agree":
@@ -389,7 +426,7 @@ def analyze(symbol: str) -> Optional[dict]:
         "ticker": sym, "price": round(px, 2),
         "bias": bias, "confidence": int(conf),
         "taBias": ta_bias, "quantBias": quant_bias, "agreement": agreement,
-        "shortTerm": short_term,
+        "shortTerm": short_term, "idea": idea,
         "trend": {"d1": trend_d, "h1": t1h, "m15": t15},
         "mtf": {"state": mtf, "dir": mtf_dir},
         "channel": ch, "trendlines": tl, "levels": lv,
@@ -401,3 +438,76 @@ def analyze(symbol: str) -> Optional[dict]:
             "channel": ch, "levels": lv, "patterns": pats, "gap": gap,
         },
     }
+
+
+# ── Agreement track record — daily snapshot logger + forward-outcome scorer ──
+_HORIZON_DAYS = 5   # trading-ish days to judge who was right
+
+
+def log_snapshot(sb, tickers: list[str]) -> dict:
+    """Log each ticker's TA-vs-Quant read to chart_read_log — one row per ticker
+    per day. Best-effort; no-ops gracefully if the table doesn't exist yet."""
+    from datetime import datetime, timezone
+    stats = {"logged": 0}
+    if sb is None:
+        return stats
+    today = datetime.now(timezone.utc).date().isoformat()
+    for tk in tickers or []:
+        try:
+            r = analyze(tk)
+            if not r:
+                continue
+            exists = (sb.table("chart_read_log").select("id")
+                      .eq("ticker", r["ticker"]).gte("created_at", today + "T00:00:00Z")
+                      .limit(1).execute().data)
+            if exists:
+                continue
+            sb.table("chart_read_log").insert({
+                "ticker": r["ticker"], "ta_bias": r["taBias"], "quant_bias": r.get("quantBias"),
+                "agreement": r["agreement"], "short_term": r.get("shortTerm"), "price": r["price"],
+            }).execute()
+            stats["logged"] += 1
+        except Exception as e:
+            logger.debug(f"[chart_read] log_snapshot {tk} failed: {e}")
+    logger.info(f"[chart_read] snapshot logged {stats}")
+    return stats
+
+
+def score_snapshots(sb) -> dict:
+    """Fill forward-outcome columns for chart_read_log rows past their horizon, and
+    mark the winner (TA / Quant / both / neither) when the two disagreed. Best-effort."""
+    from datetime import datetime, timezone, timedelta
+    from engine.alpaca_client import get_latest_price
+    stats = {"scored": 0}
+    if sb is None:
+        return stats
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=_HORIZON_DAYS)).isoformat()
+    try:
+        rows = (sb.table("chart_read_log").select("*")
+                .is_("winner", "null").lte("created_at", cutoff)
+                .limit(200).execute().data) or []
+    except Exception as e:
+        logger.debug(f"[chart_read] score_snapshots fetch failed: {e}")
+        return stats
+    for row in rows:
+        try:
+            entry = float(row.get("price") or 0)
+            now_px = get_latest_price(row["ticker"])
+            if not entry or not now_px:
+                continue
+            ret = (now_px - entry) / entry * 100.0
+            up = ret > 1.0; down = ret < -1.0
+            def _right(bias):
+                return (bias == "bullish" and up) or (bias == "bearish" and down)
+            ta_ok = _right(row.get("ta_bias")); q_ok = _right(row.get("quant_bias"))
+            winner = ("both" if ta_ok and q_ok else "ta" if ta_ok else "quant" if q_ok else "neither")
+            sb.table("chart_read_log").update({
+                "horizon_days": _HORIZON_DAYS, "forward_price": round(float(now_px), 2),
+                "forward_return_pct": round(ret, 3), "winner": winner,
+                "scored_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", row["id"]).execute()
+            stats["scored"] += 1
+        except Exception as e:
+            logger.debug(f"[chart_read] score row failed: {e}")
+    logger.info(f"[chart_read] snapshots scored {stats}")
+    return stats
