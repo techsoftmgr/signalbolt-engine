@@ -200,6 +200,27 @@ Needs both an up AND a down regime in the sample before concluding; do NOT judge
 detector on a single-regime window. (Related: the deferred "extend market-regime
 filter to SMC signals" backlog note.)
 
+### Also: the OPTION (PUT/CALL) leg needs a higher bar + DTE/moneyness alignment
+
+The breakdown stock short ran ~82% early, but the paired PUT did NOT (tiny sample:
+JPM stopped out on a wiggle the short rode through; NFLX `expired` — right direction,
+too slow for theta). This is **structural, not signal quality**: an option must
+overcome theta + delta<1 + bid/ask spread + a tighter premium-stop, so the stock's
+*small/slow* wins (many <1% structure-reversal exits) become option *losses*.
+
+`result_pct`/`result_pnl` are NOW logged on option closes (premium P&L%), so option
+expectancy is measurable. When data accrues, segment option expectancy by detector,
+DTE bucket, and moneyness.
+
+**Scanner alignment hypothesis (test, then maybe change `options_scanner`):** current
+picks are **21–60 DTE, ~2% OTM** — misaligned with a 1–10 day swing.
+- **Moneyness:** nearer-the-money / slightly-ITM (delta ~0.6) tracks the underlying
+  more 1:1 and beats theta/spread better than 2% OTM (delta ~0.4).
+- **DTE:** match the hold horizon + buffer. For a 10-trading-day swing that's roughly
+  **~14–30 DTE** (NOT 60 — overpaying for time; NOT daily/0DTE — it expires before a
+  multi-day swing resolves and has violent gamma/theta that worsens noise stop-outs).
+  Daily/weekly expiries are for *intraday* theses, not multi-day swings.
+
 ---
 
 ## How to use this backlog

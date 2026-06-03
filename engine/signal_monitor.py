@@ -1363,6 +1363,10 @@ def _monitor_options(sb: Client) -> None:
                         "status":        "closed",
                         "closed_reason": "target_hit" if result == "win" else "stop_hit",
                         "result":        result,
+                        # realized premium P&L% — needed to measure PUT/CALL
+                        # expectancy (options were win/loss-only before).
+                        "result_pct":    round(pct, 4),
+                        "result_pnl":    round(est_prem - entry_prem, 4),
                         "closed_at":     now_utc.isoformat(),
                     }).eq("id", sig["id"]).execute()
                     event_type = "closed_win" if result == "win" else "closed_loss"
