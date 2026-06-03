@@ -1263,6 +1263,26 @@ def _warn_near_stop(sig: dict, price: float) -> None:
         sl      = float(sig["stop_loss"])
         is_long = sig["direction"] == "LONG"
 
+        # Bad-print guard: a single out-of-tape print must not fire a false
+        # near-stop alert (GLD 2026-06-03 logged near-stop @ $417.54 while the
+        # tape was ~$407.5). Clamp gross outliers to the recent range, then
+        # re-check the near-stop condition on the real price — skip if it no
+        # longer holds.
+        try:
+            from engine import alpaca_client as _ac
+            sane = _ac.sane_close_price(ticker, price)
+            if sane is not None and abs(sane - price) > 1e-9:
+                stop_dist = abs(entry - sl)
+                near = ((sane <= sl + 0.25 * stop_dist) if is_long
+                        else (sane >= sl - 0.25 * stop_dist)) if stop_dist > 0 else False
+                if not near:
+                    logger.warning(f"[stream] {ticker} near-stop @ {price:.2f} not "
+                                   f"corroborated (real ~{sane:.2f}) — skipping phantom alert")
+                    return
+                price = sane
+        except Exception as _se:
+            logger.debug(f"[stream] near-stop sanity error for {sig.get('ticker')}: {_se}")
+
         pnl_pct    = ((price - entry) / entry * 100) if is_long else ((entry - price) / entry * 100)
         dist_to_sl = abs(price - sl)
         dist_pct   = (dist_to_sl / price * 100) if price else 0   # true price distance

@@ -773,6 +773,13 @@ def _monitor_stocks(sb: Client) -> None:
         if not price:
             continue
 
+        # Bad-print guard: a single out-of-tape SIP print must not drive status,
+        # near-stop alerts, or the backstop close (the GLD 2026-06-03 near-stop
+        # logged $417.54 while the 1-min high was $411.84). Clamp gross outliers
+        # to the recent 1-min range — a real move that large appears in the bars,
+        # so it is NOT clamped.
+        price = _alpaca.sane_close_price(ticker, price) or price
+
         is_long  = direction == "LONG"
         pnl_pct  = ((price - entry) / entry * 100) if is_long else ((entry - price) / entry * 100)
 
