@@ -2528,6 +2528,93 @@ def _require_admin_jwt(request: Request):
         raise HTTPException(status_code=401, detail="Token verification failed")
 
 
+def _require_user_jwt(request: Request):
+    """JWT auth for ANY signed-in user. Returns (user_id, email, sb)."""
+    token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Authorization required")
+    sb = _make_supabase()
+    try:
+        user_resp = sb.auth.get_user(token)
+        if not user_resp or not user_resp.user:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return user_resp.user.id, (user_resp.user.email or ""), sb
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="Token verification failed")
+
+
+# ── AI stock chat (cost-bounded, Pro/Pro+ only) ───────────────────────────────
+# Grounded in the app's own analysis (quant + Expert Read + active signals),
+# Haiku model + prompt caching, per-user DAILY quota by tier. Adjust the caps
+# here. Free/expired = 0 (upgrade prompt).
+CHAT_DAILY_CAP = {"pro_plus": 100, "pro": 10}
+
+
+def _chat_cap_for(status: str) -> int:
+    return CHAT_DAILY_CAP.get((status or "").lower(), 0)
+
+
+@app.post("/ticker/{symbol}/chat")
+async def ticker_chat(symbol: str, request: Request):
+    user_id, _email, sb = _require_user_jwt(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    message = (body.get("message") or "").strip()
+    history = body.get("history") or []
+    if not message:
+        raise HTTPException(status_code=400, detail="message required")
+
+    # Tier gate
+    try:
+        prof = sb.table("profiles").select("subscription_status").eq("id", user_id).single().execute().data or {}
+        status = prof.get("subscription_status", "free")
+    except Exception:
+        status = "free"
+    cap = _chat_cap_for(status)
+    if cap <= 0:
+        raise HTTPException(status_code=403, detail={
+            "error": "upgrade_required",
+            "message": "AI stock chat is a Pro / Pro+ feature.",
+        })
+
+    # Daily quota (UTC day)
+    from datetime import datetime, timezone
+    day = datetime.now(timezone.utc).date().isoformat()
+    used = 0
+    try:
+        rows = (sb.table("chat_usage").select("count")
+                .eq("user_id", user_id).eq("day", day).limit(1).execute()).data
+        used = int(rows[0]["count"]) if rows else 0
+    except Exception:
+        used = 0
+    if used >= cap:
+        raise HTTPException(status_code=429, detail={
+            "error": "quota_exceeded", "used": used, "limit": cap,
+            "message": f"Daily chat limit reached ({cap}). Resets at 00:00 UTC.",
+        })
+
+    from engine import chat_service
+    result = chat_service.answer(sb, symbol.upper(), message, history)
+
+    # Count the message only when we actually answered.
+    if result.get("ok"):
+        try:
+            sb.table("chat_usage").upsert({
+                "user_id": user_id, "day": day, "count": used + 1,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+            used += 1
+        except Exception as e:
+            logger.debug(f"[chat] usage increment failed for {user_id}: {e}")
+
+    return {"answer": result.get("answer"), "ok": result.get("ok", False),
+            "used": used, "limit": cap}
+
+
 # ── Manual override / management control (admin-only) ──────────────────────────
 # Create, edit, and close stock + option signals by hand, and flip each between
 # 'manual' (engine leaves it alone) and 'engine' (engine manages normally). The
