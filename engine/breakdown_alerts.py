@@ -86,6 +86,7 @@ def run(sb=None) -> dict:
     early_cands: list[dict] = []
     confirm_cands: list[dict] = []
     breakdown_now: list[dict] = []   # names CURRENTLY in breakdown (for tracked cards)
+    forming_now: list[dict]   = []   # names in the EARLY bearish state (BREAKDOWN_FORMING)
 
     for r in scored:
         tk = (r.get("ticker") or "").upper()
@@ -106,6 +107,10 @@ def run(sb=None) -> dict:
         # there's no fresh transition this scan.
         if cur["breakdown"]:
             breakdown_now.append(r)
+        # EARLY bearish state (lost the 20-day avg on heavy down-vol, not yet a
+        # confirmed breakdown) → BREAKDOWN_FORMING tracked card (state-based).
+        elif cur["belowMA"] and _heavy_down(r):
+            forming_now.append(r)
 
         # CONFIRMED: just entered the breakdown bucket (broke 20-day low on vol).
         if cur["breakdown"] and not prev.get("breakdown"):
@@ -173,6 +178,30 @@ def run(sb=None) -> dict:
                             stats["put"] = stats.get("put", 0) + 1
                 except Exception as _e:
                     logger.debug(f"[breakdown_alerts] signal gen failed for {tk}: {_e}")
+
+    # BREAKDOWN_FORMING — EARLY anticipatory short, fired from the current early
+    # bearish state (lost the 20-day avg on heavy down-vol, not yet broken). A
+    # separate measured experiment vs the confirmed breakdown. Capped + deduped
+    # inside forming_signals (per ticker+strategy, co-exists with confirmed).
+    if sb is not None and forming_now:
+        forming_now.sort(key=lambda r: -_pressure(r))
+        try:
+            from engine import forming_signals
+        except Exception:
+            forming_signals = None
+        if forming_signals is not None:
+            gen = 0
+            for r in forming_now:
+                if gen >= _MAX_GEN:
+                    break
+                tk = (r.get("ticker") or "").upper()
+                try:
+                    res = forming_signals.generate(sb, r, "breakdown")
+                    if res.get("stock") or res.get("option"):
+                        gen += 1
+                        stats["forming"] = stats.get("forming", 0) + 1
+                except Exception as _e:
+                    logger.debug(f"[breakdown_alerts] forming gen failed for {tk}: {_e}")
 
     logger.info(f"[breakdown_alerts] done {stats}")
     return stats

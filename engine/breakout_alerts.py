@@ -83,6 +83,7 @@ def run(sb=None) -> dict:
     confirm_cands: list[dict] = []
     early_cands:   list[dict] = []
     accum_cands:   list[dict] = []
+    forming_now:   list[dict] = []   # EARLY bullish state (BREAKOUT_FORMING)
 
     for r in scored:
         tk = (r.get("ticker") or "").upper()
@@ -101,6 +102,10 @@ def run(sb=None) -> dict:
         # there's no fresh transition this scan (mirrors breakdown_alerts).
         if cur["breakout"]:
             breakout_now.append(r)
+        # EARLY bullish state (pressing the 20-day high on up-vol, not yet broken)
+        # → BREAKOUT_FORMING tracked card (state-based).
+        elif cur["near"] and cur["heavyup"]:
+            forming_now.append(r)
 
         if cur["breakout"] and not prev.get("breakout"):
             confirm_cands.append(r)
@@ -189,6 +194,29 @@ def run(sb=None) -> dict:
                             stats["call"] += 1
                 except Exception as _e:
                     logger.debug(f"[breakout_alerts] signal gen failed for {tk}: {_e}")
+
+    # BREAKOUT_FORMING — EARLY anticipatory long, fired from the current early
+    # bullish state (pressing the 20-day high on up-vol, not yet broken). Separate
+    # measured experiment vs the confirmed breakout. Deduped inside forming_signals.
+    if sb is not None and forming_now:
+        forming_now.sort(key=lambda r: -_strength(r))
+        try:
+            from engine import forming_signals
+        except Exception:
+            forming_signals = None
+        if forming_signals is not None:
+            gen = 0
+            for r in forming_now:
+                if gen >= _MAX_GEN:
+                    break
+                tk = (r.get("ticker") or "").upper()
+                try:
+                    res = forming_signals.generate(sb, r, "breakout")
+                    if res.get("stock") or res.get("option"):
+                        gen += 1
+                        stats["forming"] = stats.get("forming", 0) + 1
+                except Exception as _e:
+                    logger.debug(f"[breakout_alerts] forming gen failed for {tk}: {_e}")
 
     logger.info(f"[breakout_alerts] done {stats}")
     return stats
