@@ -91,6 +91,10 @@ def manage(sb) -> dict:
     logger.info(f"[momentum_monitor] managing {len(mom)} TREND_MOMENTUM signal(s)")
     for sig in mom:
         try:
+            # MANUAL override: admin owns it — engine does not trail/exit.
+            if (sig.get("management_mode") or "engine") == "manual":
+                stats["skipped"] += 1
+                continue
             ticker    = sig["ticker"]
             is_long   = sig["direction"] == "LONG"
             entry     = float(sig["entry_price"])
