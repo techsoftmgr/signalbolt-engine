@@ -212,8 +212,13 @@ overcome theta + delta<1 + bid/ask spread + a tighter premium-stop, so the stock
 expectancy is measurable. When data accrues, segment option expectancy by detector,
 DTE bucket, and moneyness.
 
-**Scanner alignment hypothesis (test, then maybe change `options_scanner`):** current
-picks are **21–60 DTE, ~2% OTM** — misaligned with a 1–10 day swing.
+**UPDATE 2026-06-03 — SHIPPED:** `options_scanner` changed from 21–60 DTE / ~2% OTM
+to **14–30 DTE / ~2% ITM** (delta ~0.6) for all option-firing detectors. The June
+study should therefore compare option `result_pct` **before vs after this change**
+(closed_at < 2026-06-03 = old params; >= = new) to confirm it actually helped.
+
+**Original hypothesis (now live):** the old **21–60 DTE, ~2% OTM** picks were
+misaligned with a 1–10 day swing.
 - **Moneyness:** nearer-the-money / slightly-ITM (delta ~0.6) tracks the underlying
   more 1:1 and beats theta/spread better than 2% OTM (delta ~0.4).
 - **DTE:** match the hold horizon + buffer. For a 10-trading-day swing that's roughly

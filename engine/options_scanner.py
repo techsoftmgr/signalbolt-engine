@@ -7,10 +7,16 @@ Data sources:
 
 Filters applied (any failure = skip):
   1. Earnings proximity   — skip if earnings within 5 days
-  2. Expiry window        — 21-60 DTE required
-  3. Liquidity gate       — OI >= 500, premium >= $0.10
-  4. Flow validation      — volume must not exceed OI (closers vs openers)
-  5. IV vs HV check       — skip if IV > 1.5× 30-day realised vol (overpriced)
+  2. Expiry window        — 14-30 DTE (≈2-4 weeks): long enough to survive a
+                            1-10 day swing hold, short enough to stay responsive
+                            and limit theta. (NOT daily/0DTE — it would expire
+                            before a multi-day swing resolves.)
+  3. Strike               — slightly IN-the-money (~2%, delta ~0.6) so the premium
+                            tracks the underlying move ~1:1 with less extrinsic
+                            value to decay than an ATM/OTM contract.
+  4. Liquidity gate       — OI >= 500, premium >= $0.10
+  5. Flow validation      — volume must not exceed OI (closers vs openers)
+  6. IV vs HV check       — skip if IV > 1.5× 30-day realised vol (overpriced)
 """
 
 import logging
@@ -26,13 +32,27 @@ import yfinance as yf
 logger = logging.getLogger(__name__)
 
 POLYGON_KEY    = os.environ.get("POLYGON_API_KEY", "")
-_MIN_DTE       = 21
-_MAX_DTE       = 60
+# Expiry window matched to the 1-10 day swing hold: ~2-4 weeks. Long enough to
+# survive the full hold + a buffer, short enough to track the move and limit the
+# theta you pay (was 21-60, which overpaid for time and tracked the swing less).
+_MIN_DTE       = 14
+_MAX_DTE       = 30
+# Target ~2% IN-the-money (delta ~0.6): premium tracks the underlying move closer
+# to 1:1 with less extrinsic value to decay than ATM/OTM. For a CALL that's just
+# BELOW spot; for a PUT just ABOVE spot.
+_ITM_OFFSET    = 0.02
 _RISK_FREE     = 0.05
 _MIN_OI        = 500
 _MIN_ASK       = 0.10
 _MAX_EARN_DAYS = 5
 _IV_HV_MAX_RATIO = 1.5
+
+
+def _target_strike(current_price: float, is_call: bool) -> float:
+    """Slightly IN-the-money target strike (delta ~0.6). CALL → just below spot,
+    PUT → just above spot, so the contract carries intrinsic value and tracks the
+    underlying move more 1:1 (less extrinsic/theta than ATM or OTM)."""
+    return current_price * ((1 - _ITM_OFFSET) if is_call else (1 + _ITM_OFFSET))
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +163,7 @@ def _polygon_options_chain(ticker: str, direction: str, current_price: float) ->
     is_call = direction == "LONG"
     min_exp = (date.today() + timedelta(days=_MIN_DTE)).strftime("%Y-%m-%d")
     max_exp = (date.today() + timedelta(days=_MAX_DTE)).strftime("%Y-%m-%d")
-    target_strike = current_price * (1.02 if is_call else 0.98)
+    target_strike = _target_strike(current_price, is_call)
 
     try:
         r = _requests.get(
@@ -260,7 +280,7 @@ def _yf_options_chain(ticker: str, direction: str, current_price: float) -> Opti
         if contracts.empty:
             return None
 
-        target_strike = current_price * (1.02 if is_call else 0.98)
+        target_strike = _target_strike(current_price, is_call)
         contracts["_dist"] = (contracts["strike"] - target_strike).abs()
         contracts = contracts[
             (contracts["ask"] >= _MIN_ASK) &
