@@ -2850,7 +2850,11 @@ async def admin_quality_screen(request: Request, min_score: int = 0):
     try:
         from engine import fundamentals
         rows = fundamentals.get_ranked(sb, min_score=max(0, min(min_score, 5)))
-        return {"count": len(rows), "universe": len(fundamentals.QUALITY_UNIVERSE), "rows": rows}
+        try:
+            uni = len(fundamentals.get_universe())
+        except Exception:
+            uni = len(fundamentals.QUALITY_UNIVERSE)
+        return {"count": len(rows), "universe": uni, "rows": rows}
     except HTTPException:
         raise
     except Exception as e:

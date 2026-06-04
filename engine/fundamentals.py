@@ -171,10 +171,11 @@ def _companyfacts(cik: str) -> dict | None:
     return r.json()
 
 
-def screen_ticker(ticker: str) -> dict | None:
-    """Fetch + compute metrics + score for one ticker. None if no EDGAR data."""
+def screen_ticker(ticker: str, cik: str | None = None) -> dict | None:
+    """Fetch + compute metrics + score for one ticker. `cik` may be supplied
+    (e.g. from the S&P 500 CSV) to skip the SEC ticker lookup. None if no data."""
     tk = ticker.upper()
-    cik = cik_map().get(tk)
+    cik = cik or cik_map().get(tk)
     if not cik:
         return None
     facts = _companyfacts(cik)
@@ -209,11 +210,47 @@ QUALITY_UNIVERSE = [
 ]
 
 
+# ── Dynamic universe — full S&P 500 (cached daily), curated list as fallback ──
+_SP500_CSV = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+_universe_cache: list | None = None
+_universe_cache_ts = 0.0
+
+
+def get_universe() -> list[dict]:
+    """[{ticker, cik}] — the ~500 S&P 500 constituents (cached daily; the CSV
+    includes CIKs so every name resolves regardless of ticker format). Falls back
+    to the curated QUALITY_UNIVERSE (mapped via SEC) if the source is unreachable."""
+    global _universe_cache, _universe_cache_ts
+    if _universe_cache is not None and (time.time() - _universe_cache_ts) < 86400:
+        return _universe_cache
+    try:
+        import csv, io
+        r = requests.get(_SP500_CSV, headers=_UA, timeout=20)
+        if r.status_code == 200:
+            out = []
+            for row in csv.DictReader(io.StringIO(r.text)):
+                sym = (row.get("Symbol") or "").strip().upper().replace(".", "-")
+                cik = (row.get("CIK") or "").strip()
+                if sym and cik and cik.isdigit():
+                    out.append({"ticker": sym, "cik": str(int(cik)).zfill(10)})
+            if len(out) >= 400:
+                _universe_cache, _universe_cache_ts = out, time.time()
+                logger.info(f"[fundamentals] universe = {len(out)} S&P 500 names")
+                return out
+    except Exception as e:
+        logger.warning(f"[fundamentals] S&P500 universe fetch failed — curated fallback: {e}")
+    try:
+        cm = cik_map()
+    except Exception:
+        cm = {}
+    return [{"ticker": t, "cik": cm.get(t)} for t in QUALITY_UNIVERSE]
+
+
 # ── Cache (Supabase) + rolling refresh ─────────────────────────────────────
-def refresh_universe(sb, batch: int = 15, sleep_s: float = 0.2) -> dict:
-    """Refresh the `batch` stalest universe tickers into fundamentals_cache.
-    Rolling: a few runs/day keeps the whole universe within the quarterly cadence
-    fundamentals actually change on. SEC-polite (sleep between fetches)."""
+def refresh_universe(sb, batch: int = 20, sleep_s: float = 0.2) -> dict:
+    """Refresh the `batch` stalest universe names into fundamentals_cache.
+    Rolling: 3 runs/day × 20 cycles the ~500 universe in ~8 days — inside the
+    quarterly cadence fundamentals change. SEC-polite (sleep between fetches)."""
     from datetime import datetime, timezone
     try:
         cached = (sb.table("fundamentals_cache").select("ticker, fetched_at").execute().data) or []
@@ -221,12 +258,13 @@ def refresh_universe(sb, batch: int = 15, sleep_s: float = 0.2) -> dict:
         logger.warning(f"[fundamentals] cache read failed (run supabase-fundamentals-cache.sql?): {e}")
         return {"refreshed": 0, "error": "no_cache_table"}
     seen = {r["ticker"]: r.get("fetched_at") or "" for r in cached}
+    universe = get_universe()
     # stalest first: never-fetched (not in cache) before oldest fetched_at
-    ordered = sorted(QUALITY_UNIVERSE, key=lambda t: seen.get(t.upper(), ""))
+    ordered = sorted(universe, key=lambda u: seen.get(u["ticker"], ""))
     done = 0
-    for tk in ordered[:batch]:
+    for u in ordered[:batch]:
         try:
-            m = screen_ticker(tk)
+            m = screen_ticker(u["ticker"], cik=u.get("cik"))
             if not m:
                 continue
             sb.table("fundamentals_cache").upsert({
@@ -239,10 +277,10 @@ def refresh_universe(sb, batch: int = 15, sleep_s: float = 0.2) -> dict:
             }).execute()
             done += 1
         except Exception as e:
-            logger.debug(f"[fundamentals] refresh {tk} failed: {e}")
+            logger.debug(f"[fundamentals] refresh {u['ticker']} failed: {e}")
         time.sleep(sleep_s)
-    logger.info(f"[fundamentals] refreshed {done}/{batch} (universe={len(QUALITY_UNIVERSE)})")
-    return {"refreshed": done, "universe": len(QUALITY_UNIVERSE)}
+    logger.info(f"[fundamentals] refreshed {done}/{batch} (universe={len(universe)})")
+    return {"refreshed": done, "universe": len(universe)}
 
 
 def get_ranked(sb, min_score: int = 0) -> list[dict]:
