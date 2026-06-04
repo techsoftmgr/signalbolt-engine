@@ -3426,28 +3426,34 @@ async def admin_detector_stats(request: Request, days: int = 7):
 
 @app.get("/admin/detector-scorecard")
 async def admin_detector_scorecard(request: Request, days: int = 30, cost_pct: float = 0.10,
-                                   group_by: str = "detector"):
+                                   group_by: str = "detector", notional: float = 1000.0):
     """
     Realized-edge scorecard over CLOSED signals — the "what to keep / cut" view,
-    and the honest "is the engine actually +EV (not just high win-rate)?" answer.
+    the honest "is the engine actually +EV (not just high win-rate)?" answer, AND
+    "which detector actually MADE THE MOST MONEY" (not just win %).
 
     Per segment (and a PORTFOLIO roll-up across all signals):
       win_rate, avg_win%, avg_loss%, payoff (avg_win/|avg_loss|),
       worst_loss% / best_win% (tail — how bad are the losers),
-      expectancy_gross% = mean realized result_pct per trade,
-      expectancy_net%   = gross − round-trip cost (default 0.10%),
+      expectancy_gross/net% per trade,
+      total_return_pct / net_total_pct = CUMULATIVE % return (Σ result_pct) —
+        this is n × expectancy, so a high-win/low-payoff detector and a
+        low-win/big-payoff one are finally comparable in PROFIT terms,
+      pnl_per_notional = net total in $ on `notional` $/trade (real position
+        sizes aren't tracked, so money is normalized to equal $ per trade),
+      profit_share% = this segment's share of the whole engine's net profit,
       verdict (KEEP / WATCH / CUT, sample-size aware).
+    Segments are ranked by net $ contribution (most money first).
 
-    group_by: 'detector' (detector×strategy, default) | 'regime' | 'detector_regime'
-    — so you can see whether an 80% win rate holds across regimes or is one
-    regime carrying it. Expectancy per trade is the bottom line: positive net =
-    makes money after costs; negative = bleeds. Admin only.
+    group_by: 'detector' (detector×strategy, default) | 'regime' | 'detector_regime'.
+    Admin only.
     """
     _user_id, sb = _require_admin_jwt(request)
     from datetime import datetime, timezone, timedelta
     from engine import scorecard
     days     = max(1, min(days, 120))
     cost_pct = max(0.0, min(cost_pct, 2.0))
+    notional = max(1.0, min(notional, 1_000_000.0))
     since    = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
     try:
@@ -3461,7 +3467,7 @@ async def admin_detector_scorecard(request: Request, days: int = 30, cost_pct: f
               .execute()
         ).data or []
 
-        res = scorecard.compute(rows, group_by=group_by, cost_pct=cost_pct)
+        res = scorecard.compute(rows, group_by=group_by, cost_pct=cost_pct, notional=notional)
         # Backward-compatible key 'detectors'; new richer key 'segments' + portfolio.
         return {"since": since, "days": days, **res, "detectors": res["segments"]}
     except HTTPException:

@@ -18,6 +18,11 @@ from __future__ import annotations
 # Below this many closed trades a segment's verdict isn't trustworthy.
 _MIN_N = 15
 
+# We don't track real position sizes (the engine fires signals, it doesn't size
+# trades), so "money made" is expressed on a NORMALIZED notional: equal $ in every
+# trade. $1,000/trade by default — total $ = Σ(result_pct/100) × notional.
+_NOTIONAL = 1000.0
+
 
 def _seg_fields(row: dict, group_by: str) -> dict:
     """Identity fields for a row's segment, per the chosen grouping."""
@@ -65,7 +70,7 @@ def _accumulate(bucket: dict, pct: float, is_win: bool) -> None:
     bucket["best"]  = pct if bucket["best"]  is None else max(bucket["best"],  pct)
 
 
-def _stats(bucket: dict, cost_pct: float, min_n: int) -> dict:
+def _stats(bucket: dict, cost_pct: float, min_n: int, notional: float = _NOTIONAL) -> dict:
     """Derived metrics + verdict from an accumulated bucket."""
     n = bucket["n"]
     win_rate  = round(bucket["wins"] / n * 100, 1) if n else None
@@ -86,23 +91,38 @@ def _stats(bucket: dict, cost_pct: float, min_n: int) -> dict:
     else:
         verdict, reason = "WATCH", "marginal edge"
 
+    # "Money made" — position-size-independent: total % return = Σ result_pct
+    # (this is n × expectancy, so high win-rate/low payoff vs low win-rate/big
+    # payoff is finally comparable in actual profit terms), net of costs, plus a
+    # normalized $/notional view.
+    total_gross = round(bucket["pnl_sum"], 2)
+    net_total   = round(bucket["pnl_sum"] - cost_pct * n, 2) if n else None
+    pnl_cash    = round((net_total / 100.0) * notional, 2) if net_total is not None else None
+
     return {
         "n": n, "win_rate": win_rate, "avg_win": avg_win, "avg_loss": avg_loss,
         "payoff": payoff,
         "worst_loss": round(bucket["worst"], 3) if bucket["worst"] is not None else None,
         "best_win":   round(bucket["best"],  3) if bucket["best"]  is not None else None,
         "expectancy_gross": exp_gross, "expectancy_net": exp_net,
+        "total_return_pct": total_gross, "net_total_pct": net_total,
+        "pnl_per_notional": pnl_cash,
         "verdict": verdict, "reason": reason,
     }
 
 
 def compute(rows: list, group_by: str = "detector",
-            cost_pct: float = 0.10, min_n: int = _MIN_N) -> dict:
+            cost_pct: float = 0.10, min_n: int = _MIN_N,
+            notional: float = _NOTIONAL) -> dict:
     """
     rows: closed-signal dicts with result, result_pct, score_breakdown,
           strategy_type, (optional) regime_type.
     group_by: 'detector' (detector×strategy) | 'regime' | 'detector_regime'.
-    Returns {group_by, cost_pct, min_sample, portfolio, segments[]}.
+    notional: $/trade for the normalized cash view (real position sizes aren't
+              tracked, so "money made" = Σ result_pct × equal capital per trade).
+    Returns {group_by, cost_pct, notional, min_sample, portfolio, segments[]}.
+    Each segment also carries profit_share = its net total ÷ portfolio net total
+    (what % of all profit this detector contributed).
 
     A row counts as a WIN when result == 'win' OR (result missing AND pct > 0).
     Rows with result_pct is None are skipped (can't measure edge without P&L).
@@ -135,12 +155,22 @@ def compute(rows: list, group_by: str = "detector",
     out = []
     for key, bucket in segs.items():
         fields = seg_fields[key]
-        row = {**fields, "label": _label(fields), **_stats(bucket, cost_pct, min_n)}
+        row = {**fields, "label": _label(fields), **_stats(bucket, cost_pct, min_n, notional)}
         out.append(row)
 
-    # Best → worst by net expectancy (None last).
-    out.sort(key=lambda x: (x["expectancy_net"] is None, -(x["expectancy_net"] or -999)))
+    port = {"label": "ALL SIGNALS", **_stats(portfolio, cost_pct, min_n, notional)}
 
-    port = {"label": "ALL SIGNALS", **_stats(portfolio, cost_pct, min_n)}
-    return {"group_by": group_by, "cost_pct": cost_pct, "min_sample": min_n,
-            "portfolio": port, "segments": out}
+    # profit_share: each segment's net total as a % of the whole engine's net
+    # total — "who's actually carrying the P&L" (only meaningful when the
+    # portfolio is net-positive; else left None).
+    port_net = port.get("net_total_pct") or 0.0
+    for row in out:
+        nt = row.get("net_total_pct")
+        row["profit_share"] = (round(nt / port_net * 100, 1)
+                               if (nt is not None and port_net > 0) else None)
+
+    # Best → worst by net total $ contribution (who made the most money), None last.
+    out.sort(key=lambda x: (x["net_total_pct"] is None, -(x["net_total_pct"] or -1e9)))
+
+    return {"group_by": group_by, "cost_pct": cost_pct, "notional": notional,
+            "min_sample": min_n, "portfolio": port, "segments": out}
