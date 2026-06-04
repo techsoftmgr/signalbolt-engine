@@ -3413,88 +3413,45 @@ async def admin_detector_stats(request: Request, days: int = 7):
 
 
 @app.get("/admin/detector-scorecard")
-async def admin_detector_scorecard(request: Request, days: int = 30, cost_pct: float = 0.10):
+async def admin_detector_scorecard(request: Request, days: int = 30, cost_pct: float = 0.10,
+                                   group_by: str = "detector"):
     """
-    Realized-edge scorecard per detector — the "what to keep / cut" view. For
-    each detector_source, over CLOSED signals in the window, computes:
+    Realized-edge scorecard over CLOSED signals — the "what to keep / cut" view,
+    and the honest "is the engine actually +EV (not just high win-rate)?" answer.
 
+    Per segment (and a PORTFOLIO roll-up across all signals):
       win_rate, avg_win%, avg_loss%, payoff (avg_win/|avg_loss|),
+      worst_loss% / best_win% (tail — how bad are the losers),
       expectancy_gross% = mean realized result_pct per trade,
       expectancy_net%   = gross − round-trip cost (default 0.10%),
       verdict (KEEP / WATCH / CUT, sample-size aware).
 
-    Expectancy per trade is the honest bottom line: positive net = the detector
-    makes money after costs; negative = it bleeds. Admin only.
+    group_by: 'detector' (detector×strategy, default) | 'regime' | 'detector_regime'
+    — so you can see whether an 80% win rate holds across regimes or is one
+    regime carrying it. Expectancy per trade is the bottom line: positive net =
+    makes money after costs; negative = bleeds. Admin only.
     """
     _user_id, sb = _require_admin_jwt(request)
     from datetime import datetime, timezone, timedelta
+    from engine import scorecard
     days     = max(1, min(days, 120))
     cost_pct = max(0.0, min(cost_pct, 2.0))
     since    = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    _MIN_N   = 15   # below this, sample is too small to trust a verdict
 
     try:
         rows = (
             sb.table("signals")
-              .select("result, result_pct, status, score_breakdown, strategy_type, created_at")
+              .select("result, result_pct, status, score_breakdown, strategy_type, "
+                      "regime_type, created_at")
               .eq("status", "closed")
               .gte("created_at", since)
               .limit(5000)
               .execute()
         ).data or []
 
-        # Group by detector_source × strategy_type so e.g. SMC-swing is isolated
-        # from SMC-day_trade, and TREND_MOMENTUM (always swing) stands on its own
-        # — the head-to-head the operator actually wants ("is 12-1 momentum
-        # beating SMC swing?"), not a blended SMC row.
-        det: dict[tuple, dict] = {}
-        for r in rows:
-            bd  = r.get("score_breakdown") or {}
-            src = bd.get("detector_source") or "SMC"
-            strat = r.get("strategy_type") or "—"
-            pct = r.get("result_pct")
-            if pct is None:
-                continue
-            pct = float(pct)
-            d = det.setdefault((src, strat), {"n": 0, "wins": 0, "losses": 0,
-                                     "win_sum": 0.0, "loss_sum": 0.0, "pnl_sum": 0.0})
-            d["n"] += 1
-            d["pnl_sum"] += pct
-            if r.get("result") == "win" or pct > 0:
-                d["wins"] += 1; d["win_sum"] += pct
-            else:
-                d["losses"] += 1; d["loss_sum"] += pct
-
-        out = []
-        for (src, strat), d in det.items():
-            n = d["n"]
-            win_rate = round(d["wins"] / n * 100, 1) if n else None
-            avg_win  = round(d["win_sum"]  / d["wins"],   3) if d["wins"]   else None
-            avg_loss = round(d["loss_sum"] / d["losses"], 3) if d["losses"] else None
-            payoff   = round(avg_win / abs(avg_loss), 2) if (avg_win and avg_loss) else None
-            exp_gross = round(d["pnl_sum"] / n, 3) if n else None
-            exp_net   = round(exp_gross - cost_pct, 3) if exp_gross is not None else None
-
-            if n < _MIN_N:
-                verdict = "WATCH"; reason = f"low sample (n={n})"
-            elif exp_net is None:
-                verdict = "WATCH"; reason = "no data"
-            elif exp_net >= 0.10:
-                verdict = "KEEP"; reason = f"+{exp_net}%/trade after costs"
-            elif exp_net <= -0.05:
-                verdict = "CUT"; reason = f"{exp_net}%/trade after costs"
-            else:
-                verdict = "WATCH"; reason = "marginal edge"
-
-            out.append({"detector": src, "strategy": strat, "n": n, "win_rate": win_rate,
-                        "avg_win": avg_win, "avg_loss": avg_loss, "payoff": payoff,
-                        "expectancy_gross": exp_gross, "expectancy_net": exp_net,
-                        "verdict": verdict, "reason": reason})
-
-        # Rank best → worst by net expectancy (None last)
-        out.sort(key=lambda x: (x["expectancy_net"] is None, -(x["expectancy_net"] or -999)))
-        return {"since": since, "days": days, "cost_pct": cost_pct,
-                "min_sample": _MIN_N, "detectors": out}
+        res = scorecard.compute(rows, group_by=group_by, cost_pct=cost_pct)
+        # Backward-compatible key 'detectors'; new richer key 'segments' + portfolio.
+        return {"since": since, "days": days, **res, "detectors": res["segments"]}
     except HTTPException:
         raise
     except Exception as e:
