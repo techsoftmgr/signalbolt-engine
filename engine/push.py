@@ -9,6 +9,7 @@ Token list is cached for 5 minutes so rapid-fire notifications (e.g. T1 hit
 import logging
 import os
 import time
+from datetime import datetime, timezone
 
 import requests
 from supabase import create_client, Client
@@ -54,67 +55,159 @@ def _supabase() -> Client:
     return _sb_client
 
 
-def _get_profiles() -> list[dict]:
-    """
-    Return cached list of {token, prefs} dicts. Refresh every 5 minutes.
+def _valid_token(tok) -> bool:
+    return isinstance(tok, str) and tok.startswith("ExponentPushToken[")
 
-    Retries up to 3 times (backoff 1s/2s/4s) before logging a single error
-    and falling back to the stale cache. This prevents transient Supabase
-    blips from spamming the logs and from clearing the working cache.
+
+def _merge_devices(ptoks: list[dict], profiles: list[dict]) -> list[dict]:
+    """PURE — merge the push_tokens table (multi-device) with the legacy
+    profiles.push_token into one deduped device list:
+        [{user_id, token, prefs, email}]
+    push_tokens wins; a legacy profiles.push_token is included only if that token
+    isn't already present. Non-Expo tokens are dropped. Deterministic + testable.
+    """
+    pmap = {p.get("id"): p for p in (profiles or [])}
+    out: list[dict] = []
+    seen: set = set()
+
+    def _add(user_id, token, prof):
+        if not _valid_token(token) or token in seen:
+            return
+        out.append({
+            "user_id": user_id,
+            "token":   token,
+            "prefs":   {**_DEFAULT_PREFS, **((prof or {}).get("notification_prefs") or {})},
+            "email":   (prof or {}).get("email"),
+        })
+        seen.add(token)
+
+    for pt in (ptoks or []):
+        _add(pt.get("user_id"), pt.get("token"), pmap.get(pt.get("user_id")))
+    for p in (profiles or []):          # legacy fallback
+        _add(p.get("id"), p.get("push_token"), p)
+    return out
+
+
+def _device_rows() -> list[dict]:
+    """
+    Cached list of {user_id, token, prefs, email} for ALL registered devices —
+    the UNION of the push_tokens table (one user → many devices) and the legacy
+    profiles.push_token. Refresh every 5 min; retries with backoff; serves stale
+    cache on persistent failure (a Supabase blip must not silence push).
     """
     global _profile_cache, _profile_cache_ts
     now = time.monotonic()
     if now - _profile_cache_ts < _TOKEN_CACHE_TTL:
-        return _profile_cache   # serve from cache
+        return _profile_cache
 
     last_error: Exception | None = None
     for attempt in range(3):
         try:
-            rows = (
-                _supabase()
-                .table("profiles")
-                .select("push_token, notification_prefs")
-                .neq("push_token", None)
-                .execute()
-                .data
-            )
-            profiles = [
-                {
-                    "token": r["push_token"],
-                    "prefs": {**_DEFAULT_PREFS, **(r.get("notification_prefs") or {})},
-                }
-                for r in rows
-                if r.get("push_token") and r["push_token"].startswith("ExponentPushToken[")
-            ]
-            _profile_cache    = profiles
+            profiles = (
+                _supabase().table("profiles")
+                .select("id, push_token, notification_prefs, email")
+                .execute().data
+            ) or []
+            try:
+                ptoks = (
+                    _supabase().table("push_tokens").select("user_id, token").execute().data
+                ) or []
+            except Exception:
+                ptoks = []   # table not migrated yet → legacy profiles-only
+            devices = _merge_devices(ptoks, profiles)
+            _profile_cache    = devices
             _profile_cache_ts = now
-            return profiles
+            return devices
         except Exception as e:
             last_error = e
             if attempt < 2:
                 logger.warning(
-                    "[push] token fetch failed attempt=%s; retrying in %ss",
+                    "[push] device fetch failed attempt=%s; retrying in %ss",
                     attempt + 1, 2 ** attempt,
                 )
                 time.sleep(2 ** attempt)
 
-    logger.error(f"[push] Failed to fetch push profiles after retries: {last_error}")
-    return _profile_cache   # return stale cache on persistent error
+    logger.error(f"[push] Failed to fetch devices after retries: {last_error}")
+    return _profile_cache   # stale cache on persistent error
+
+
+def _get_profiles() -> list[dict]:
+    """Back-compat shim: [{token, prefs}] across ALL devices."""
+    return [{"token": d["token"], "prefs": d["prefs"]} for d in _device_rows()]
 
 
 def _tokens_for(pref_key: str, default: bool = True) -> list[str]:
     """
-    Return only tokens where the user has enabled the given notification type.
-
-    `default` controls behavior when the user hasn't set this pref yet:
-      - True  → opt-out (most prefs work this way)
-      - False → opt-in  (used for noisy alerts like block_prints)
+    Tokens (all devices) where the user has enabled the given notification type.
+    `default` controls users who haven't set this pref: True → opt-out, False →
+    opt-in (noisy alerts like block_prints).
     """
-    return [
-        p["token"]
-        for p in _get_profiles()
-        if p["prefs"].get(pref_key, default)
-    ]
+    return [d["token"] for d in _device_rows() if d["prefs"].get(pref_key, default)]
+
+
+def _tokens_for_users(user_ids, pref_key: str | None = None, default: bool = True) -> list[str]:
+    """Tokens for a set of user_ids (ALL of each user's devices), optionally
+    pref-filtered. Used by watchlist / buzz / cycle (audience-scoped) alerts."""
+    uid = {u for u in (user_ids or []) if u}
+    if not uid:
+        return []
+    out = []
+    for d in _device_rows():
+        if d["user_id"] not in uid:
+            continue
+        if pref_key is not None and not d["prefs"].get(pref_key, default):
+            continue
+        out.append(d["token"])
+    return out
+
+
+def register_device(user_id: str, token: str, platform: str | None = None) -> bool:
+    """
+    Service-role upsert of a device push token (multi-device aware). A given Expo
+    token belongs to exactly ONE install, so we REASSIGN it to this user if it was
+    previously registered to another account (re-login on the same device). Also
+    mirrors to profiles.push_token for back-compat. Returns True on success.
+    """
+    if not _valid_token(token):
+        return False
+    try:
+        sb = _supabase()
+        sb.table("push_tokens").delete().eq("token", token).execute()   # reassign
+        sb.table("push_tokens").insert({
+            "user_id":   user_id,
+            "token":     token,
+            "platform":  platform,
+            "last_seen": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+        try:
+            sb.table("profiles").update({"push_token": token}).eq("id", user_id).execute()
+        except Exception:
+            pass   # back-compat mirror is best-effort
+        global _profile_cache_ts
+        _profile_cache_ts = 0.0   # invalidate cache so the new token is used now
+        return True
+    except Exception as e:
+        logger.error(f"[push] register_device failed for {user_id}: {e}")
+        return False
+
+
+def _prune_dead_tokens(tokens: list[str]) -> None:
+    """Delete tokens Expo reported as DeviceNotRegistered (app uninstalled / token
+    rotated) from push_tokens + clear any legacy profiles.push_token match."""
+    try:
+        sb = _supabase()
+        for t in tokens:
+            if not t:
+                continue
+            try: sb.table("push_tokens").delete().eq("token", t).execute()
+            except Exception: pass
+            try: sb.table("profiles").update({"push_token": None}).eq("push_token", t).execute()
+            except Exception: pass
+        global _profile_cache_ts
+        _profile_cache_ts = 0.0
+        logger.info(f"[push] pruned {len(tokens)} dead token(s)")
+    except Exception as e:
+        logger.debug(f"[push] prune dead tokens failed: {e}")
 
 
 def _record_alert(
@@ -515,20 +608,7 @@ def send_buzz_spike_alert(
         if not user_ids:
             return 0
 
-        prof = (
-            client.table("profiles")
-            .select("push_token, notification_prefs")
-            .in_("id", user_ids)
-            .neq("push_token", None)
-            .execute()
-            .data
-        ) or []
-        tokens = [
-            p["push_token"]
-            for p in prof
-            if p.get("push_token", "").startswith("ExponentPushToken[")
-            and {**_DEFAULT_PREFS, **(p.get("notification_prefs") or {})}.get("community_buzz", True)
-        ]
+        tokens = _tokens_for_users(user_ids, "community_buzz")   # all devices, pref-gated
         if not tokens:
             return 0
 
@@ -567,20 +647,7 @@ def send_watchlist_state_alert(ticker: str, title: str, body: str, sb: Client | 
         user_ids = list({w["user_id"] for w in watchers if w.get("user_id")})
         if not user_ids:
             return 0
-        prof = (
-            client.table("profiles")
-            .select("push_token, notification_prefs")
-            .in_("id", user_ids)
-            .neq("push_token", None)
-            .execute()
-            .data
-        ) or []
-        tokens = [
-            p["push_token"]
-            for p in prof
-            if p.get("push_token", "").startswith("ExponentPushToken[")
-            and {**_DEFAULT_PREFS, **(p.get("notification_prefs") or {})}.get("watchlist_alerts", True)
-        ]
+        tokens = _tokens_for_users(user_ids, "watchlist_alerts")   # all devices, pref-gated
         if not tokens:
             return 0
         messages = [
@@ -628,20 +695,7 @@ def send_cycle_alert(ticker: str, kind: str, sb: Client | None = None) -> int:
         user_ids = list({w["user_id"] for w in watchers if w.get("user_id")})
         if not user_ids:
             return 0
-        prof = (
-            client.table("profiles")
-            .select("push_token, notification_prefs")
-            .in_("id", user_ids)
-            .neq("push_token", None)
-            .execute()
-            .data
-        ) or []
-        tokens = [
-            p["push_token"]
-            for p in prof
-            if p.get("push_token", "").startswith("ExponentPushToken[")
-            and {**_DEFAULT_PREFS, **(p.get("notification_prefs") or {})}.get("cycle_signals", True)
-        ]
+        tokens = _tokens_for_users(user_ids, "cycle_signals")   # all devices, pref-gated
         if not tokens:
             return 0
         messages = [
@@ -747,22 +801,13 @@ ADMIN_EMAIL = "techsoftmgr@gmail.com"
 
 def send_admin_alert(title: str, body: str, data: dict | None = None) -> bool:
     """
-    Push to the ADMIN's device ONLY (never a broadcast). For internal ops alerts
-    such as the daily phantom-data audit. Returns True if an admin token was
-    found and dispatched (False = logged only, e.g. no token registered).
+    Push to the ADMIN's device(s) ONLY (never a broadcast). For internal ops
+    alerts such as the daily phantom-data audit. Now multi-device: sends to ALL
+    of the admin's registered devices. Returns True if a token was found and
+    dispatched (False = logged only, e.g. no token registered).
     """
     try:
-        rows = (
-            _supabase().table("profiles")
-            .select("push_token")
-            .eq("email", ADMIN_EMAIL)
-            .neq("push_token", None)
-            .execute().data
-        ) or []
-        tokens = [
-            r["push_token"] for r in rows
-            if (r.get("push_token") or "").startswith("ExponentPushToken[")
-        ]
+        tokens = [d["token"] for d in _device_rows() if d.get("email") == ADMIN_EMAIL]
         if not tokens:
             logger.info("[push] admin alert: no admin push token registered — logged only")
             return False
@@ -792,11 +837,23 @@ def _dispatch(messages: list[dict], label: str) -> None:
             timeout=10,
         )
         result = resp.json()
+        data = result.get("data", []) or []
         errors = [
             r.get("details", {}).get("error")
-            for r in result.get("data", [])
+            for r in data
             if r.get("status") == "error"
         ]
+        # Prune tokens Expo says are dead (DeviceNotRegistered) — the response is
+        # positional, so index i maps to messages[i]["to"].
+        dead = [
+            messages[i].get("to")
+            for i, r in enumerate(data)
+            if i < len(messages)
+            and r.get("status") == "error"
+            and r.get("details", {}).get("error") == "DeviceNotRegistered"
+        ]
+        if dead:
+            _prune_dead_tokens(dead)
         if errors:
             logger.warning(f"[push] Errors for '{label}': {errors}")
         else:

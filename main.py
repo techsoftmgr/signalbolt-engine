@@ -1449,10 +1449,22 @@ class PushTokenRequest(BaseModel):
 
 @app.post("/register-push")
 def register_push_token(req: PushTokenRequest):
-    """Save a device's Expo push token to the profiles table."""
+    """
+    Register a device's Expo push token (multi-device). Upserts into push_tokens
+    (one user → many devices) and reassigns the token if it was bound to another
+    account (re-login on the same install); also mirrors profiles.push_token for
+    back-compat. The app already calls this on every launch, so multi-device
+    delivery turns on with no app change once push_tokens exists.
+    """
     try:
-        sb = _make_supabase()
-        sb.table("profiles").update({"push_token": req.push_token}).eq("id", req.user_id).execute()
+        from engine import push
+        ok = push.register_device(req.user_id, req.push_token)
+        if not ok:
+            # Fallback to the legacy single-token write (e.g. push_tokens not
+            # migrated yet, or an invalid token shape) so we never regress.
+            _make_supabase().table("profiles").update(
+                {"push_token": req.push_token}
+            ).eq("id", req.user_id).execute()
         return {"status": "ok"}
     except Exception as e:
         logger.error(f"POST /register-push error: {e}")
