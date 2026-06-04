@@ -132,6 +132,20 @@ def generate(sb, r: dict, kind: str) -> dict:
     rvol    = r.get("relativeVolume")
     rvol_txt = f" on {rvol:.1f}x volume" if isinstance(rvol, (int, float)) else ""
 
+    # Logging-only fire-time telemetry (regime + concentration + sector + instrument)
+    # so the FORMING variants are sliceable in the same study as the confirmed
+    # detectors. NEVER gates firing — fails open.
+    try:
+        from engine import signal_telemetry
+        regime_type, study = signal_telemetry.capture(sb, tk, direction, strat)
+    except Exception:
+        regime_type, study = "", {}
+    try:
+        from engine.breakdown_signals import classify_asset
+        instrument = classify_asset(tk)
+    except Exception:
+        instrument = {}
+
     label = {
         "breakout":  "forming breakout (pressing the 20-day high)",
         "breakdown": "forming breakdown (lost the 20-day average)",
@@ -161,7 +175,7 @@ def generate(sb, r: dict, kind: str) -> dict:
             f"Entry near {entry}, wider stop {stop} (give the swing room), "
             f"targets {t1} / {t2}. Smaller size — unproven, forming setup."
         ),
-        "regime_type":         "",
+        "regime_type":         regime_type,
         "session_mode":        "",
         "confidence_tier":     "B",
         "position_multiplier": 0.25,
@@ -177,6 +191,12 @@ def generate(sb, r: dict, kind: str) -> dict:
             "ma20":            round(float(r.get("ma20")), 2) if r.get("ma20") else None,
             "atr_used":        round(atr, 4),
             "initial_stop":    stop,
+            # Logging-only metadata for the segmented expectancy study (does NOT
+            # gate firing): instrument class + relative volume + the regime /
+            # concentration / sector telemetry blob.
+            "relativeVolume":  round(float(rvol), 2) if isinstance(rvol, (int, float)) else None,
+            **instrument,
+            "study":           study,
         },
         "confidence_grade":    "B",
         "risk_grade":          "MEDIUM",
