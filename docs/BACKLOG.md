@@ -247,6 +247,56 @@ misaligned with a 1–10 day swing.
 
 ---
 
+## 9. Long-term TECHNICAL context for chat + Expert Read — ~half day
+
+**Priority:** LOW-MED. Asked 2026-06-03: the AI chat can't answer "long-term"
+questions because the entire grounding (quant verdict, Expert Read, signal levels)
+is short-horizon (daily/1h/15m, 1-10 day swings). The assistant correctly refuses
+to invent, so it stays silent on the long term.
+
+**Scope (Option A — technical only, no fundamentals):** add a long-term block to
+`chart_read.analyze` and the chat context built in `chat_service._build_context`:
+- weekly/monthly bars → **200-day MA** (above/below), **52-week range + position
+  within it**, multi-month trend & structure, distance from 52-wk high/low.
+Cheap (just more Alpaca bars), stays in the technical lane (no investment-advice
+liability), and lets chat answer "long-term trend / where it sits in its range /
+is it above the 200-day". Keep declining true fundamentals (see #10 dependency).
+
+## 10. Long-term "crash / deep-value" BUY signal (+ long-term SHORT) — LARGER, gated
+
+**Priority:** MED (strategic differentiator) but **a different product track** — do
+NOT bolt onto the swing detectors. Asked 2026-06-03: in a deep index drawdown
+(-20-30% from highs) quality names trade at multi-year lows; a long-term buy at the
+lows historically returns 100-200% on recovery (2008/2020/2022).
+
+**Why it's a separate track, not a quick detector:**
+- **Horizon:** months-to-years. The whole engine assumes 1-10 day swings (tight
+  stops, 10-day expiry, 5-min monitors). A long-term position would get shaken out
+  by those. Needs the existing `position_trade` type (720h) extended with LOOSE
+  management: wide/no hard stop, scale-in, hold through volatility.
+- **Fires RARELY:** regime-gated (once every few years), so it's an occasional
+  "generational buy" alert, not a steady signal stream. Different UX + audience
+  (investors, not traders).
+- **DEPENDS ON FUNDAMENTALS (the blocker):** "good stocks trading deep low" can't be
+  picked on technicals alone — you'd catch falling knives / value traps (a stock
+  -30% can go -60%; survivorship bias hides the bankruptcies). Needs a quality screen
+  (balance sheet, earnings durability) = the fundamentals feed we don't have yet
+  (Option B from the long-term-context discussion).
+
+**Buildable now (cheap, technical, no fundamentals):** a **market-regime drawdown
+detector** — index (SPY/QQQ/IWM) % off its 52-week high + breadth — that flags
+"deep drawdown regime." That's the trigger half. Layer the quality screen + the
+long-term BUY list once fundamentals exist.
+
+**Long-term SHORT (inverse):** overvalued names at market tops. Lower priority +
+harder — shorting has unlimited risk, borrow cost, and markets stay irrational longer
+than a short can hold. Defer.
+
+**Liability:** long-term buy/sell recommendations are heavier investment-advice
+territory than a 1-10 day signal — keep the "educational, not advice" framing.
+
+---
+
 ## How to use this backlog
 
 - Items get re-prioritised whenever new data changes the calculus
