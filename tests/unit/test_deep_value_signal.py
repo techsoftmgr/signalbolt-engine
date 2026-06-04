@@ -39,6 +39,9 @@ def _run(regime, candidates, df, ta):
          patch("engine.fundamentals.get_ranked", return_value=candidates), \
          patch("engine.runner._has_active_signal", return_value=False), \
          patch("engine.runner._write_signal", side_effect=_write), \
+         patch("engine.runner._has_active_option_signal", return_value=False), \
+         patch("engine.runner._write_option_signal", return_value="opt-id"), \
+         patch("engine.options_scanner.scan_leap", return_value=None), \
          patch("engine.alpaca_client.get_bars", return_value=df), \
          patch("engine.turnaround_detector.score_turnaround", return_value=ta), \
          patch("engine.push._send_raw"), \
@@ -106,3 +109,72 @@ class TestDeepBearEscalation:
     def test_normal_regime_caps_at_fifteen(self):
         res, rows = _run(_OPEN, _MANY, _df(420.0), {"stage": "buyzone", "score": 80})
         assert res["count"] == 15 and len(rows) == 15
+
+
+# ── Deep-ITM LEAP companion ──────────────────────────────────────────────────
+from engine import options_scanner as _opt
+
+
+class TestPickLeap:
+    """Pure selection logic for the deep-ITM LEAP: delta band + liquidity gates."""
+    @staticmethod
+    def _c(delta, oi=500, spread=0.05):
+        return {"delta": delta, "oi": oi, "spread_pct": spread, "strike": 100.0}
+
+    def test_picks_delta_closest_to_target(self):
+        best = _opt._pick_leap([self._c(0.70), self._c(0.82), self._c(0.95)])
+        assert best["delta"] == 0.82            # 0.80 target → 0.82 wins
+
+    def test_rejects_below_deep_itm_band(self):
+        assert _opt._pick_leap([self._c(0.50)]) is None     # < 0.65 floor
+
+    def test_rejects_thin_open_interest(self):
+        assert _opt._pick_leap([self._c(0.80, oi=10)]) is None   # < 100 OI
+
+    def test_rejects_wide_spread(self):
+        assert _opt._pick_leap([self._c(0.80, spread=0.30)]) is None  # > 12%
+
+    def test_missing_spread_is_allowed(self):
+        assert _opt._pick_leap([self._c(0.80, spread=None)]) is not None
+
+
+_LEAP = {
+    "ticker": "MSFT", "direction": "LONG", "contract_type": "CALL",
+    "strike_price": 380.0, "expiry_date": "2027-01-15", "dte": 560,
+    "underlying_price": 420.0, "entry_premium": 95.0, "target_premium": 140.0,
+    "stop_premium": 47.5, "delta": 0.82, "theta": -0.02, "iv": 28.0,
+    "open_interest": 1200, "volume": 50, "breakeven": 475.0,
+    "max_loss": 9500.0, "max_gain": 4500.0,
+}
+
+
+class TestLeapCompanion:
+    def test_writes_manual_leap_when_contract_found(self):
+        captured = {"opts": []}
+        def _wo(_sb, r):
+            captured["opts"].append(r)
+            return "opt-id"
+        with patch("engine.drawdown_regime.assess", return_value=_OPEN), \
+             patch("engine.fundamentals.get_ranked", return_value=_QUAL), \
+             patch("engine.runner._has_active_signal", return_value=False), \
+             patch("engine.runner._write_signal", return_value="sig-id"), \
+             patch("engine.runner._has_active_option_signal", return_value=False), \
+             patch("engine.runner._write_option_signal", side_effect=_wo), \
+             patch("engine.options_scanner.scan_leap", return_value=dict(_LEAP)), \
+             patch("engine.alpaca_client.get_bars", return_value=_df(420.0)), \
+             patch("engine.turnaround_detector.score_turnaround", return_value={"stage": "buyzone", "score": 80}), \
+             patch("engine.push._send_raw"), patch("engine.push._record_alert"):
+            res = dv.generate(sb=object())
+        assert res["leaps"] == ["MSFT"]
+        assert len(captured["opts"]) == 1
+        opt = captured["opts"][0]
+        assert opt["strategy_type"] == "deep_value"
+        assert opt["management_mode"] == "manual"     # engine hands-off (no 24h expiry)
+        assert opt["contract_type"] == "CALL"
+        assert opt["status"] == "active"
+        assert "LEAP" in opt["ai_explanation"]
+
+    def test_stock_fires_without_leap_when_none(self):
+        # scan_leap → None: the stock signal still fires, no option written.
+        res, rows = _run(_OPEN, _QUAL, _df(420.0), {"stage": "buyzone", "score": 80})
+        assert res["count"] == 1 and res["leaps"] == []
