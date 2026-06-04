@@ -210,6 +210,8 @@ STRATEGY_MAX_HOLD_HOURS = {
     "earnings":       48.0,   # 2 days — pre/post earnings move
     "short_squeeze":  24.0,   # 1 day — squeeze resolves quickly
     "position_trade": 720.0,  # 30 days — macro position
+    "deep_value":     8760.0, # 1 year — crash/deep-value long-term hold (also fired
+                              # management_mode='manual', so the expiry skips it anyway)
     "options_flow":   8.0,
     "dark_pool":      8.0,
 }
@@ -2075,6 +2077,13 @@ def _close_signals(sb: Client) -> None:
         # already skips it for the same reason.)
         if ((sig.get("score_breakdown") or {}).get("detector_source")) == "TREND_MOMENTUM":
             continue
+        # MANUAL override: the admin — or a long-horizon signal like deep_value —
+        # owns this trade. The engine must NOT auto-expire or stop/target-close it
+        # (signal_monitor + the RT path already skip manual; the expiry must too,
+        # else a manual / months-hold position is force-closed at its strategy's
+        # max-hold default).
+        if (sig.get("management_mode") or "engine") == "manual":
+            continue
 
         created      = datetime.fromisoformat(sig["created_at"].replace("Z", "+00:00"))
         strategy     = sig.get("strategy_type") or "day_trade"
@@ -2421,6 +2430,19 @@ def _run_weight_optimization() -> None:
     except Exception as e:
         sentry_sdk.capture_exception(e)
         logger.error(f"[runner] Weight optimization failed: {e}", exc_info=True)
+
+
+def _run_deep_value_signal() -> None:
+    """Crash/deep-value long-term BUY combine (backlog #10). Regime-gated → no-ops
+    in a healthy market; fires manual-mode position signals for quality names that
+    are deeply discounted AND showing a confirmed turn (falling-knife guard)."""
+    try:
+        from engine import deep_value_signal
+        sb = create_client(os.environ["SUPABASE_URL"], _supabase_key())
+        res = deep_value_signal.generate(sb)
+        logger.info(f"[runner] ═══ Deep-value combine — {res} ═══")
+    except Exception as e:
+        logger.error(f"[runner] Deep-value combine failed: {e}", exc_info=True)
 
 
 def _run_drawdown_regime_log() -> None:
@@ -3090,6 +3112,19 @@ def start_scheduler() -> BackgroundScheduler:
         replace_existing=True,
     )
     logger.info("[runner] Scheduled drawdown-regime log (4:12 PM ET)")
+
+    # ── Deep-value combine (crash/deep-value long-term BUY signal) ───────
+    # Daily, post-close. Regime-gated → no-ops until a real -20% drawdown, then
+    # fires manual-mode position signals for quality + deeply-discounted + turning
+    # names (the falling-knife guard).
+    scheduler.add_job(
+        _run_deep_value_signal,
+        trigger=CronTrigger(hour=16, minute=22, timezone="America/New_York"),
+        id="deep_value_signal",
+        name="SignalBolt deep-value combine",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled deep-value combine (4:22 PM ET)")
 
     # ── Overnight armed-zone clear — 12:30 AM ET ─────────────────────────
     # Zones are no longer cleared at the 4PM close so the admin can analyze
