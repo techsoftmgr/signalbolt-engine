@@ -62,8 +62,9 @@ EXTENDED_UNIVERSE = [
     "SPOT", "RDDT", "APP", "CELH", "DUOL", "ONON", "DECK", "ELF",
     "HIMS", "SNAP", "PINS", "DOCS", "WOLF", "TTWO", "EA", "RIVN",
     "HOOD", "AFRM", "UPST", "OPEN", "COUR", "BMBL", "JOBY",
-    # ── Indices / ETFs ─────────────────────────────────────────
-    "SPY", "QQQ", "IWM", "DIA", "TQQQ", "SQQQ", "UVXY", "VXX",
+    # ── Indices / ETFs (1x only — leveraged/inverse TQQQ/SQQQ/UVXY/VXX removed:
+    #    daily-rebalanced + decay-prone, never signal-worthy) ────
+    "SPY", "QQQ", "IWM", "DIA",
     "XLK", "XLF", "XLE", "XLV", "XLI", "XLC", "XLRE",
     "GLD", "SLV", "TLT", "HYG", "LQD", "ARKK", "ARKG", "ARKW",
     # ── Financials ─────────────────────────────────────────────
