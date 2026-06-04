@@ -28,7 +28,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from supabase import create_client, Client
 
 from engine import smc, scorer, explainer, options_scanner, push
-from engine.tracker import track_signals
+from engine.tracker import track_signals, result_from_pnl_pct
 from engine import regime_detector, session_classifier, gamma_engine, manipulation_detector, sl_tp_engine, risk_manager
 from engine import weight_optimizer, signal_monitor
 from engine import unusual_whales as uw
@@ -2124,17 +2124,19 @@ def _close_signals(sb: Client) -> None:
             elif close_price is not None:
                 entry   = float(sig["entry_price"])
                 is_long = sig["direction"] == "LONG"
+                raw_pct = ((close_price - entry) / entry) * 100 if is_long \
+                          else ((entry - close_price) / entry) * 100
+                raw_pnl = (close_price - entry) if is_long else (entry - close_price)
+                # Classify by P&L SIGN, not by which level was hit. A trailing
+                # stop raised above entry closes 'stop_hit' but IN PROFIT — that's
+                # a WIN (fixes the 'ON +1.47% loss' corruption, 2026-06-04).
+                update["result"] = result_from_pnl_pct(raw_pct)
                 if reason == "target_hit":
-                    update["result"]     = "win"
                     hit_t2 = (is_long and close_price >= sig["target_two"]) or \
                              (not is_long and close_price <= sig["target_two"])
                     update["hit_target"] = "t2" if hit_t2 else "t1"
                 else:
-                    update["result"]     = "loss"
                     update["hit_target"] = "sl"
-                raw_pct = ((close_price - entry) / entry) * 100 if is_long \
-                          else ((entry - close_price) / entry) * 100
-                raw_pnl = (close_price - entry) if is_long else (entry - close_price)
                 update["result_pct"] = round(raw_pct, 4)
                 update["result_pnl"] = round(raw_pnl, 4)
             try:
