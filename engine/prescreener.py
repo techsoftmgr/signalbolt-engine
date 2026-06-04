@@ -259,6 +259,17 @@ def screen(
         # so the final list is sorted by "how interesting is this ticker right now"
         scored: list[tuple[str, float]] = []
 
+        # Time-of-day volume projection factor (computed ONCE for the whole batch).
+        # Alpaca's snapshot daily_bar.volume is today's PARTIAL volume intraday, so
+        # comparing it raw to yesterday's FULL volume makes vol_ratio artificially
+        # low early (~0.14x at 9:46am) and MISSES genuinely high-volume names. Scale
+        # today's volume up to a full-day estimate via the shared empirical intraday
+        # curve before the ratio. Only during RTH (pre/post-market: use raw).
+        from datetime import datetime as _dt, timezone as _tz
+        from engine.volume_curve import expected_volume_fraction
+        _elapsed  = _dt.now(_tz.utc).hour * 60 + _dt.now(_tz.utc).minute - (13 * 60 + 30)
+        _vol_proj = (1.0 / max(0.05, expected_volume_fraction(_elapsed))) if 0 < _elapsed < 390 else 1.0
+
         for ticker, snap in snapshots.items():
             try:
                 daily = snap.daily_bar
@@ -286,7 +297,7 @@ def screen(
                 # WMT (-gap down) show here while the intraday move is small.
                 gap_pct = abs(open_price - prev_close) / prev_close
 
-                vol_ratio = today_vol / prev_vol if prev_vol > 0 else 1.0
+                vol_ratio = (today_vol * _vol_proj) / prev_vol if prev_vol > 0 else 1.0
 
                 # Qualify on ANY of: intraday move, overnight gap, or volume
                 has_move = move_pct >= min_move_pct
