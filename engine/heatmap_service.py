@@ -20,34 +20,10 @@ import numpy as np
 
 logger = logging.getLogger("signalbolt.heatmap")
 
-# Empirical intraday CUMULATIVE volume curve — fraction of a full RTH day's volume
-# typically completed by N minutes after the 9:30 ET open. Derived from ~340
-# ticker-days of 5-min bars across the universe (2026-06). Volume is heavily
-# front-loaded by the opening surge (~14% in the first 15 min), so the old naive
-# `elapsed / 390` assumption massively OVER-projected early-session relative volume
-# — e.g. HOOD 2026-06-04 9:46am: real ~0.8x opening volume was projected to a fake
-# "2.3x" and fired a false accumulation signal. Projecting against this curve
-# instead makes relative volume valid at ANY time of day.
-_VOL_CURVE = [
-    (0, 0.0), (5, 0.087), (10, 0.113), (15, 0.139), (20, 0.160), (30, 0.200),
-    (45, 0.255), (60, 0.306), (90, 0.387), (120, 0.459), (180, 0.570),
-    (240, 0.670), (300, 0.768), (360, 0.880), (390, 1.0),
-]
-
-
-def _expected_volume_fraction(elapsed_min: float) -> float:
-    """Fraction of a full RTH day's volume typically done by `elapsed_min` minutes
-    after the open (linear-interpolated empirical curve). Clamped to (0, 1]."""
-    if elapsed_min >= 390:
-        return 1.0
-    if elapsed_min <= 5:
-        return _VOL_CURVE[1][1]          # floor at the 5-min mark (~8.7%); avoids
-                                          # div-by-zero + tames the first-bar noise
-    for (m0, f0), (m1, f1) in zip(_VOL_CURVE, _VOL_CURVE[1:]):
-        if m0 <= elapsed_min <= m1:
-            t = (elapsed_min - m0) / (m1 - m0) if m1 > m0 else 0.0
-            return f0 + t * (f1 - f0)
-    return 1.0
+# Intraday volume curve lives in engine/volume_curve.py — SHARED with the
+# signal-firing path (quant_score_service). Aliased here for the local relative-
+# volume projection below + back-compat with the existing test import.
+from engine.volume_curve import expected_volume_fraction as _expected_volume_fraction
 
 # ── In-memory cache ──────────────────────────────────────────────────────────
 _cache: list[dict]   = []
