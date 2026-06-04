@@ -145,6 +145,13 @@ _pending_tickers:    set[str] = set()   # requested before stream connected
 _wss_ref                      = None    # StockDataStream (set while stream is live)
 _on_trade_ref                 = None    # stored handler for re-subscriptions
 _on_bar_ref                   = None    # stored bar handler (dynamic bar subs)
+# The worker's event loop, captured when run_stream() starts. Lets the SYNC
+# APScheduler scan thread schedule subscribe_extra_tickers() onto the live stream
+# loop immediately (run_coroutine_threadsafe) instead of only queuing to
+# _pending_tickers — which drains ONLY on reconnect, so a freshly-fired ticker
+# could sit unsubscribed for hours while the stream stays connected (HOOD froze +
+# its RT stop/target checks went dark, 2026-06-04).
+_stream_loop = None
 
 # ── Compression breakout watch (per-tick firing) ──────────────────────────────
 # Staged on bar close by runner._process_predictive_ticker; checked on EVERY
@@ -1652,7 +1659,11 @@ async def run_stream() -> None:
     feed_env  = os.environ.get("ALPACA_DATA_FEED", "sip").lower()
     feed      = DataFeed.SIP if feed_env == "sip" else DataFeed.IEX
 
-    global _subscribed_tickers, _pending_tickers, _wss_ref, _on_trade_ref, _on_bar_ref
+    global _subscribed_tickers, _pending_tickers, _wss_ref, _on_trade_ref, _on_bar_ref, _stream_loop
+
+    # Capture the worker's event loop so the sync APScheduler scan thread can
+    # schedule dynamic subscriptions onto it immediately (see _stream_loop note).
+    _stream_loop = asyncio.get_running_loop()
 
     from engine.runner import ALL_TICKERS, SCALP_TICKERS
     scalp_set = set(SCALP_TICKERS)
