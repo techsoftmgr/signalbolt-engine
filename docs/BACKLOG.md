@@ -288,6 +288,23 @@ detector** — index (SPY/QQQ/IWM) % off its 52-week high + breadth — that fla
 "deep drawdown regime." That's the trigger half. Layer the quality screen + the
 long-term BUY list once fundamentals exist.
 
+**UPDATE 2026-06-04 — BOTH HALVES SHIPPED (signal not yet fired):**
+- ✅ **Quality half** — `engine/fundamentals.py` (PR #215/#216): robust EDGAR XBRL
+  extraction (largest-annual-per-FY revenue + sanity guards — fixed the META 148%/
+  MSFT 163% bug), net margin / ROE / D/E / growth / FCF → 0-5 quality_score. Full
+  **S&P 500 universe** (live CSV w/ CIKs, cached daily), `fundamentals_cache` table
+  + rolling refresh (3×/day, batch 20). `GET /admin/quality-screen`.
+- ✅ **Regime half (Phase 0)** — `engine/drawdown_regime.py` (PR #217): SPY/QQQ/IWM
+  % off 52-wk high → healthy/pullback/correction/bear/deep_bear + `accumulation_window`
+  (opens at SPY <= -20%). `GET /market/regime-drawdown`. Daily ops log 4:12 PM ET.
+- ⬜ **REMAINING = combine + surface (the actual signal — NOT built):** when
+  `accumulation_window` is open, take quality_score>=4 from fundamentals_cache → a
+  long-horizon BUY list using `position_trade` (720h) with LOOSE mgmt (wide/no hard
+  stop, scale-in, hold through vol — do NOT reuse the swing monitors). Surface via a
+  regime BANNER on Signals/Markets + Position-tagged picks in the Signals tab (NO new
+  tab — bar is full at 6) + optional push when regime enters bear. This is the bigger
+  product + investment-advice-framing decision — paused pending user go-ahead.
+
 **Long-term SHORT (inverse):** overvalued names at market tops. Lower priority +
 harder — shorting has unlimited risk, borrow cost, and markets stay irrational longer
 than a short can hold. Defer.
