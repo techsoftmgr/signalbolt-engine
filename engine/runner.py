@@ -320,11 +320,21 @@ def _ensure_stream_subscription(ticker: str, cap: int | None = None) -> None:
         if loop and loop.is_running():
             asyncio.ensure_future(_stream.subscribe_extra_tickers([ticker]))
         else:
-            # No running loop (e.g. sync APScheduler thread). The function
-            # itself queues to _pending_tickers when _wss_ref is None, so
-            # just touch _subscribed_tickers directly.
-            _stream._subscribed_tickers.add(ticker)
-            _stream._pending_tickers.add(ticker)
+            # No running loop in THIS thread (the sync APScheduler scan thread).
+            # Schedule the subscribe onto the WORKER's stream loop so the ticker
+            # is ACTUALLY subscribed on Alpaca NOW — not merely queued to
+            # _pending_tickers, which only drains on the next reconnect. A fired
+            # ticker used to sit unsubscribed for hours while the stream stayed
+            # up → frozen price + dark RT stop/target checks (HOOD 2026-06-04).
+            sl = getattr(_stream, "_stream_loop", None)
+            if sl is not None and sl.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    _stream.subscribe_extra_tickers([ticker]), sl
+                )
+            else:
+                # Stream not up yet — queue for the initial connect to apply.
+                _stream._subscribed_tickers.add(ticker)
+                _stream._pending_tickers.add(ticker)
     except Exception as e:
         logger.debug(f"[runner] stream subscribe failed for {ticker}: {e}")
 
