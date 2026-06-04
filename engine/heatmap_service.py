@@ -20,6 +20,35 @@ import numpy as np
 
 logger = logging.getLogger("signalbolt.heatmap")
 
+# Empirical intraday CUMULATIVE volume curve — fraction of a full RTH day's volume
+# typically completed by N minutes after the 9:30 ET open. Derived from ~340
+# ticker-days of 5-min bars across the universe (2026-06). Volume is heavily
+# front-loaded by the opening surge (~14% in the first 15 min), so the old naive
+# `elapsed / 390` assumption massively OVER-projected early-session relative volume
+# — e.g. HOOD 2026-06-04 9:46am: real ~0.8x opening volume was projected to a fake
+# "2.3x" and fired a false accumulation signal. Projecting against this curve
+# instead makes relative volume valid at ANY time of day.
+_VOL_CURVE = [
+    (0, 0.0), (5, 0.087), (10, 0.113), (15, 0.139), (20, 0.160), (30, 0.200),
+    (45, 0.255), (60, 0.306), (90, 0.387), (120, 0.459), (180, 0.570),
+    (240, 0.670), (300, 0.768), (360, 0.880), (390, 1.0),
+]
+
+
+def _expected_volume_fraction(elapsed_min: float) -> float:
+    """Fraction of a full RTH day's volume typically done by `elapsed_min` minutes
+    after the open (linear-interpolated empirical curve). Clamped to (0, 1]."""
+    if elapsed_min >= 390:
+        return 1.0
+    if elapsed_min <= 5:
+        return _VOL_CURVE[1][1]          # floor at the 5-min mark (~8.7%); avoids
+                                          # div-by-zero + tames the first-bar noise
+    for (m0, f0), (m1, f1) in zip(_VOL_CURVE, _VOL_CURVE[1:]):
+        if m0 <= elapsed_min <= m1:
+            t = (elapsed_min - m0) / (m1 - m0) if m1 > m0 else 0.0
+            return f0 + t * (f1 - f0)
+    return 1.0
+
 # ── In-memory cache ──────────────────────────────────────────────────────────
 _cache: list[dict]   = []
 _cache_ts: float     = 0.0
@@ -293,11 +322,14 @@ def _compute_ticker(
     rel_volume = 1.0
     if avg_volume > 0 and current_volume > 0:
         now_utc = datetime.now(timezone.utc)
-        # Market 9:30–16:00 ET = 13:30–20:00 UTC; fraction of 390-min session elapsed
+        # Market 9:30–16:00 ET = 13:30–20:00 UTC. Project today's volume-so-far to a
+        # full day using the EMPIRICAL intraday volume curve (front-loaded), NOT a
+        # naive elapsed/390 — see _VOL_CURVE. This is the proper "relative volume at
+        # this time of day" and is valid at the open as well as midday.
         market_open_utc_mins = 13 * 60 + 30
-        elapsed = max(1, now_utc.hour * 60 + now_utc.minute - market_open_utc_mins)
-        day_frac = min(1.0, elapsed / 390)
-        projected = current_volume / max(day_frac, 0.05)
+        elapsed = now_utc.hour * 60 + now_utc.minute - market_open_utc_mins
+        exp_frac = _expected_volume_fraction(elapsed)
+        projected = current_volume / max(exp_frac, 0.05)
         rel_volume = round(projected / avg_volume, 2)
 
     # ── Momentum score ────────────────────────────────────────────────────────
