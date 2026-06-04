@@ -122,6 +122,14 @@ def generate(sb, r: dict) -> dict:
     rvol_txt = f" on {rvol:.1f}x volume" if isinstance(rvol, (int, float)) else ""
     inval = round(float(lo), 2) if lo else (round(float(ma), 2) if ma else None)
 
+    # Logging-only fire-time telemetry (regime + concentration + sector) for the
+    # breakdown-quality study. NEVER gates firing — fails open.
+    try:
+        from engine import signal_telemetry
+        regime_type, study = signal_telemetry.capture(sb, tk, "SHORT", "breakdown")
+    except Exception:
+        regime_type, study = "", {}
+
     # ── SHORT equity card ──────────────────────────────────────────────────
     signal_row = {
         "ticker":              tk,
@@ -141,7 +149,7 @@ def generate(sb, r: dict) -> dict:
             + (f"; a reclaim of {inval} invalidates it" if inval else "")
             + f". Cover into {t1} / {t2}."
         ),
-        "regime_type":         "",
+        "regime_type":         regime_type,
         "session_mode":        "",
         "confidence_tier":     "B",
         "position_multiplier": 0.25,        # small size — new, directional, unproven
@@ -162,6 +170,7 @@ def generate(sb, r: dict) -> dict:
             # by entry volume and instrument class.
             "relativeVolume":  round(float(rvol), 2) if isinstance(rvol, (int, float)) else None,
             **classify_asset(tk),
+            "study":           study,
         },
         "confidence_grade":    "B",
         "risk_grade":          "HIGH",
