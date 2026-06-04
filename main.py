@@ -2842,6 +2842,22 @@ async def admin_close_signal(request: Request, signal_id: str, asset: str = "sto
     return {"ok": True, "id": signal_id, **payload}
 
 
+@app.get("/admin/quality-screen")
+async def admin_quality_screen(request: Request, min_score: int = 0):
+    """EDGAR fundamentals quality ranking (cached). Feeds the crash/deep-value
+    long-term signal — the 'which names are quality' half. Admin-only."""
+    _user_id, sb = _require_admin_jwt(request)
+    try:
+        from engine import fundamentals
+        rows = fundamentals.get_ranked(sb, min_score=max(0, min(min_score, 5)))
+        return {"count": len(rows), "universe": len(fundamentals.QUALITY_UNIVERSE), "rows": rows}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GET /admin/quality-screen error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/admin/phantom-audit")
 async def admin_phantom_audit(request: Request, days: int = 1):
     """

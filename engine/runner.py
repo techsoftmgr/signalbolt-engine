@@ -2423,6 +2423,19 @@ def _run_weight_optimization() -> None:
         logger.error(f"[runner] Weight optimization failed: {e}", exc_info=True)
 
 
+def _run_fundamentals_refresh() -> None:
+    """Rolling refresh of the EDGAR fundamentals quality screen — a stale batch
+    each run. Fundamentals change quarterly, so a few runs/day covers the whole
+    universe well within cadence. Best-effort; no-ops if the cache table is absent."""
+    try:
+        from engine import fundamentals
+        sb = create_client(os.environ["SUPABASE_URL"], _supabase_key())
+        res = fundamentals.refresh_universe(sb, batch=15)
+        logger.info(f"[runner] ═══ Fundamentals refresh — {res} ═══")
+    except Exception as e:
+        logger.error(f"[runner] Fundamentals refresh failed: {e}", exc_info=True)
+
+
 def _run_phantom_audit() -> None:
     """
     EOD data-integrity audit. Verifies every signal closed today against the
@@ -3042,6 +3055,18 @@ def start_scheduler() -> BackgroundScheduler:
         replace_existing=True,
     )
     logger.info("[runner] Scheduled phantom-data audit (4:50 PM ET, post-close)")
+
+    # ── Fundamentals quality-screen rolling refresh ──────────────────────
+    # 3×/day (off-market hours) refreshes a stale batch; the ~150-name universe
+    # cycles within days, well inside the quarterly cadence fundamentals change.
+    scheduler.add_job(
+        _run_fundamentals_refresh,
+        trigger=CronTrigger(hour="6,13,19", minute=37, timezone="America/New_York"),
+        id="fundamentals_refresh",
+        name="SignalBolt EDGAR fundamentals refresh",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled fundamentals refresh (6:37/13:37/19:37 ET, rolling batch)")
 
     # ── Overnight armed-zone clear — 12:30 AM ET ─────────────────────────
     # Zones are no longer cleared at the 4PM close so the admin can analyze
