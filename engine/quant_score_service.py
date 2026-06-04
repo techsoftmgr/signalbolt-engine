@@ -670,9 +670,16 @@ def _score_ticker(
             today_vol  = _safe(intraday_df["volume"].tail(78).sum())
 
     if avg_vol > 0 and today_vol > 0:
-        now_utc = datetime.now(timezone.utc)
-        elapsed  = max(1, now_utc.hour * 60 + now_utc.minute - (13 * 60 + 30))
-        proj_vol = today_vol / max(0.05, elapsed / 390)
+        # Project today's volume-so-far to a full day via the EMPIRICAL intraday
+        # volume curve (front-loaded), NOT a naive elapsed/390 — which assumed
+        # volume arrives linearly and massively over-projected the open (the HOOD
+        # 9:46am "2.3x" false accum, 2026-06-04). This is the SIGNAL-firing volume
+        # gating accum/distrib/breakout/breakdown/turnaround/peak — same curve the
+        # heatmap display uses.
+        from engine.volume_curve import expected_volume_fraction
+        now_utc  = datetime.now(timezone.utc)
+        elapsed  = now_utc.hour * 60 + now_utc.minute - (13 * 60 + 30)
+        proj_vol = today_vol / max(0.05, expected_volume_fraction(elapsed))
         rel_vol  = proj_vol / avg_vol
     else:
         rel_vol = 1.0

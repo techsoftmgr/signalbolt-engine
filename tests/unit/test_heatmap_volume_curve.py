@@ -1,14 +1,21 @@
 """
-Unit tests — engine/heatmap_service._expected_volume_fraction (intraday volume
-curve). Regression for the HOOD 2026-06-04 false "2.3x volume" accum signal at
-9:46am: the old naive elapsed/390 (floored at 0.05) assumed ~5% of volume done
-16 min in, when ~14% really is — over-projecting relative volume ~2.9x.
+Unit tests — engine/volume_curve.expected_volume_fraction (intraday volume curve).
+Regression for the HOOD 2026-06-04 false "2.3x volume" accum signal at 9:46am: the
+old naive elapsed/390 (floored at 0.05) assumed ~5% of volume done 16 min in, when
+~14% really is — over-projecting relative volume ~2.9x. The curve is the SHARED
+divisor for BOTH the heatmap display AND the signal-firing path (quant_score_service).
 """
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from engine.heatmap_service import _expected_volume_fraction as ef
+from engine.volume_curve import expected_volume_fraction as ef
+# heatmap_service must alias the SAME shared function (display + signals in sync)
+from engine.heatmap_service import _expected_volume_fraction as _heatmap_ef
+
+
+def test_heatmap_uses_shared_curve():
+    assert _heatmap_ef is ef
 
 
 class TestVolumeCurve:
