@@ -79,3 +79,16 @@ class TestAnswer:
     def test_empty_message_rejected(self):
         res = cs.answer(_FakeSB([]), "NVDA", "   ", [])
         assert res["ok"] is False
+
+
+class TestInstructions:
+    def test_on_topic_guard_present(self):
+        instr = cs._INSTRUCTIONS.lower()
+        assert "stay on topic" in instr
+        assert "off-topic" in instr
+        assert "decline" in instr
+
+    def test_no_buy_sell_and_disclaimer(self):
+        instr = cs._INSTRUCTIONS
+        assert "not tell the user to buy/sell" in instr.lower()
+        assert cs._DISCLAIMER in instr
