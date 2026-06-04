@@ -2191,6 +2191,11 @@ def _close_signals(sb: Client) -> None:
 
     option_cutoff = now - timedelta(hours=24)
     for sig in opt_rows:
+        # MANUAL: months-horizon option holds (deep-value LEAPS) — engine
+        # hands-off. Without this skip the 24h cutoff below would force-"expire"
+        # a 1-2yr LEAP the next day (same class as the stock-expiry manual fix).
+        if (sig.get("management_mode") or "engine") == "manual":
+            continue
         created = datetime.fromisoformat(sig["created_at"].replace("Z", "+00:00"))
         reason  = None
 

@@ -46,7 +46,7 @@ def _stock_drawdown_and_high(df) -> tuple:
 
 def generate(sb) -> dict:
     """Run the combine. Returns {fired, count, regime, reason}."""
-    from engine import drawdown_regime, fundamentals, runner, push
+    from engine import drawdown_regime, fundamentals, runner, push, options_scanner
     from engine import alpaca_client as ac
     from engine.turnaround_detector import score_turnaround
 
@@ -65,6 +65,7 @@ def generate(sb) -> dict:
 
     candidates = fundamentals.get_ranked(sb, min_score=_MIN_QUALITY)
     fired: list[str] = []
+    leaps: list[str] = []
     for c in candidates:
         if len(fired) >= max_fires:
             break
@@ -129,6 +130,43 @@ def generate(sb) -> dict:
             if sid:
                 fired.append(tk)
                 logger.info(f"[deep_value] FIRED {tk} q={qscore} dd={dd}% turn=buyzone")
+                # ── Companion deep-ITM LEAP CALL (leveraged, capped-risk expression) ──
+                # Long-dated (1-2yr), delta ~0.80 so it's intrinsic-dominated and
+                # vol-crush resistant — the right options structure for a crash buy.
+                try:
+                    if not runner._has_active_option_signal(sb, tk):
+                        leap = options_scanner.scan_leap(tk, price, stock_target=t2)
+                        if leap:
+                            leap["confidence_score"]   = conf
+                            leap["confidence_factors"] = [
+                                f"Deep-ITM LEAP (Δ{leap['delta']})",
+                                f"~{leap['dte'] // 30}mo to expiry",
+                                "Leveraged deep-value recovery",
+                                "Capped risk (premium paid)",
+                            ]
+                            leap["ai_explanation"] = (
+                                f"Deep-ITM LEAP call on {tk} — a leveraged, capped-risk way to express the "
+                                f"long-term recovery: {leap['strike_price']} strike expiring {leap['expiry_date']} "
+                                f"(~{leap['dte'] // 30}mo), delta ~{leap['delta']}, so it tracks the shares with far "
+                                f"less capital. Deep-ITM on purpose — mostly intrinsic value, so the elevated crash IV "
+                                f"won't crush it on the recovery (an OTM call would). Max loss = premium "
+                                f"(~${leap['max_loss']}). Roll 2-3 months before expiry if the thesis still holds. "
+                                f"Educational, not financial advice."
+                            )
+                            leap["timeframe"]       = "1Day"
+                            leap["strategy_type"]   = "deep_value"
+                            leap["status"]          = "active"
+                            leap["management_mode"] = "manual"   # months-horizon — engine hands-off
+                            leap["origin"]          = "engine"
+                            oid = runner._write_option_signal(sb, leap)
+                            if oid:
+                                leaps.append(tk)
+                                logger.info(
+                                    f"[deep_value] LEAP fired {tk} {leap['strike_price']}C "
+                                    f"{leap['expiry_date']} Δ{leap['delta']}"
+                                )
+                except Exception as e:
+                    logger.debug(f"[deep_value] {tk} LEAP failed: {e}")
         except Exception as e:
             logger.debug(f"[deep_value] {tk} failed: {e}")
 
@@ -139,10 +177,11 @@ def generate(sb) -> dict:
         deep_tag = " · DEEP-BEAR (size up)" if deep else ""
         title = f"💎 Deep-value buy window OPEN — {len(fired)} names{deep_tag}"
         more = "…" if len(fired) > 10 else ""
+        leap_tag = f" · {len(leaps)} with LEAPS" if leaps else ""
         body = (f"Market {regime.get('off_high_pct')}% off highs. Quality names that "
-                f"have stopped falling: " + ", ".join(fired[:10]) + more)
+                f"have stopped falling: " + ", ".join(fired[:10]) + more + leap_tag)
         data = {"type": "deep_value", "signal": "deep_value", "count": len(fired),
-                "deep": deep, "tickers": fired[:15]}
+                "deep": deep, "tickers": fired[:15], "leaps": leaps[:15]}
         try:
             push._record_alert(type_="deep_value", ticker=None, title=title, body=body,
                                stage=("deep" if deep else "open"), data=data, sb=sb)
@@ -152,7 +191,7 @@ def generate(sb) -> dict:
             push._send_raw(title=title, body=body, data=data)
         except Exception:
             pass
-    logger.info(f"[deep_value] done — fired {len(fired)} (regime={regime.get('regime')}, "
-                f"deep={deep})")
-    return {"fired": fired, "count": len(fired), "regime": regime.get("regime"),
+    logger.info(f"[deep_value] done — fired {len(fired)} (leaps={len(leaps)}, "
+                f"regime={regime.get('regime')}, deep={deep})")
+    return {"fired": fired, "count": len(fired), "leaps": leaps, "regime": regime.get("regime"),
             "reason": "fired" if fired else "no_qualifying_names"}
