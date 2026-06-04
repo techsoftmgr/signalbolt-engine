@@ -2423,6 +2423,19 @@ def _run_weight_optimization() -> None:
         logger.error(f"[runner] Weight optimization failed: {e}", exc_info=True)
 
 
+def _run_drawdown_regime_log() -> None:
+    """Daily ops log of the broad-market drawdown regime (Phase 0 of the
+    crash/deep-value signal). Visibility only — surfacing/alerting is a later step."""
+    try:
+        from engine import drawdown_regime
+        r = drawdown_regime.assess(force=True)
+        logger.info(f"[runner] ═══ Drawdown regime: {r['regime']} "
+                    f"(SPY {r.get('off_high_pct')}% off high) — "
+                    f"accumulation_window={r['accumulation_window']} ═══")
+    except Exception as e:
+        logger.debug(f"[runner] drawdown regime log failed: {e}")
+
+
 def _run_fundamentals_refresh() -> None:
     """Rolling refresh of the EDGAR fundamentals quality screen — a stale batch
     each run. Fundamentals change quarterly, so a few runs/day covers the whole
@@ -2430,7 +2443,7 @@ def _run_fundamentals_refresh() -> None:
     try:
         from engine import fundamentals
         sb = create_client(os.environ["SUPABASE_URL"], _supabase_key())
-        res = fundamentals.refresh_universe(sb, batch=15)
+        res = fundamentals.refresh_universe(sb, batch=20)
         logger.info(f"[runner] ═══ Fundamentals refresh — {res} ═══")
     except Exception as e:
         logger.error(f"[runner] Fundamentals refresh failed: {e}", exc_info=True)
@@ -3067,6 +3080,16 @@ def start_scheduler() -> BackgroundScheduler:
         replace_existing=True,
     )
     logger.info("[runner] Scheduled fundamentals refresh (6:37/13:37/19:37 ET, rolling batch)")
+
+    # ── Drawdown-regime daily log (Phase 0 of crash/deep-value signal) ───
+    scheduler.add_job(
+        _run_drawdown_regime_log,
+        trigger=CronTrigger(hour=16, minute=12, timezone="America/New_York"),
+        id="drawdown_regime_log",
+        name="SignalBolt drawdown-regime log",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled drawdown-regime log (4:12 PM ET)")
 
     # ── Overnight armed-zone clear — 12:30 AM ET ─────────────────────────
     # Zones are no longer cleared at the 4PM close so the admin can analyze

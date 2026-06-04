@@ -2842,6 +2842,15 @@ async def admin_close_signal(request: Request, signal_id: str, asset: str = "sto
     return {"ok": True, "id": signal_id, **payload}
 
 
+@app.get("/market/regime-drawdown")
+async def market_regime_drawdown(request: Request):
+    """Broad-market drawdown regime (SPY/QQQ/IWM % off 52-wk high). Phase 0 of the
+    crash/deep-value signal — flags the accumulation window. Any signed-in user."""
+    _require_user_jwt(request)
+    from engine import drawdown_regime
+    return drawdown_regime.assess()
+
+
 @app.get("/admin/quality-screen")
 async def admin_quality_screen(request: Request, min_score: int = 0):
     """EDGAR fundamentals quality ranking (cached). Feeds the crash/deep-value
