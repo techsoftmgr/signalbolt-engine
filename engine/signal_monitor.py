@@ -61,6 +61,19 @@ ET = ZoneInfo("America/New_York")
 # Strategies that must be closed by market close (not held overnight)
 INTRADAY_STRATEGIES = {"scalping", "day_trade", "options_flow"}
 
+# Multi-day / overnight (SWING-class) strategies — EXCLUDED from the intraday
+# early-booking block (step 5). They ride to T1/T2 + trailing + structure-reversal
+# instead; subjecting them to intraday RSI/MACD + a CALENDAR-minute "stalling >180"
+# rule books them prematurely (an overnight hold trivially exceeds 180 min). Before
+# this, only the literal "swing_trade" was excluded, so breakdown/breakout/peak/
+# turnaround/*_forming/position slipped through and got booked the morning after —
+# e.g. AMZN breakdown booked +1.2% instead of riding toward its target.
+_SWING_LIKE_STRATEGIES = {
+    "swing_trade", "breakdown", "breakout", "turnaround", "peak",
+    "breakdown_forming", "distrib_forming", "peak_forming", "turn_forming",
+    "accum_forming", "position_trade",
+}
+
 # Scalping max hold in minutes (regardless of market hours)
 SCALP_MAX_HOLD_MINS = 30
 
@@ -1160,7 +1173,7 @@ def _monitor_stocks(sb: Client) -> None:
         #   • Swing trailing stop above (step 4b — protects gains after T1)
         #   • Structure reversal detection (step 6 below — CHoCH on 15m bars)
         #   • Smart EOD close is already exempt (swing not in INTRADAY_STRATEGIES)
-        if strategy != "swing_trade":
+        if strategy not in _SWING_LIKE_STRATEGIES:
             try:
                 current_status = _STATUS_CACHE.get(sig["id"], "")
                 # Pre-T1 only — once past T1, step 4b above owns the exit decision
