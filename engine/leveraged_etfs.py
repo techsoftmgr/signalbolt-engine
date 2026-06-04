@@ -1,47 +1,80 @@
 """
-Leveraged & inverse ETF / ETN exclusion list.
+Leveraged & inverse ETF / ETN signal-firing policy.
 
-These products (2x/3x long, -1x/-2x/-3x inverse, and vol ETNs) are DAILY-rebalanced
-and path-dependent: volatility decay + compounding drift make them mean-revert and
-bleed over multi-day holds. They are NOT suitable for the swing / momentum / breakout
-/ breakdown / cycle signals (which assume a clean multi-day directional move), so the
-engine must never FIRE a signal on them. Blocked centrally in runner._is_untradeable
-(every stock fire path) + _write_option_signal (options on them are leverage-on-
-leverage — worse).
+Daily-rebalanced products are path-dependent (volatility decay + compounding
+drift). Two tiers:
 
-Curated set of the common, liquid leveraged/inverse products + the major
-single-stock leveraged ETFs. Not exhaustive — new single-stock leveraged products
-launch often; add here as needed. (Plain 1x sector/index ETFs like SPY/QQQ/XLK/SMH
-are NOT leveraged and stay tradeable.)
+  • BLOCKED_LEVERAGED_ETFS — NEVER fire a signal. The worst products:
+      - SINGLE-STOCK leveraged (TSLL/NVDL/MSTU/CONL…): single-name gap risk +
+        leverage + decay = uniquely dangerous.
+      - VOLATILITY ETNs (UVXY/VXX/SVXY/UVIX…): VIX-futures, contango decay — bleed
+        in any non-trending tape regardless of direction.
+      - COMMODITY / PRECIOUS-METAL futures (BOIL/KOLD/UCO/NUGT/JNUG/AGQ…): futures-
+        roll decay, not clean index tracking.
+      - LEVERAGED BONDS/RATES (TMF/TMV/TBT…) + FOREIGN/EM (YINN/YANG…): niche +
+        decay; not the broad US equity index the short-horizon signals assume.
+
+  • LEVERAGED_INDEX_ETFS — leveraged BROAD-INDEX & US SECTOR EQUITY (TQQQ/SQQQ,
+    SPXL/SPXU, SOXL/SOXS, TNA/TZA, FAS/FAZ, TECL/TECS, LABU/LABD, ERX/GUSH…).
+    Liquid, diversified, commonly traded on technicals → ALLOWED for short-horizon
+    signals (day/swing/momentum/breakout/breakdown/cycle), but BLOCKED on the
+    months-horizon signals (deep_value/position_trade/LEAPS) where multi-month
+    decay ruins a 3x hold.
+
+Plain 1x ETFs (SPY/QQQ/IWM/XLK/SMH/GLD…) are not leveraged → always tradeable.
 """
 from __future__ import annotations
 
-LEVERAGED_INVERSE_ETFS: frozenset[str] = frozenset({
-    # ── Broad index (2x/3x long + inverse) ──
+# Months-horizon strategies — even an allowed leveraged INDEX ETF must not fire
+# these (a 3x ETF held for months is a decay disaster).
+_LONG_HORIZON_STRATEGIES: frozenset[str] = frozenset({"deep_value", "position_trade"})
+
+# ── ALLOWED for short-horizon (blocked only on long-horizon): broad-index + US sector equity ──
+LEVERAGED_INDEX_ETFS: frozenset[str] = frozenset({
+    # Broad US index (2x/3x long + inverse)
     "TQQQ", "SQQQ", "QLD", "QID", "UPRO", "SPXU", "SPXL", "SPXS", "SSO", "SDS",
     "UDOW", "SDOW", "DDM", "DXD", "TNA", "TZA", "URTY", "SRTY", "UWM", "TWM",
-    # ── Volatility (decaying ETNs/ETFs) ──
-    "UVXY", "SVXY", "VXX", "VIXY", "UVIX", "SVIX", "VIXM",
-    # ── Sector 2x/3x ──
+    # US sector equity (2x/3x)
     "SOXL", "SOXS", "USD", "SSG", "TECL", "TECS", "ROM", "REW",
-    "FAS", "FAZ", "DRN", "DRV", "LABU", "LABD", "CURE", "RXD",
-    "DPST", "WDRW", "PILL", "DFEN",
-    # ── Energy / commodity 2x/3x ──
-    "ERX", "ERY", "GUSH", "DRIP", "BOIL", "KOLD", "UCO", "SCO", "UGA", "OILU", "OILD",
-    # ── Gold / silver / miners 2x/3x ──
-    "NUGT", "DUST", "JNUG", "JDST", "UGL", "GLL", "AGQ", "ZSL", "USLV", "DSLV",
-    # ── China / EM 2x/3x ──
-    "YINN", "YANG", "CWEB", "CHAU", "EDC", "EDZ",
-    # ── Treasury / rates 2x/3x ──
-    "TMF", "TMV", "TBT", "UBT", "TYO", "TYD",
-    # ── Single-stock leveraged (growing category) ──
+    "FAS", "FAZ", "DRN", "DRV", "LABU", "LABD", "CURE", "RXD", "DPST", "DFEN",
+    "ERX", "ERY", "GUSH", "DRIP",
+})
+
+# ── ALWAYS blocked: single-stock, vol ETNs, commodity/metal futures, bonds, EM ──
+BLOCKED_LEVERAGED_ETFS: frozenset[str] = frozenset({
+    # Single-stock leveraged
     "TSLL", "TSLT", "TSLQ", "TSLS", "TSLR", "NVDL", "NVDU", "NVDD", "NVDS", "NVDX",
     "MSTU", "MSTX", "MSTZ", "CONL", "AMDL", "AMUU", "AMDD", "GGLL", "GGLS",
     "AAPU", "AAPD", "METU", "METD", "AMZU", "AMZD", "MSFU", "MSFD", "PLTU", "COIU",
+    # Volatility ETNs/ETFs
+    "UVXY", "SVXY", "VXX", "VIXY", "UVIX", "SVIX", "VIXM",
+    # Commodity / precious-metal (futures/miners — decay)
+    "BOIL", "KOLD", "UCO", "SCO", "UGA", "OILU", "OILD",
+    "NUGT", "DUST", "JNUG", "JDST", "UGL", "GLL", "AGQ", "ZSL", "USLV", "DSLV", "PILL",
+    # Leveraged bonds / rates
+    "TMF", "TMV", "TBT", "UBT", "TYO", "TYD",
+    # Foreign / EM leveraged
+    "YINN", "YANG", "CWEB", "CHAU", "EDC", "EDZ",
 })
 
 
-def is_leveraged_etf(ticker: str) -> bool:
-    """True if `ticker` is a known leveraged/inverse ETF/ETN that must NOT fire a
-    signal (daily-rebalanced, decay-prone). Case-insensitive."""
-    return (ticker or "").upper() in LEVERAGED_INVERSE_ETFS
+def is_blocked_leveraged_etf(ticker: str) -> bool:
+    """ALWAYS-blocked leveraged product (single-stock / vol / commodity / bond / EM)."""
+    return (ticker or "").upper() in BLOCKED_LEVERAGED_ETFS
+
+
+def is_leveraged_index_etf(ticker: str) -> bool:
+    """Leveraged broad-index / US-sector equity ETF (OK short-horizon, not long)."""
+    return (ticker or "").upper() in LEVERAGED_INDEX_ETFS
+
+
+def should_block_signal(ticker: str, strategy_type: str | None = None) -> bool:
+    """The firing-gate rule. Block if: (a) an always-blocked leveraged product, or
+    (b) a leveraged INDEX/sector ETF on a months-horizon strategy. Short-horizon
+    signals on leveraged index/sector ETFs are allowed."""
+    sym = (ticker or "").upper()
+    if sym in BLOCKED_LEVERAGED_ETFS:
+        return True
+    if sym in LEVERAGED_INDEX_ETFS and (strategy_type or "") in _LONG_HORIZON_STRATEGIES:
+        return True
+    return False

@@ -62,11 +62,17 @@ EXTENDED_UNIVERSE = [
     "SPOT", "RDDT", "APP", "CELH", "DUOL", "ONON", "DECK", "ELF",
     "HIMS", "SNAP", "PINS", "DOCS", "WOLF", "TTWO", "EA", "RIVN",
     "HOOD", "AFRM", "UPST", "OPEN", "COUR", "BMBL", "JOBY",
-    # ── Indices / ETFs (1x only — leveraged/inverse TQQQ/SQQQ/UVXY/VXX removed:
-    #    daily-rebalanced + decay-prone, never signal-worthy) ────
+    # ── Indices / ETFs (1x) ────────────────────────────────────
     "SPY", "QQQ", "IWM", "DIA",
     "XLK", "XLF", "XLE", "XLV", "XLI", "XLC", "XLRE",
     "GLD", "SLV", "TLT", "HYG", "LQD", "ARKK", "ARKG", "ARKW",
+    # ── Leveraged BROAD-INDEX / US-sector equity (liquid, traded on technicals).
+    #    ALLOWED short-horizon; the firing gate (leveraged_etfs.should_block_signal)
+    #    blocks them on months-horizon strategies. Single-stock 2x/3x, vol ETNs
+    #    (UVXY/VXX), and commodity/metal/bond/EM leveraged stay OUT of the universe
+    #    (always-blocked — daily-rebalanced + decay-prone, no clean index). ────
+    "TQQQ", "SQQQ", "SOXL", "SOXS", "SPXL", "SPXU", "TNA", "TZA",
+    "FAS", "FAZ", "LABU", "LABD", "TECL", "TECS", "UPRO", "SDOW",
     # ── Financials ─────────────────────────────────────────────
     "JPM", "GS", "MS", "BAC", "C", "WFC", "BLK", "SCHW", "CME",
     "V", "MA", "PYPL", "SQ", "AXP", "COF", "DFS",
