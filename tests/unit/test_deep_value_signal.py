@@ -41,14 +41,17 @@ def _run(regime, candidates, df, ta):
          patch("engine.runner._write_signal", side_effect=_write), \
          patch("engine.alpaca_client.get_bars", return_value=df), \
          patch("engine.turnaround_detector.score_turnaround", return_value=ta), \
-         patch("engine.push.send_admin_alert"):
+         patch("engine.push._send_raw"), \
+         patch("engine.push._record_alert"):
         res = dv.generate(sb=object())
     return res, captured["rows"]
 
 
-_OPEN  = {"accumulation_window": True,  "regime": "bear",    "off_high_pct": -23}
+_OPEN  = {"accumulation_window": True,  "regime": "bear",      "off_high_pct": -23}
+_DEEP  = {"accumulation_window": True,  "regime": "deep_bear", "off_high_pct": -32, "deep": True}
 _CLOSED = {"accumulation_window": False, "regime": "healthy", "off_high_pct": -1}
 _QUAL  = [{"ticker": "MSFT", "quality_score": 5}]
+_MANY  = [{"ticker": f"T{i:03d}", "quality_score": 5} for i in range(40)]
 
 
 class TestGenerateGating:
@@ -65,6 +68,9 @@ class TestGenerateGating:
         assert row["direction"] == "LONG"
         assert row["management_mode"] == "manual"     # engine hands-off
         assert row["score_breakdown"]["detector_source"] == "DEEP_VALUE"
+        # Ordinary accumulation window → HALF size (scale in), not deep-bear.
+        assert row["position_multiplier"] == 0.5
+        assert row["score_breakdown"]["deep_regime"] is False
 
     def test_falling_knife_gate_blocks_non_buyzone(self):
         # Deeply discounted quality name, but NOT a confirmed turn (still 'watch') → skip
@@ -79,3 +85,24 @@ class TestGenerateGating:
     def test_no_quality_candidates(self):
         res, rows = _run(_OPEN, [], _df(420.0), {"stage": "buyzone"})
         assert res["count"] == 0 and rows == []
+
+
+class TestDeepBearEscalation:
+    def test_deep_regime_sizes_up_and_bumps_confidence(self):
+        res, rows = _run(_DEEP, _QUAL, _df(420.0), {"stage": "buyzone", "score": 80})
+        assert res["count"] == 1
+        row = rows[0]
+        assert row["position_multiplier"] == 1.0          # full size in a deep-bear washout
+        assert row["score_breakdown"]["deep_regime"] is True
+        assert row["confidence_score"] == 90              # min(90, 70 + 5*3 + 5)
+        assert any("DEEP-BEAR" in f for f in row["confidence_factors"])
+        assert "DEEP-BEAR" in row["ai_explanation"]
+
+    def test_deep_regime_uses_bigger_basket(self):
+        # 40 deeply-discounted quality names; deep cap is 30, normal cap 15.
+        res, rows = _run(_DEEP, _MANY, _df(420.0), {"stage": "buyzone", "score": 80})
+        assert res["count"] == 30 and len(rows) == 30
+
+    def test_normal_regime_caps_at_fifteen(self):
+        res, rows = _run(_OPEN, _MANY, _df(420.0), {"stage": "buyzone", "score": 80})
+        assert res["count"] == 15 and len(rows) == 15
