@@ -342,17 +342,26 @@ def _ensure_stream_subscription(ticker: str, cap: int | None = None) -> None:
 _MIN_SIGNAL_PRICE = 2.0   # hard floor — penny/sub-penny names have wide spreads
 
 
-def _is_untradeable(ticker: str, price) -> bool:
-    """Block penny stocks, warrants/units/rights, AND leveraged/inverse ETFs from
-    EVER firing a signal. Belt-and-suspenders behind the prescreener — covers every
-    fire path (SMC, breakout/breakdown, momentum, predictive, cycle). HUBCW (a $0.05
-    warrant) lost -31.8% in 9 min; and 2x/3x/inverse ETFs (TQQQ/SQQQ/SOXL/UVXY…)
-    decay + mean-revert so the multi-day directional signals don't apply."""
+def _is_untradeable(ticker: str, price, strategy_type: str | None = None) -> bool:
+    """Block penny stocks, warrants/units/rights, AND the dangerous leveraged/inverse
+    products from EVER firing a signal. Belt-and-suspenders behind the prescreener —
+    covers every fire path (SMC, breakout/breakdown, momentum, predictive, cycle).
+    HUBCW (a $0.05 warrant) lost -31.8% in 9 min.
+
+    Two-tier leveraged policy (see engine/leveraged_etfs.py):
+      • ALWAYS blocked — single-stock 2x/3x (TSLL/NVDL…), vol ETNs (UVXY/VXX…),
+        commodity/metal futures (BOIL/NUGT…), leveraged bonds/EM. Uniquely path-
+        dependent; no clean broad-index to track.
+      • Leveraged BROAD-INDEX / US-sector equity (TQQQ/SQQQ/SOXL/SPXL…) — ALLOWED
+        for short-horizon signals, but BLOCKED on months-horizon strategies
+        (deep_value/position_trade) where 3x decay ruins a multi-month hold.
+    Passing strategy_type enables the long-horizon block; omit it for the
+    strategy-agnostic always-blocked check."""
     sym = (ticker or "").upper()
     if len(sym) == 5 and sym[-1] in ("W", "U", "R"):   # warrant / unit / rights
         return True
-    from engine.leveraged_etfs import is_leveraged_etf
-    if is_leveraged_etf(sym):                          # 2x/3x long, inverse, vol ETN
+    from engine.leveraged_etfs import should_block_signal
+    if should_block_signal(sym, strategy_type):        # always-blocked + lev-index×long-horizon
         return True
     try:
         if price is not None and float(price) < _MIN_SIGNAL_PRICE:
@@ -364,10 +373,11 @@ def _is_untradeable(ticker: str, price) -> bool:
 
 def _write_signal(sb: Client, row: dict) -> str | None:
     """Insert signal row, log the 'fired' event, and return the new signal ID."""
-    if _is_untradeable(row.get("ticker", ""), row.get("entry_price")):
+    if _is_untradeable(row.get("ticker", ""), row.get("entry_price"), row.get("strategy_type")):
         logger.info(
             f"[runner] BLOCKED untradeable signal {row.get('ticker')} "
-            f"@ {row.get('entry_price')} (penny / warrant / leveraged-inverse ETF) — not firing"
+            f"@ {row.get('entry_price')} [{row.get('strategy_type','?')}] "
+            f"(penny / warrant / always-blocked leveraged / leveraged-index on long-horizon) — not firing"
         )
         return None
     # Capture the ORIGINAL stop at fire time. The monitors mutate stop_loss in
@@ -437,10 +447,13 @@ def _has_active_option_signal(sb: Client, ticker: str) -> bool:
 
 def _write_option_signal(sb: Client, row: dict) -> str | None:
     """Insert option signal row and return the new option signal ID."""
-    # Options on leveraged/inverse ETFs are leverage-on-leverage — never fire.
-    if _is_untradeable(row.get("ticker", ""), row.get("underlying_price")):
+    # Options on leveraged ETFs are leverage-on-leverage. Always-blocked products
+    # never fire; leveraged-index underlyings are blocked on the months-horizon
+    # LEAP/position strategies (3x decay over a multi-month option hold is fatal).
+    if _is_untradeable(row.get("ticker", ""), row.get("underlying_price"), row.get("strategy_type")):
         logger.info(f"[runner] BLOCKED option signal {row.get('ticker')} "
-                    f"(penny / warrant / leveraged-inverse ETF) — not firing")
+                    f"[{row.get('strategy_type','?')}] "
+                    f"(penny / warrant / always-blocked leveraged / leveraged-index on long-horizon) — not firing")
         return None
     try:
         result = sb.table("option_signals").insert(row).execute()
