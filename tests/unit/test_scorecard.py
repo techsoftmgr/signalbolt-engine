@@ -45,6 +45,39 @@ class TestExpectancyMath:
         assert p["worst_loss"] == -9.0 and p["best_win"] == 5.0
 
 
+class TestMoneyMade:
+    def test_low_winrate_big_payoff_makes_more_total_money(self):
+        # The user's exact point: breakdown wins MORE often but breakout makes MORE money.
+        breakdown = [_row(0.5, detector="BREAKDOWN") for _ in range(8)] + \
+                    [_row(-0.5, result="loss", detector="BREAKDOWN") for _ in range(2)]   # 80% win
+        breakout  = [_row(6.0, detector="BREAKOUT") for _ in range(5)] + \
+                    [_row(-1.0, result="loss", detector="BREAKOUT") for _ in range(5)]    # 50% win
+        res = sc.compute(breakdown + breakout, cost_pct=0.0)
+        by = {s["detector"]: s for s in res["segments"]}
+        assert by["BREAKDOWN"]["win_rate"] == 80.0
+        assert by["BREAKOUT"]["win_rate"] == 50.0
+        # Breakdown total = 8*0.5 - 2*0.5 = 3.0% ; Breakout = 5*6 - 5*1 = 25.0%
+        assert by["BREAKDOWN"]["total_return_pct"] == 3.0
+        assert by["BREAKOUT"]["total_return_pct"] == 25.0
+        assert by["BREAKOUT"]["net_total_pct"] > by["BREAKDOWN"]["net_total_pct"]   # more money
+        # Ranked by money → breakout first.
+        assert res["segments"][0]["detector"] == "BREAKOUT"
+
+    def test_cash_view_normalized_to_notional(self):
+        rows = [_row(10.0) for _ in range(1)]   # +10% on one trade
+        res = sc.compute(rows, cost_pct=0.0, notional=1000.0)
+        p = res["portfolio"]
+        assert p["total_return_pct"] == 10.0
+        assert p["pnl_per_notional"] == 100.0    # 10% of $1,000
+        assert res["notional"] == 1000.0
+
+    def test_profit_share_sums_to_100(self):
+        rows = [_row(3.0, detector="A"), _row(1.0, detector="B")]
+        res = sc.compute(rows, cost_pct=0.0)
+        shares = {s["detector"]: s["profit_share"] for s in res["segments"]}
+        assert shares["A"] == 75.0 and shares["B"] == 25.0
+
+
 class TestVerdict:
     def _many(self, pct, result, n, **kw):
         return [_row(pct, result=result, **kw) for _ in range(n)]
