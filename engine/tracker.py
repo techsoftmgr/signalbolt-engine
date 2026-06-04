@@ -27,6 +27,21 @@ load_dotenv()
 
 logger = logging.getLogger("signalbolt.tracker")
 
+
+def result_from_pnl_pct(pct) -> str:
+    """Win/loss STRICTLY by realized P&L sign — never by which level was hit.
+
+    A trailing stop that was raised above entry can close at a PROFIT while the
+    close reason is 'stop_hit'; that's a WIN, not a loss. Deriving result from
+    the reason (stop→loss) produced the 'ON +1.47% loss' corruption (2026-06-04).
+    Always classify by the realized percentage instead. Pure → unit-tested.
+    """
+    try:
+        return "win" if float(pct) > 0 else "loss"
+    except (TypeError, ValueError):
+        return "loss"
+
+
 # ── Alpaca client singleton ───────────────────────────────────
 # Creating StockHistoricalDataClient is expensive (sets up connection pool).
 # One module-level instance is shared across all _current_price() calls
