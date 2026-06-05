@@ -219,12 +219,28 @@ def _in_quote_window() -> bool:
     return 4 <= now.hour < 20
 
 
+def _mins_since_entry(created_at) -> float | None:
+    """Minutes from a signal's entry timestamp to now (UTC). None if unparseable."""
+    if not created_at:
+        return None
+    try:
+        from datetime import datetime, timezone
+        c = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+        if c.tzinfo is None:
+            c = c.replace(tzinfo=timezone.utc)
+        return round((datetime.now(timezone.utc) - c).total_seconds() / 60.0, 1)
+    except Exception:
+        return None
+
+
 def _capture_excursion(sb, sig) -> None:
     """Record running MFE (peak favorable) / MAE (peak adverse) unrealized % on a
     signal — INCLUDING the big after-hours / pre-market excursions — so profit
     GIVE-BACK (peak − realized) is measurable per signal. MEASUREMENT ONLY: never
-    closes or moves a stop. Stored in score_breakdown.{mfe_pct,mae_pct} (JSONB,
-    no migration); the row is written only when a NEW extreme is set."""
+    closes or moves a stop. Stored in score_breakdown.{mfe_pct,mae_pct} plus the
+    TIMING of each extreme ({t_mfe_min,t_mae_min,mae_before_mfe}) — the raw
+    material for profit-lock + stop tuning (JSONB, no migration); the row is
+    written only when a NEW extreme is set."""
     try:
         entry = float(sig.get("entry_price") or 0)
     except (TypeError, ValueError):
@@ -247,11 +263,26 @@ def _capture_excursion(sb, sig) -> None:
     cur_mae = sbd.get("mae_pct")
     new_mfe = pnl if cur_mfe is None else max(float(cur_mfe), pnl)
     new_mae = pnl if cur_mae is None else min(float(cur_mae), pnl)
-    if new_mfe == cur_mfe and new_mae == cur_mae:
+    mfe_changed = new_mfe != cur_mfe
+    mae_changed = new_mae != cur_mae
+    if not mfe_changed and not mae_changed:
         return  # no new extreme — skip the write
     merged = dict(sbd)
     merged["mfe_pct"] = round(new_mfe, 2)
     merged["mae_pct"] = round(new_mae, 2)
+    # TIMING — minutes from entry to each extreme + which came FIRST. Answers the
+    # two exit-tuning questions: profit-lock (when does favorable excursion peak?
+    # → t_mfe_min) and min-stop (do winners take heat BEFORE they work? →
+    # mae_before_mfe). Stamped on the read that sets each new extreme.
+    elapsed = _mins_since_entry(sig.get("created_at"))
+    if elapsed is not None:
+        if mfe_changed:
+            merged["t_mfe_min"] = elapsed
+        if mae_changed:
+            merged["t_mae_min"] = elapsed
+        t_mfe, t_mae = merged.get("t_mfe_min"), merged.get("t_mae_min")
+        if t_mfe is not None and t_mae is not None:
+            merged["mae_before_mfe"] = bool(t_mae < t_mfe)
     try:
         sb.table("signals").update({"score_breakdown": merged}).eq("id", sig["id"]).execute()
         sig["score_breakdown"] = merged   # keep local copy fresh for downstream checks
