@@ -296,6 +296,62 @@ def _patterns(df: pd.DataFrame, hi_idx: list[int], lo_idx: list[int], tl: dict) 
     return out
 
 
+# ── Fibonacci (auto-anchored to the most recent swing) ────────────────────────
+def _fib_explain(direction: str, gp: dict, target, lo: float, hi: float, inval: float) -> str:
+    """Plain-English read of the Fib overlay — what the levels mean + how to use
+    them (dip/bounce zone, target, invalidation). 'Golden pocket' demystified."""
+    band = f"${gp['low']}–${gp['high']}"
+    if direction == "up":
+        return (f"Ran from ${round(lo,2)} up to ${round(hi,2)}. The {band} band (50–61.8% "
+                f"retracement — the 'golden pocket') is the most-watched dip-buy zone: a hold/bounce "
+                f"there is a lower-risk add. A close below ~${round(inval,2)} (78.6%) says the run failed. "
+                f"If it resumes, the 1.618 extension targets ~${target}.")
+    return (f"Fell from ${round(hi,2)} down to ${round(lo,2)}. The {band} band (50–61.8% retracement) "
+            f"is the most-watched bounce/lower-entry zone: sellers often re-enter there. A close above "
+            f"~${round(inval,2)} (78.6%) says the drop is reversing. If the decline resumes, the 1.618 "
+            f"extension targets ~${target}.")
+
+
+def _fib(df: pd.DataFrame, lookback: int = 60) -> Optional[dict]:
+    """Auto-anchored Fibonacci over the most recent significant swing in the last
+    `lookback` bars. Direction = the most recent leg (whichever of the swing
+    high/low is more recent). Returns retracement levels + golden pocket (dip/
+    bounce zone) + 1.272/1.618 extension targets + a plain-English read."""
+    sub = df.tail(lookback)
+    if len(sub) < 10:
+        return None
+    highs = sub["high"].values.astype(float)
+    lows  = sub["low"].values.astype(float)
+    hi = float(highs.max()); lo = float(lows.min())
+    rng = hi - lo
+    if rng <= 0:
+        return None
+    up_leg = int(highs.argmax()) > int(lows.argmin())   # high more recent → last leg was up
+    direction = "up" if up_leg else "down"
+
+    def at(r):   # retracement price at ratio r
+        return (hi - rng * r) if up_leg else (lo + rng * r)
+    levels = [{"ratio": r, "label": f"{r*100:.1f}%".rstrip("0").rstrip("."),
+               "price": round(at(r), 2)} for r in (0.236, 0.382, 0.5, 0.618, 0.786)]
+
+    def ext(r):   # extension/projection beyond the swing, in the leg direction
+        return (lo + rng * r) if up_leg else (hi - rng * r)
+    extensions = [{"ratio": r, "price": round(ext(r), 2)} for r in (1.272, 1.618)]
+
+    gp_a, gp_b = at(0.5), at(0.618)
+    golden = {"low": round(min(gp_a, gp_b), 2), "high": round(max(gp_a, gp_b), 2)}
+    target = extensions[-1]["price"]          # 1.618 projection
+    inval  = at(0.786)                         # break beyond 78.6% = leg failed
+
+    return {
+        "direction": direction,
+        "swingHigh": round(hi, 2), "swingLow": round(lo, 2),
+        "levels": levels, "extensions": extensions,
+        "goldenPocket": golden, "target": target, "invalidation": round(inval, 2),
+        "explain": _fib_explain(direction, golden, target, lo, hi, inval),
+    }
+
+
 # ── Per-timeframe + MTF ───────────────────────────────────────────────────────
 def _tf_trend(symbol: str, timeframe: str, days: int) -> str:
     try:
@@ -329,6 +385,7 @@ def analyze(symbol: str) -> Optional[dict]:
     gap = _gaps(daily, trend_d)
     vol = _volume_regime(daily)
     pats = _patterns(daily, hi_idx, lo_idx, tl)
+    fib = _fib(daily)
 
     # MTF
     t15 = _tf_trend(sym, "15Min", 5)
@@ -484,12 +541,12 @@ def analyze(symbol: str) -> Optional[dict]:
         "trend": {"d1": trend_d, "h1": t1h, "m15": t15},
         "mtf": {"state": mtf, "dir": mtf_dir},
         "channel": ch, "trendlines": tl, "levels": lv,
-        "gap": gap, "volumeRegime": vol, "patterns": pats,
+        "gap": gap, "volumeRegime": vol, "patterns": pats, "fib": fib,
         "narrative": bullets,
         # Geometry for the chart layer to DRAW later (Phase 1b).
         "overlays": {
             "trendlines": [v for v in (tl.get("support"), tl.get("resistance")) if v],
-            "channel": ch, "levels": lv, "patterns": pats, "gap": gap,
+            "channel": ch, "levels": lv, "patterns": pats, "gap": gap, "fib": fib,
         },
     }
 
