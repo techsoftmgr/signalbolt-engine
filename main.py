@@ -670,6 +670,20 @@ _market_status_ts: float   = 0.0
 _MARKET_STATUS_TTL: int    = 30  # 30s — short enough that the banner appears within 30s of session changes
 
 
+@app.get("/market/regime-history")
+def get_regime_history(hours: int = 48):
+    """Market-regime transition timeline (write-on-change) over the last N hours.
+    Each row is a regime FLIP (pre→PANIC→bull→chop…) with VIX/ADX/SPY context +
+    session. Powers intraday regime-at-fire analysis and a 'regime today' view."""
+    try:
+        from engine import runner as _runner, regime_history as _rh
+        rows = _rh.recent(_runner._supabase(), hours=max(1, min(int(hours), 24 * 14)))
+        return {"hours": int(hours), "count": len(rows), "transitions": rows}
+    except Exception as e:
+        logger.error(f"[regime-history] failed: {e}")
+        return {"hours": int(hours), "count": 0, "transitions": [], "error": str(e)}
+
+
 @app.get("/market/status")
 async def market_status():
     """
@@ -3499,7 +3513,9 @@ async def admin_detector_scorecard(request: Request, days: int = 30, cost_pct: f
       verdict (KEEP / WATCH / CUT, sample-size aware).
     Segments are ranked by net $ contribution (most money first).
 
-    group_by: 'detector' (detector×strategy, default) | 'regime' | 'detector_regime'.
+    group_by: 'detector' (detector×strategy, default) | 'regime' | 'detector_regime'
+              | 'conviction' | 'detector_conviction' (per-detector × confidence tier
+              — shows whether high-conviction signals actually beat low ones).
     Admin only.
     """
     _user_id, sb = _require_admin_jwt(request)
@@ -3514,7 +3530,7 @@ async def admin_detector_scorecard(request: Request, days: int = 30, cost_pct: f
         rows = (
             sb.table("signals")
               .select("result, result_pct, status, score_breakdown, strategy_type, "
-                      "regime_type, created_at")
+                      "regime_type, confidence_score, created_at")
               .eq("status", "closed")
               .gte("created_at", since)
               .limit(5000)

@@ -2948,6 +2948,35 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled premarket disaster-gap alerts every 15 min (8:00–9:30 AM ET gate)")
 
+    # ── Market-regime timeline (write-on-change) ─────────────────────────────
+    # Evaluate the regime every 5 min across 4:00 AM–8:00 PM ET and append a row
+    # to regime_history ONLY when regime_type/session flips — so we keep the day's
+    # transitions (pre → PANIC → bull → chop), enabling intraday regime-at-fire /
+    # regime-during-hold analysis. No-op overnight/weekends.
+    def _run_regime_capture():
+        try:
+            from zoneinfo import ZoneInfo as _ZI
+            et = datetime.now(_ZI("America/New_York"))
+            if et.weekday() >= 5:
+                return
+            mins = et.hour * 60 + et.minute
+            if not (4 * 60 <= mins <= 20 * 60):   # 4:00 AM – 8:00 PM ET only
+                return
+            from engine import regime_history
+            regime_history.record_if_changed(_supabase())
+        except Exception as _e:
+            logger.error(f"[runner] regime capture failed: {_e}")
+
+    scheduler.add_job(
+        _run_regime_capture,
+        trigger=IntervalTrigger(minutes=5),
+        id="regime_capture",
+        name="Market-regime timeline (write-on-change, 4 AM–8 PM ET)",
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=45),
+    )
+    logger.info("[runner] Scheduled regime-timeline capture every 5 min (write-on-change)")
+
     # ── Cycle tracked cards — turnaround (LONG+CALL) + peak (SHORT+PUT) ───────
     # The Buy-Zone / Peak PUSH alerts fire from the 5-min breakout-watch sync;
     # this generates the TRADEABLE cards for those same names. State-based +
