@@ -352,6 +352,73 @@ def _fib(df: pd.DataFrame, lookback: int = 60) -> Optional[dict]:
     }
 
 
+# ── "What to watch" — two-sided IF/THEN trigger plan ──────────────────────────
+def _scenarios(px: float, lv: dict, fib: Optional[dict], pats: list) -> Optional[dict]:
+    """Turn the read into a NEUTRAL if/then plan: the level to RECLAIM for the
+    bullish case + the level to LOSE for the bearish case, each with a next
+    upside/downside level to watch. Built only from already-computed geometry
+    (nearest support/resistance, Fib levels/extensions, pattern necklines). It
+    never says buy/sell — it hands the user the decision rule ("let price pick the
+    side"), which is also why it's not advice."""
+    res = lv.get("resistance")     # nearest level ABOVE price
+    sup = lv.get("support")        # nearest level BELOW price
+    bull_pat = next((p for p in (pats or []) if p.get("tone") == "bullish"), None)
+    bear_pat = next((p for p in (pats or []) if p.get("tone") == "bearish"), None)
+
+    def _round(v):
+        return round(float(v), 2) if v is not None else None
+
+    # ── Bull trigger: a level ABOVE price to reclaim ──
+    bull_trig = res
+    if bull_pat and (bull_pat.get("neckline") or 0) > px:
+        bull_trig = bull_pat["neckline"]
+    if bull_trig is None and fib:
+        ups = sorted(l["price"] for l in fib.get("levels", []) if l["price"] > px)
+        bull_trig = ups[0] if ups else None
+    # Bull target: next level to watch ABOVE the trigger
+    bull_tgt = None
+    if bull_pat and (bull_pat.get("target") or 0) > px:
+        bull_tgt = bull_pat["target"]
+    elif fib:
+        if fib.get("direction") == "up" and fib.get("extensions"):
+            bull_tgt = fib["extensions"][0]["price"]                       # 1.272 up-extension
+        elif (fib.get("goldenPocket", {}).get("high") or 0) > (bull_trig or px):
+            bull_tgt = fib["goldenPocket"]["high"]                          # bounce destination (down-leg)
+
+    # ── Bear trigger: a level BELOW price to lose ──
+    bear_trig = sup
+    if bear_pat and 0 < (bear_pat.get("neckline") or 0) < px:
+        bear_trig = bear_pat["neckline"]
+    if bear_trig is None and fib and (fib.get("swingLow") or 0) < px:
+        bear_trig = fib["swingLow"]                                         # at the lows → the swing low
+    # Bear target: next level to watch BELOW the trigger
+    bear_tgt = None
+    if bear_pat and 0 < (bear_pat.get("target") or 0) < px:
+        bear_tgt = bear_pat["target"]
+    elif fib:
+        if fib.get("direction") == "down" and fib.get("extensions"):
+            bear_tgt = fib["extensions"][0]["price"]                       # 1.272 down-extension
+        else:
+            downs = sorted((l["price"] for l in fib.get("levels", []) if l["price"] < px), reverse=True)
+            bear_tgt = downs[0] if downs else None
+
+    bull = {"trigger": _round(bull_trig), "then": "bullish — upside / bottom holding",
+            "target": _round(bull_tgt)} if bull_trig else None
+    bear = {"trigger": _round(bear_trig), "then": "bearish — downside resumes",
+            "target": _round(bear_tgt)} if bear_trig else None
+    if not bull and not bear:
+        return None
+
+    parts = []
+    if bull:
+        parts.append(f"reclaim ${bull['trigger']} = bullish" + (f" (→ ${bull['target']})" if bull.get("target") else ""))
+    if bear:
+        parts.append(f"lose ${bear['trigger']} = bearish" + (f" (→ ${bear['target']})" if bear.get("target") else ""))
+    return {"bull": bull, "bear": bear,
+            "summary": "Let price pick the side: " + "; ".join(parts) + ".",
+            "note": "Until one triggers it's undecided — react, don't predict."}
+
+
 # ── Per-timeframe + MTF ───────────────────────────────────────────────────────
 def _tf_trend(symbol: str, timeframe: str, days: int) -> str:
     try:
@@ -386,6 +453,7 @@ def analyze(symbol: str) -> Optional[dict]:
     vol = _volume_regime(daily)
     pats = _patterns(daily, hi_idx, lo_idx, tl)
     fib = _fib(daily)
+    scenarios = _scenarios(px, lv, fib, pats)
 
     # MTF
     t15 = _tf_trend(sym, "15Min", 5)
@@ -542,6 +610,7 @@ def analyze(symbol: str) -> Optional[dict]:
         "mtf": {"state": mtf, "dir": mtf_dir},
         "channel": ch, "trendlines": tl, "levels": lv,
         "gap": gap, "volumeRegime": vol, "patterns": pats, "fib": fib,
+        "scenarios": scenarios,
         "narrative": bullets,
         # Geometry for the chart layer to DRAW later (Phase 1b).
         "overlays": {
