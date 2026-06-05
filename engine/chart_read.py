@@ -201,6 +201,37 @@ def _volume_regime(df: pd.DataFrame) -> str:
     return "normal"
 
 
+def _pattern_explain(p: dict) -> str:
+    """Beginner-friendly one-liner for a detected pattern: what it is + what to
+    watch + the measured target. Keeps the jargon label but makes it readable to
+    a non-technical user (so 'Bull Flag' isn't meaningless)."""
+    t   = p.get("type", "")
+    tgt = p.get("target")
+    tgt_s = f"${tgt}" if tgt is not None else "the measured move"
+    if t == "Bull Flag":
+        return (f"A brief pause after a sharp run-up — flags usually resolve in the "
+                f"prior direction (up here). A push out of the range targets ~{tgt_s}.")
+    if t == "Bear Flag":
+        return (f"A brief pause after a sharp drop — flags usually resolve in the "
+                f"prior direction (down here). A break lower targets ~{tgt_s}.")
+    if t == "Double Top":
+        return (f"Price stalled twice near ${p.get('level')} and failed to break higher "
+                f"— a possible top. A close below the ${p.get('neckline')} neckline targets ~{tgt_s}.")
+    if t == "Double Bottom":
+        return (f"Price held twice near ${p.get('level')} and bounced — a possible bottom. "
+                f"A close above the ${p.get('neckline')} neckline targets ~{tgt_s}.")
+    if t == "Ascending Triangle":
+        return (f"Rising lows pressing into flat resistance at ${p.get('upper')} — buyers "
+                f"gaining control. A break above ${p.get('upper')} targets ~{tgt_s}.")
+    if t == "Descending Triangle":
+        return (f"Falling highs pressing into flat support at ${p.get('lower')} — sellers "
+                f"gaining control. A break below ${p.get('lower')} targets ~{tgt_s}.")
+    if t == "Symmetrical Triangle":
+        return (f"The range is tightening between ${p.get('lower')} and ${p.get('upper')} — "
+                f"a breakout is brewing; its direction decides the move. Measured move ~{tgt_s}.")
+    return f"{t} forming — measured target ~{tgt_s}."
+
+
 # ── Patterns (robust set) ─────────────────────────────────────────────────────
 def _patterns(df: pd.DataFrame, hi_idx: list[int], lo_idx: list[int], tl: dict) -> list[dict]:
     out: list[dict] = []
@@ -257,6 +288,11 @@ def _patterns(df: pd.DataFrame, hi_idx: list[int], lo_idx: list[int], tl: dict) 
             out.append({"type": "Bull Flag" if pole > 0 else "Bear Flag",
                         "tone": "bullish" if pole > 0 else "bearish", "confidence": 0.5,
                         "target": round(px * (1 + pole / 100 / 2), 2)})
+
+    # Attach a plain-English read to every detected pattern (so "Bull Flag" means
+    # something to a non-technical user).
+    for p in out:
+        p["explain"] = _pattern_explain(p)
     return out
 
 
