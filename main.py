@@ -684,6 +684,33 @@ def get_regime_history(hours: int = 48):
         return {"hours": int(hours), "count": 0, "transitions": [], "error": str(e)}
 
 
+@app.get("/admin/daily-performance")
+def get_daily_performance(request: Request, days: int = 30):
+    """Daily EOD performance snapshots (one row/day): closed outcomes by detector/
+    conviction/direction, give-back (peak vs realized), regime path, active-book
+    state. The longitudinal series behind the deferred studies. Admin only."""
+    _user_id, sb = _require_admin_jwt(request)
+    from datetime import datetime, timezone, timedelta
+    days = max(1, min(int(days), 400))
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+    try:
+        rows = (sb.table("daily_performance").select("*")
+                .gte("trade_date", since).order("trade_date", desc=True).execute().data) or []
+        return {"days": days, "count": len(rows), "snapshots": rows}
+    except Exception as e:
+        logger.error(f"GET /admin/daily-performance error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/run-daily-performance")
+def run_daily_performance_now(request: Request):
+    """Manually compute + store today's snapshot (testing / backfill). Admin only."""
+    _require_admin_jwt(request)
+    from engine import runner as _runner, daily_performance as _dp
+    row = _dp.compute_and_store(_runner._supabase())
+    return {"ok": row is not None, "snapshot": row}
+
+
 @app.get("/market/status")
 async def market_status():
     """

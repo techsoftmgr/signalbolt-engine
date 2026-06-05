@@ -2977,6 +2977,37 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled regime-timeline capture every 5 min (write-on-change)")
 
+    # ── Daily EOD performance snapshot (~8:05 PM ET) ─────────────────────────
+    # One immutable row/day in daily_performance: today's CLOSED outcomes (by
+    # detector / conviction / direction), profit give-back (peak vs realized),
+    # the regime path, and the ACTIVE-book state. Runs AFTER the full 4 AM–8 PM
+    # extended session so the MFE peaks are complete (captures AH give-back).
+    # Upsert is idempotent per trade_date; the 15-min interval + ET gate fires it
+    # once in the 8:05–8:35 PM window.
+    def _run_daily_performance():
+        try:
+            from zoneinfo import ZoneInfo as _ZI
+            et = datetime.now(_ZI("America/New_York"))
+            if et.weekday() >= 5:
+                return
+            mins = et.hour * 60 + et.minute
+            if not (20 * 60 + 5 <= mins <= 20 * 60 + 35):   # 8:05–8:35 PM ET
+                return
+            from engine import daily_performance
+            daily_performance.compute_and_store(_supabase())
+        except Exception as _e:
+            logger.error(f"[runner] daily performance snapshot failed: {_e}")
+
+    scheduler.add_job(
+        _run_daily_performance,
+        trigger=IntervalTrigger(minutes=15),
+        id="daily_performance",
+        name="Daily EOD performance snapshot (~8:05 PM ET)",
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=75),
+    )
+    logger.info("[runner] Scheduled daily EOD performance snapshot (~8:05 PM ET)")
+
     # ── Cycle tracked cards — turnaround (LONG+CALL) + peak (SHORT+PUT) ───────
     # The Buy-Zone / Peak PUSH alerts fire from the 5-min breakout-watch sync;
     # this generates the TRADEABLE cards for those same names. State-based +
