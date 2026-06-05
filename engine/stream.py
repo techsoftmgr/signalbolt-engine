@@ -641,25 +641,39 @@ async def subscribe_extra_tickers(tickers: list[str]) -> None:
         logger.warning(f"[stream] Dynamic subscription deferred (will retry on reconnect): {e}")
 
 
-def _load_watchlist_tickers(limit: int = 200) -> list[str]:
-    """Distinct tickers across ALL users' watchlists.
+# Hard ceiling on how many symbols the single Alpaca socket streams live. One
+# connection can't carry the whole universe (Alpaca per-connection symbol cap +
+# the worker burns CPU on every tick of every symbol). Anything past the budget
+# falls back to REST polling. Tune via MAX_STREAM_SYMBOLS once we confirm the
+# plan's real cap / worker headroom; 180 is a conservative default well under it.
+_MAX_STREAM_SYMBOLS = int(os.environ.get("MAX_STREAM_SYMBOLS", "180"))
+
+
+def _load_watchlist_tickers(limit: int = 500) -> list[str]:
+    """Distinct watchlist tickers across ALL users, MOST-WATCHED FIRST.
 
     These must stream LIVE even when they carry no active signal — the watchlist
-    and quote screens display them tick-by-tick. The Alpaca stream lives on the
-    WORKER process; /ws/prices runs on the WEB process where `_wss_ref` is None,
-    so the web's subscribe_extra_tickers() call is a no-op and never reaches the
-    stream. The worker therefore pulls the wanted set straight from the DB.
-    Capped so a large user base can't blow past the feed's symbol budget.
+    and quote screens display them. The Alpaca stream lives on the WORKER; /ws/prices
+    runs on the WEB process where `_wss_ref` is None, so the web's
+    subscribe_extra_tickers() is a no-op and never reaches the stream. The worker
+    therefore pulls the wanted set straight from the DB.
+
+    Ordered by how many users watch each name so a bounded live-stream budget
+    (see _MAX_STREAM_SYMBOLS) covers the names the most people actually look at;
+    the long tail falls back to REST polling. This is what keeps the design sane
+    when one user adds 1000 names or the combined set approaches the whole universe.
     """
     try:
+        from collections import Counter
         from supabase import create_client
         sb = create_client(
             os.environ["SUPABASE_URL"],
             os.environ.get("SUPABASE_SECRET_KEY") or os.environ.get("SUPABASE_SERVICE_KEY", ""),
         )
-        rows = sb.table("watchlist").select("ticker").limit(5000).execute().data or []
-        ticks = sorted({(r.get("ticker") or "").upper() for r in rows if r.get("ticker")})
-        return ticks[:limit]
+        rows = sb.table("watchlist").select("ticker").limit(20000).execute().data or []
+        counts = Counter((r.get("ticker") or "").upper() for r in rows if r.get("ticker"))
+        counts.pop("", None)
+        return [t for t, _ in counts.most_common(limit)]
     except Exception as e:
         logger.warning(f"[stream] Could not load watchlist tickers: {e}")
         return []
@@ -1711,18 +1725,32 @@ async def run_stream() -> None:
     except Exception as _e:
         logger.warning(f"[stream] Could not load active-signal tickers on startup: {_e}")
 
-    # Also subscribe every ticker in users' WATCHLISTS so the watchlist / quote
-    # screens get LIVE ticks even when the name has no active signal. /ws/prices
-    # runs on the WEB process (where _wss_ref is None → its subscribe_extra_tickers
-    # is a no-op), so the WORKER must pull the wanted set from the DB itself.
-    # (HOOD 2026-06-05: watchlist ticker with no active signal showed a frozen
-    # price — live $87.08 vs streamed $86.37 — because it was never subscribed.)
+    # Also subscribe users' WATCHLIST tickers so the watchlist / quote screens get
+    # LIVE ticks even with no active signal. /ws/prices runs on the WEB process
+    # (where _wss_ref is None → its subscribe_extra_tickers is a no-op), so the
+    # WORKER pulls the wanted set from the DB itself. (HOOD 2026-06-05: watchlist
+    # ticker with no active signal froze — live $87.08 vs streamed $86.37.)
+    #
+    # SCALE GUARD: one socket can't stream the whole universe (Alpaca symbol cap +
+    # worker CPU per tick). Enforce a hard budget. PRIORITY = core + active-signal
+    # tickers (already in all_subscribe, trade-critical, never dropped) THEN the
+    # most-watched watchlist names fill whatever budget remains. Overflow is NOT
+    # silently dropped — it's logged and served by the app's REST sweep (active
+    # signals beyond the budget stay safe via the signal_monitor REST backstop).
     try:
-        wl_tickers = _load_watchlist_tickers()
-        extra_wl = [t for t in wl_tickers if t not in all_subscribe]
+        budget_left = max(0, _MAX_STREAM_SYMBOLS - len(all_subscribe))
+        wl_tickers  = [t for t in _load_watchlist_tickers() if t not in all_subscribe]
+        extra_wl    = wl_tickers[:budget_left]
+        dropped_wl  = wl_tickers[budget_left:]
         if extra_wl:
             all_subscribe.extend(extra_wl)
-            logger.info(f"[stream] Subscribing {len(extra_wl)} watchlist ticker(s): {extra_wl}")
+            logger.info(f"[stream] Subscribing {len(extra_wl)} watchlist ticker(s) (live)")
+        if dropped_wl:
+            logger.warning(
+                f"[stream] Stream budget {_MAX_STREAM_SYMBOLS} reached — "
+                f"{len(dropped_wl)} watchlist ticker(s) on REST fallback (not live): "
+                f"{dropped_wl[:25]}{'…' if len(dropped_wl) > 25 else ''}"
+            )
     except Exception as _we:
         logger.warning(f"[stream] Could not load watchlist tickers on startup: {_we}")
 
@@ -1751,8 +1779,12 @@ async def run_stream() -> None:
                 await asyncio.sleep(180)
                 wanted = await loop_.run_in_executor(None, _load_watchlist_tickers)
                 new = [t for t in wanted if t not in _subscribed_tickers]
-                if new:
-                    await subscribe_extra_tickers(new)
+                # respect the same live-stream budget — overflow stays on REST
+                room = _MAX_STREAM_SYMBOLS - len(_subscribed_tickers)
+                if new and room > 0:
+                    await subscribe_extra_tickers(new[:room])
+                elif new:
+                    logger.debug(f"[stream] watchlist resub skipped {len(new)} — at budget {_MAX_STREAM_SYMBOLS}")
             except asyncio.CancelledError:
                 break
             except Exception as _re:
