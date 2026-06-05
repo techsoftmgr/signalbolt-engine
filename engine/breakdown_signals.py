@@ -104,6 +104,9 @@ def generate(sb, r: dict) -> dict:
     lo      = r.get("breakdownLevel")            # the broken 20-day low
     atr_pct = float(r.get("atrPct") or 2.0)
     atr     = float(price) * atr_pct / 100.0
+    # Sanity-cap the ATR used for SL/TP so a high-ATR / leveraged name can't blow
+    # targets past zero (see KORU note in forming_signals). Cap at 8% of price.
+    atr     = min(atr, float(price) * 0.08)
     conf    = _conf(r)
 
     entry = round(float(price), 2)
