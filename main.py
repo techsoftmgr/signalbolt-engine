@@ -684,6 +684,23 @@ def get_regime_history(hours: int = 48):
         return {"hours": int(hours), "count": 0, "transitions": [], "error": str(e)}
 
 
+@app.get("/jobs/status")
+def get_jobs_status():
+    """Daily Jobs report — every scheduled job (catalog) merged with its last-run
+    ledger (status / when / duration / summary). The Market-tab 'Daily Jobs'
+    section. PUBLIC for now (will gate to admin later)."""
+    try:
+        from engine import runner as _runner, job_runs as _jr, job_registry as _reg
+        runs = _jr.recent(_runner._supabase())
+        jobs = _reg.merge(runs)
+        ok   = sum(1 for j in jobs if j.get("status") == "success")
+        err  = sum(1 for j in jobs if j.get("status") in ("error", "missed"))
+        return {"count": len(jobs), "ok": ok, "errors": err, "jobs": jobs}
+    except Exception as e:
+        logger.error(f"[jobs/status] failed: {e}")
+        return {"count": 0, "ok": 0, "errors": 0, "jobs": [], "error": str(e)}
+
+
 @app.get("/admin/daily-performance")
 def get_daily_performance(request: Request, days: int = 30):
     """Daily EOD performance snapshots (one row/day): closed outcomes by detector/

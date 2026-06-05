@@ -2522,6 +2522,8 @@ def _run_phantom_audit() -> None:
         res = phantom_audit.run_and_alert(days=1)
         logger.info(f"[runner] ═══ Phantom audit done — {res['audited']} audited, "
                     f"{res['serious_count']} serious, {res['flagged_count']} flagged ═══")
+        return (f"{res['audited']} audited · {res['serious_count']} serious · "
+                f"{res['flagged_count']} flagged")
     except Exception as e:
         sentry_sdk.capture_exception(e)
         logger.error(f"[runner] Phantom audit failed: {e}", exc_info=True)
@@ -2620,6 +2622,14 @@ def start_scheduler() -> BackgroundScheduler:
     """
     scheduler = BackgroundScheduler(timezone="UTC")
     now = datetime.now(timezone.utc)
+
+    # Per-job run ledger — records last-run/status/duration of EVERY job below to
+    # the job_runs table (one listener, no per-job edits) for the Daily Jobs report.
+    try:
+        from engine import job_runs as _job_runs
+        _job_runs.attach(scheduler, _supabase)
+    except Exception as _jr_e:
+        logger.debug(f"[runner] job_runs ledger not attached: {_jr_e}")
 
     # ── Maintenance: tracker + signal_monitor every 15 min ───────────────
     scheduler.add_job(
@@ -2994,7 +3004,11 @@ def start_scheduler() -> BackgroundScheduler:
             if not (20 * 60 + 5 <= mins <= 20 * 60 + 35):   # 8:05–8:35 PM ET
                 return
             from engine import daily_performance
-            daily_performance.compute_and_store(_supabase())
+            row = daily_performance.compute_and_store(_supabase())
+            if row:
+                return (f"{row.get('closed_n', 0)} closed · win {row.get('closed_win_rate')}% · "
+                        f"net {row.get('closed_net_pct')}% · active {row.get('active_n', 0)} · "
+                        f"giveback {row.get('giveback_pct')}%")
         except Exception as _e:
             logger.error(f"[runner] daily performance snapshot failed: {_e}")
 
