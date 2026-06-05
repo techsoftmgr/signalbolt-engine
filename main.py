@@ -1127,6 +1127,18 @@ async def ws_prices(websocket: WebSocket):
         price_store.remove_client(queue)
 
 
+# Human-friendly labels for the market-regime chip (regime_detector values).
+_REGIME_LABELS = {
+    "PANIC":         "Panic",
+    "HIGH_VOL":      "High Vol",
+    "RISK_OFF":      "Risk-Off",
+    "TRENDING_BEAR": "Bear Trend",
+    "RANGING":       "Ranging",
+    "TRENDING_BULL": "Bull Trend",
+    "LOW_VOL":       "Low Vol",
+}
+
+
 @app.get("/indices")
 def get_indices():
     """
@@ -1194,6 +1206,25 @@ def get_indices():
     else:
         vix_sentiment = "BEARISH"
     result["VIX_SENTIMENT"] = {"label": vix_sentiment}
+
+    # ── Derived: Market REGIME (same engine the signals use for L6 scoring +
+    # the "Market shifted to PANIC" signal advisory). Reuses the 180s-cached
+    # regime snapshot so /indices polling doesn't re-run the VIX/SPY fetch every
+    # 5s. Values: PANIC, HIGH_VOL, RISK_OFF, TRENDING_BEAR, RANGING,
+    # TRENDING_BULL, LOW_VOL. `blocked` = new entries paused (PANIC / VIX spike).
+    try:
+        from engine import signal_telemetry
+        reg = signal_telemetry.get_regime()
+        rtype = reg.get("regime_type") or ""
+        if rtype:
+            result["REGIME"] = {
+                "type":    rtype,
+                "label":   _REGIME_LABELS.get(rtype, rtype.replace("_", " ").title()),
+                "vix":     reg.get("vix"),
+                "blocked": bool(reg.get("blocked")),
+            }
+    except Exception as _re:
+        logger.debug(f"[indices] regime fetch skipped: {_re}")
 
     # Store in BOTH cache layers
     _indices_cache    = result
