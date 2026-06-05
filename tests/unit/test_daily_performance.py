@@ -2,7 +2,9 @@
 already-fetched closed/active/price/regime inputs (pure)."""
 import sys, os, datetime as dt
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from engine.daily_performance import _aggregate
+from engine.daily_performance import (
+    _aggregate, _select_movers, _match_catalyst, _news_sentiment,
+)
 
 TD = dt.date(2026, 6, 5)
 
@@ -58,3 +60,50 @@ def test_regime_path():
 def test_empty_is_graceful():
     r = _aggregate([], [], {}, [], TD)
     assert r["closed_n"] == 0 and r["active_n"] == 0 and r["top_winner"] is None
+
+
+# ── news catalyst enrichment (the "why it dumped" layer) ──
+
+def test_news_sentiment():
+    assert _news_sentiment({"headline": "Acme misses on revenue, warns"}) == "bearish"
+    assert _news_sentiment({"headline": "Acme beats, raises guidance"}) == "bullish"
+    assert _news_sentiment({"headline": "Acme to host investor day"}) == "neutral"
+
+def test_select_movers_closed_active_and_dedupe():
+    closed = [
+        _closed("MU", "LONG", -12.0, 75, "TREND_MOMENTUM"),   # big loss → stock down
+        _closed("CLSK", "SHORT", 11.0, 80, "DISTRIB_FORMING"),# short win → stock down
+        _closed("KO", "LONG", 1.2, 70, "BREAKOUT"),           # too small → excluded
+        _closed("MU", "LONG", 9.0, 75, "TREND_MOMENTUM"),     # dup ticker → ignored
+    ]
+    active = [
+        {"ticker": "NVDA", "direction": "LONG", "entry_price": 100, "score_breakdown": {}},  # cur 90 → -10% adverse
+        {"ticker": "AAPL", "direction": "LONG", "entry_price": 100,
+         "score_breakdown": {"mfe_pct": 14.0}},               # cur 102 → +2% but gave back 12
+        {"ticker": "T", "direction": "LONG", "entry_price": 100, "score_breakdown": {}},      # cur 101 → ignored
+    ]
+    prices = {"NVDA": 90.0, "AAPL": 102.0, "T": 101.0}
+    mv = {m["ticker"]: m for m in _select_movers(closed, active, prices)}
+    assert set(mv) == {"MU", "CLSK", "NVDA", "AAPL"}
+    assert mv["MU"]["stock_down"] is True and mv["MU"]["kind"] == "closed"
+    assert mv["CLSK"]["stock_down"] is True                   # short win = underlying fell
+    assert mv["NVDA"]["kind"] == "active" and mv["NVDA"]["stock_down"] is True
+    assert mv["AAPL"]["giveback_pct"] == 12.0
+
+def test_match_catalyst_prefers_aligned_and_today():
+    mover = {"ticker": "MU", "kind": "closed", "direction": "LONG",
+             "move_pct": -12.0, "stock_down": True}
+    news = [
+        {"symbols": ["MU"], "headline": "Micron upgraded, analysts bullish",
+         "summary": "Strong demand.", "created_at": "2026-06-04T12:00:00Z", "url": "u1"},
+        {"symbols": ["MU"], "headline": "Micron plunges after guidance cut",
+         "summary": "Company warns on margins.", "created_at": "2026-06-05T21:30:00Z", "url": "u2"},
+        {"symbols": ["AMD"], "headline": "AMD news", "created_at": "2026-06-05T21:00:00Z"},
+    ]
+    c = _match_catalyst(mover, news, TD)
+    assert c["url"] == "u2" and c["sentiment"] == "bearish"   # bearish + today wins
+    assert c["ticker"] == "MU" and c["move_pct"] == -12.0
+
+def test_match_catalyst_none_when_no_symbol():
+    mover = {"ticker": "MU", "stock_down": True}
+    assert _match_catalyst(mover, [{"symbols": ["AMD"], "headline": "x"}], TD) is None

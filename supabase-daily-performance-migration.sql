@@ -45,8 +45,18 @@ create table if not exists daily_performance (
   active_long_n         integer,
   active_short_n        integer,
   active_near_levels    integer,     -- # active within ~1.5% of stop or target
-  active_giveback_pct   numeric      -- sum of (peak MFE − current unrealized) over active
+  active_giveback_pct   numeric,     -- sum of (peak MFE − current unrealized) over active
+
+  -- WHY the notable movers ran/dumped — news catalysts matched to the day's
+  -- big closed winners/losers + active positions that moved hard (incl. the
+  -- after-hours dumps the 8 PM run is positioned to catch). Each entry:
+  -- {ticker, kind: closed|active, direction, move_pct, headline, summary, url,
+  --  source, published_at, sentiment: bullish|bearish|neutral}
+  catalysts             jsonb
 );
+
+-- Defensive: add the column if the table already existed before this revision.
+alter table daily_performance add column if not exists catalysts jsonb;
 
 create index if not exists idx_daily_perf_date on daily_performance (trade_date desc);
 

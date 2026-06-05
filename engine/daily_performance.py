@@ -21,7 +21,104 @@ from zoneinfo import ZoneInfo
 
 logger = logging.getLogger("signalbolt.daily_performance")
 ET = ZoneInfo("America/New_York")
-_NEAR_PCT = 1.5   # active signal "near" a level when within this % of stop/target
+_NEAR_PCT = 1.5     # active signal "near" a level when within this % of stop/target
+_MOVE_NOTABLE = 8.0  # |%| move that makes a closed/active signal a "notable" run/dump
+_AH_GIVEBACK = 10.0  # active give-back (peak MFE − current) that warrants a news check
+
+# Compact keyword sentiment for matching a headline to a move direction (a dump
+# wants a bearish headline, a run wants a bullish one). Kept local so this module
+# stays decoupled from the live news-feed service.
+_BULLISH_WORDS = {
+    "beats", "beat", "raises", "raised", "upgrade", "upgraded", "outperforms",
+    "strong", "surge", "surges", "jumps", "rallies", "record", "growth",
+    "accelerates", "partnership", "wins", "awarded", "positive", "approval",
+    "approves", "breakthrough", "buyback", "soars", "tops", "boosts",
+}
+_BEARISH_WORDS = {
+    "misses", "miss", "missed", "lowers", "lowered", "downgrade", "downgraded",
+    "disappoints", "weak", "plunges", "drops", "falls", "warns", "warning",
+    "investigation", "recall", "loss", "losses", "cut", "cuts", "delay",
+    "delayed", "lawsuit", "fine", "fined", "suspension", "negative", "rejection",
+    "rejects", "concern", "slumps", "sinks", "tumbles", "halts", "probe",
+}
+
+
+def _news_sentiment(item: dict) -> str:
+    text = ((item.get("headline") or "") + " " + (item.get("summary") or "")).lower()
+    b = sum(1 for w in _BEARISH_WORDS if w in text)
+    g = sum(1 for w in _BULLISH_WORDS if w in text)
+    if b > g: return "bearish"
+    if g > b: return "bullish"
+    return "neutral"
+
+
+def _select_movers(closed: list, active: list, prices: dict) -> list:
+    """Pure: the notable runs/dumps worth a news reason — big realized closes +
+    active positions that moved hard against (or gave back a lot)."""
+    movers = []
+    seen = set()
+    for r in (closed or []):
+        try:
+            p = float(r.get("result_pct"))
+        except (TypeError, ValueError):
+            continue
+        tk = r.get("ticker")
+        if not tk or tk in seen or abs(p) < _MOVE_NOTABLE:
+            continue
+        seen.add(tk)
+        is_long = (r.get("direction") or "").upper() == "LONG"
+        stock_down = (p < 0) if is_long else (p > 0)   # which way the underlying moved
+        movers.append({"ticker": tk, "kind": "closed",
+                       "direction": (r.get("direction") or "").upper(),
+                       "move_pct": round(p, 2), "stock_down": stock_down})
+    for r in (active or []):
+        tk = r.get("ticker")
+        if not tk or tk in seen:
+            continue
+        cur = prices.get(tk)
+        try:
+            e = float(r.get("entry_price") or 0)
+        except (TypeError, ValueError):
+            e = 0
+        if not cur or e <= 0:
+            continue
+        is_long = (r.get("direction") or "").upper() == "LONG"
+        u = ((cur - e) / e * 100) if is_long else ((e - cur) / e * 100)
+        mfe = (r.get("score_breakdown") or {}).get("mfe_pct")
+        gb = max(0.0, float(mfe) - u) if mfe is not None else 0.0
+        if u <= -_MOVE_NOTABLE or gb >= _AH_GIVEBACK:
+            seen.add(tk)
+            movers.append({"ticker": tk, "kind": "active",
+                           "direction": (r.get("direction") or "").upper(),
+                           "move_pct": round(u, 2), "giveback_pct": round(gb, 2),
+                           "stock_down": cur < e})
+    return movers
+
+
+def _match_catalyst(mover: dict, news_items: list, trade_date) -> dict | None:
+    """Pure: pick the headline that best explains a mover — same ticker, prefer a
+    sentiment that matches the move direction and a story published today."""
+    tk = mover.get("ticker")
+    want = "bearish" if mover.get("stock_down") else "bullish"
+    cands = []
+    for it in (news_items or []):
+        if tk not in (it.get("symbols") or []):
+            continue
+        created = (it.get("created_at") or "")[:10]
+        sent = _news_sentiment(it)
+        score = (2 if sent == want else 0) + (1 if created == str(trade_date) else 0)
+        cands.append((score, created, sent, it))
+    if not cands:
+        return None
+    cands.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    score, created, sent, it = cands[0]
+    summ = (it.get("summary") or "").strip()
+    if len(summ) > 240:
+        summ = summ[:237] + "..."
+    return {"ticker": tk, "kind": mover.get("kind"), "direction": mover.get("direction"),
+            "move_pct": mover.get("move_pct"), "headline": it.get("headline"),
+            "summary": summ, "url": it.get("url"), "source": it.get("source"),
+            "published_at": it.get("created_at"), "sentiment": sent}
 
 
 def _tier(cs) -> str:
@@ -181,10 +278,28 @@ def compute_and_store(sb) -> dict | None:
                 logger.debug(f"[daily_perf] price fetch failed: {e}")
 
         row = _aggregate(closed, active, prices, regime_rows, trade_date)
+
+        # WHY the notable movers ran/dumped — match a news headline to each big
+        # mover (incl. active after-hours dumps the 8 PM run is here to catch).
+        catalysts = []
+        try:
+            movers = _select_movers(closed, active, prices)
+            if movers:
+                from engine.alpaca_client import get_multi_news
+                news = get_multi_news([m["ticker"] for m in movers][:25], limit=50)
+                for m in movers:
+                    c = _match_catalyst(m, news, trade_date)
+                    if c:
+                        catalysts.append(c)
+        except Exception as e:
+            logger.debug(f"[daily_perf] catalyst enrich failed: {e}")
+        row["catalysts"] = catalysts
+
         sb.table("daily_performance").upsert(row, on_conflict="trade_date").execute()
         logger.info(f"[daily_perf] {trade_date}: closed {row['closed_n']} "
                     f"(win {row['closed_win_rate']}%, net {row['closed_net_pct']}%), "
-                    f"active {row['active_n']}, giveback {row['giveback_pct']}%")
+                    f"active {row['active_n']}, giveback {row['giveback_pct']}%, "
+                    f"catalysts {len(catalysts)}")
         return row
     except Exception as e:
         logger.error(f"[daily_perf] compute_and_store failed: {e}")
