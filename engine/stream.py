@@ -641,6 +641,30 @@ async def subscribe_extra_tickers(tickers: list[str]) -> None:
         logger.warning(f"[stream] Dynamic subscription deferred (will retry on reconnect): {e}")
 
 
+def _load_watchlist_tickers(limit: int = 200) -> list[str]:
+    """Distinct tickers across ALL users' watchlists.
+
+    These must stream LIVE even when they carry no active signal — the watchlist
+    and quote screens display them tick-by-tick. The Alpaca stream lives on the
+    WORKER process; /ws/prices runs on the WEB process where `_wss_ref` is None,
+    so the web's subscribe_extra_tickers() call is a no-op and never reaches the
+    stream. The worker therefore pulls the wanted set straight from the DB.
+    Capped so a large user base can't blow past the feed's symbol budget.
+    """
+    try:
+        from supabase import create_client
+        sb = create_client(
+            os.environ["SUPABASE_URL"],
+            os.environ.get("SUPABASE_SECRET_KEY") or os.environ.get("SUPABASE_SERVICE_KEY", ""),
+        )
+        rows = sb.table("watchlist").select("ticker").limit(5000).execute().data or []
+        ticks = sorted({(r.get("ticker") or "").upper() for r in rows if r.get("ticker")})
+        return ticks[:limit]
+    except Exception as e:
+        logger.warning(f"[stream] Could not load watchlist tickers: {e}")
+        return []
+
+
 # ── Context cache ─────────────────────────────────────────────
 # Regime/session detection hits yfinance + Alpaca REST — expensive.
 # Cache 4 minutes. All bar events within the same scan window share one fetch.
@@ -1687,6 +1711,21 @@ async def run_stream() -> None:
     except Exception as _e:
         logger.warning(f"[stream] Could not load active-signal tickers on startup: {_e}")
 
+    # Also subscribe every ticker in users' WATCHLISTS so the watchlist / quote
+    # screens get LIVE ticks even when the name has no active signal. /ws/prices
+    # runs on the WEB process (where _wss_ref is None → its subscribe_extra_tickers
+    # is a no-op), so the WORKER must pull the wanted set from the DB itself.
+    # (HOOD 2026-06-05: watchlist ticker with no active signal showed a frozen
+    # price — live $87.08 vs streamed $86.37 — because it was never subscribed.)
+    try:
+        wl_tickers = _load_watchlist_tickers()
+        extra_wl = [t for t in wl_tickers if t not in all_subscribe]
+        if extra_wl:
+            all_subscribe.extend(extra_wl)
+            logger.info(f"[stream] Subscribing {len(extra_wl)} watchlist ticker(s): {extra_wl}")
+    except Exception as _we:
+        logger.warning(f"[stream] Could not load watchlist tickers on startup: {_we}")
+
     # Restore per-tick detector zones staged before this restart so a deploy
     # doesn't reset compression/pullback/swing to zero — AND re-subscribe their
     # tickers so the restored zones are actually monitored (receive 1m bars),
@@ -1701,6 +1740,24 @@ async def run_stream() -> None:
         logger.warning(f"[stream] zone restore/resubscribe failed: {_ze}")
 
     _subscribed_tickers = set(all_subscribe)           # track base set for dynamic subs
+
+    # Pick up watchlist ADDS mid-session (and re-assert after any reconnect)
+    # without waiting for a restart — the worker owns the stream, so this is the
+    # only place a newly-watched ticker can actually be subscribed live.
+    async def _periodic_watchlist_resub() -> None:
+        loop_ = asyncio.get_running_loop()
+        while True:
+            try:
+                await asyncio.sleep(180)
+                wanted = await loop_.run_in_executor(None, _load_watchlist_tickers)
+                new = [t for t in wanted if t not in _subscribed_tickers]
+                if new:
+                    await subscribe_extra_tickers(new)
+            except asyncio.CancelledError:
+                break
+            except Exception as _re:
+                logger.debug(f"[stream] periodic watchlist resub error: {_re}")
+    asyncio.ensure_future(_periodic_watchlist_resub())
 
     logger.info(
         f"[stream] Starting event-driven stream — feed={feed.value.upper()} | "
