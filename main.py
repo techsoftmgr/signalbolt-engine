@@ -344,12 +344,35 @@ def _alpaca_stock_snapshots(symbols: list[str]) -> dict:
                 }
 
                 # ── Extended hours price (pre / post market) ──────────
-                # Alpaca minute_bar gives the most recent 1-min bar
-                # which covers pre-market (4AM) and after-hours (to 8PM)
-                if session in ("pre", "post") and snap.minute_bar:
-                    ext_price = float(snap.minute_bar.close)
+                # Brokers (ThinkOrSwim) show a value near the NBBO MIDPOINT in
+                # pre/post market, NOT the last sparse print. Extended-hours
+                # liquidity is thin and trades bounce across a wide spread, so
+                # the last trade can sit 20-30c off the true market — and two
+                # vendors' last prints legitimately disagree (Alpaca SIP vs
+                # TD/Schwab). The bid/ask mid is the stable, vendor-neutral
+                # "fair value" both sides agree on. Use it when we have a sane
+                # two-sided quote; fall back to the last 1-min bar otherwise.
+                if session in ("pre", "post"):
+                    ext_price = 0.0
+                    q = getattr(snap, "latest_quote", None)
+                    if q is not None:
+                        try:
+                            bid = float(q.bid_price or 0)
+                            ask = float(q.ask_price or 0)
+                            mid = (bid + ask) / 2.0
+                            # sane two-sided quote: both sides present, not
+                            # crossed, spread < 5% (reject the garbage-wide /
+                            # one-sided quotes Alpaca returns when a venue is dark)
+                            if bid > 0 and ask > 0 and ask >= bid and mid > 0 and (ask - bid) / mid < 0.05:
+                                ext_price = round(mid, 2)
+                        except (TypeError, ValueError):
+                            ext_price = 0.0
+                    if ext_price <= 0 and snap.minute_bar:   # fallback: last 1-min print
+                        mb = float(snap.minute_bar.close)
+                        if mb > 0:
+                            ext_price = round(mb, 2)
                     if ext_price > 0:
-                        entry["extendedPrice"] = round(ext_price, 2)
+                        entry["extendedPrice"] = ext_price
                         if session == "pre" and prev_close > 0:
                             entry["extendedChangePercent"] = round(
                                 (ext_price - prev_close) / prev_close * 100, 2
