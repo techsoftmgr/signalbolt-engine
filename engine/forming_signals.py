@@ -124,6 +124,11 @@ def generate(sb, r: dict, kind: str) -> dict:
 
     atr_pct = float(r.get("atrPct") or 2.0)
     atr     = float(price) * atr_pct / 100.0
+    # Sanity-cap the ATR used for SL/TP. A high-ATR / leveraged name (e.g. KORU's
+    # ~25% ATR) blew the +5-ATR target past zero — T1 $232 / T2 -$159 on a $624
+    # short — so the T1->breakeven profit-lock could NEVER fire. Cap at 8% of price
+    # so targets stay positive + sane (t1 ≤ ~20%, t2 ≤ ~40%); normal names unaffected.
+    atr     = min(atr, float(price) * 0.08)
     entry   = round(float(price), 2)
     stop, t1, t2 = _levels(kind, entry, atr, r)
     conf    = _conf(kind, r)

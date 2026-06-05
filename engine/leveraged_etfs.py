@@ -53,8 +53,11 @@ BLOCKED_LEVERAGED_ETFS: frozenset[str] = frozenset({
     "NUGT", "DUST", "JNUG", "JDST", "UGL", "GLL", "AGQ", "ZSL", "USLV", "DSLV", "PILL",
     # Leveraged bonds / rates
     "TMF", "TMV", "TBT", "UBT", "TYO", "TYD",
-    # Foreign / EM leveraged
+    # Foreign / EM / single-country leveraged (decay + thin tape; not the broad US
+    # index the short-horizon signals assume). KORU (China 3x) bit us 2026-06-05 —
+    # a breakdown_forming short went +3.6% after-hours then round-tripped to a loss.
     "YINN", "YANG", "CWEB", "CHAU", "EDC", "EDZ",
+    "KORU", "BRZU", "INDL", "MEXX", "EURL", "JPNL", "GREK", "RUSL", "CHAD",
 })
 
 

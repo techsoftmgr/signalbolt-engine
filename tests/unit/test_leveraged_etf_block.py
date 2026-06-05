@@ -32,7 +32,8 @@ class TestAlwaysBlocked:
     def test_blocks_commodity_metal_bond_em(self):
         for t in ("BOIL", "KOLD", "NUGT", "DUST", "JNUG", "AGQ",   # commodity/metal
                   "TMF", "TMV", "TBT",                              # bonds/rates
-                  "YINN", "YANG", "EDC", "EDZ"):                    # foreign/EM
+                  "YINN", "YANG", "EDC", "EDZ",                     # foreign/EM
+                  "KORU", "BRZU", "INDL", "MEXX", "EURL"):          # single-country 3x (KORU regression)
             assert is_blocked_leveraged_etf(t), f"{t} should be always-blocked"
 
     def test_leveraged_index_is_NOT_always_blocked(self):
