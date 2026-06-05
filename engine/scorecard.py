@@ -24,6 +24,21 @@ _MIN_N = 15
 _NOTIONAL = 1000.0
 
 
+def _conviction_tier(cs) -> str:
+    """Confidence-score band (matches the quant tiers). Lets us see whether a
+    detector's HIGH-conviction signals actually beat its low-conviction ones —
+    i.e. whether the score is calibrated."""
+    try:
+        cs = float(cs)
+    except (TypeError, ValueError):
+        return "?"
+    if cs >= 90: return "A+ (90+)"
+    if cs >= 80: return "A (80-89)"
+    if cs >= 70: return "B+ (70-79)"
+    if cs >= 60: return "B (60-69)"
+    return "C (<60)"
+
+
 def _seg_fields(row: dict, group_by: str) -> dict:
     """Identity fields for a row's segment, per the chosen grouping."""
     bd     = row.get("score_breakdown") or {}
@@ -34,6 +49,11 @@ def _seg_fields(row: dict, group_by: str) -> dict:
         return {"regime": regime}
     if group_by == "detector_regime":
         return {"detector": src, "strategy": strat, "regime": regime}
+    if group_by == "conviction":
+        return {"conviction": _conviction_tier(row.get("confidence_score"))}
+    if group_by == "detector_conviction":
+        return {"detector": src, "strategy": strat,
+                "conviction": _conviction_tier(row.get("confidence_score"))}
     return {"detector": src, "strategy": strat}   # default: detector
 
 
@@ -49,6 +69,8 @@ def _label(fields: dict) -> str:
         parts.append(str(fields["strategy"]))
     if fields.get("regime"):
         parts.append(f"[{fields['regime']}]")
+    if fields.get("conviction"):
+        parts.append(f"@{fields['conviction']}")
     return " · ".join(parts) if parts else "—"
 
 
@@ -127,7 +149,8 @@ def compute(rows: list, group_by: str = "detector",
     A row counts as a WIN when result == 'win' OR (result missing AND pct > 0).
     Rows with result_pct is None are skipped (can't measure edge without P&L).
     """
-    if group_by not in ("detector", "regime", "detector_regime"):
+    if group_by not in ("detector", "regime", "detector_regime",
+                        "conviction", "detector_conviction"):
         group_by = "detector"
 
     segs: dict = {}
