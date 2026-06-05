@@ -76,10 +76,16 @@ def _label(fields: dict) -> str:
 
 def _new_bucket() -> dict:
     return {"n": 0, "wins": 0, "losses": 0, "win_sum": 0.0, "loss_sum": 0.0,
-            "pnl_sum": 0.0, "worst": None, "best": None}
+            "pnl_sum": 0.0, "worst": None, "best": None,
+            # exit-quality accumulators (from score_breakdown MFE/MAE + timing)
+            "mfe_sum": 0.0, "mfe_n": 0, "mae_sum": 0.0, "mae_n": 0,
+            "wmae_sum": 0.0, "wmae_n": 0,            # MAE of WINNERS — the stop-tuning stat
+            "gb_sum": 0.0, "gb_n": 0,                # give-back: peak MFE − realized
+            "tmfe_sum": 0.0, "tmfe_n": 0,            # minutes entry → peak (profit-lock timing)
+            "order_n": 0, "mae_first": 0}            # of trades w/ both timings, how many took heat FIRST
 
 
-def _accumulate(bucket: dict, pct: float, is_win: bool) -> None:
+def _accumulate(bucket: dict, pct: float, is_win: bool, sbd: dict | None = None) -> None:
     bucket["n"] += 1
     bucket["pnl_sum"] += pct
     if is_win:
@@ -90,6 +96,39 @@ def _accumulate(bucket: dict, pct: float, is_win: bool) -> None:
         bucket["loss_sum"] += pct
     bucket["worst"] = pct if bucket["worst"] is None else min(bucket["worst"], pct)
     bucket["best"]  = pct if bucket["best"]  is None else max(bucket["best"],  pct)
+
+    if not isinstance(sbd, dict):
+        return
+    mfe = sbd.get("mfe_pct")
+    if mfe is not None:
+        try:
+            mfe = float(mfe)
+            bucket["mfe_sum"] += mfe; bucket["mfe_n"] += 1
+            bucket["gb_sum"] += max(0.0, mfe - pct); bucket["gb_n"] += 1
+        except (TypeError, ValueError):
+            pass
+    mae = sbd.get("mae_pct")
+    if mae is not None:
+        try:
+            mae = float(mae)
+            bucket["mae_sum"] += mae; bucket["mae_n"] += 1
+            if is_win:
+                bucket["wmae_sum"] += mae; bucket["wmae_n"] += 1
+        except (TypeError, ValueError):
+            pass
+    t_mfe = sbd.get("t_mfe_min"); t_mae = sbd.get("t_mae_min")
+    if t_mfe is not None:
+        try:
+            bucket["tmfe_sum"] += float(t_mfe); bucket["tmfe_n"] += 1
+        except (TypeError, ValueError):
+            pass
+    if t_mfe is not None and t_mae is not None:
+        try:
+            bucket["order_n"] += 1
+            if float(t_mae) < float(t_mfe):
+                bucket["mae_first"] += 1
+        except (TypeError, ValueError):
+            bucket["order_n"] -= 1
 
 
 def _stats(bucket: dict, cost_pct: float, min_n: int, notional: float = _NOTIONAL) -> dict:
@@ -121,6 +160,24 @@ def _stats(bucket: dict, cost_pct: float, min_n: int, notional: float = _NOTIONA
     net_total   = round(bucket["pnl_sum"] - cost_pct * n, 2) if n else None
     pnl_cash    = round((net_total / 100.0) * notional, 2) if net_total is not None else None
 
+    # Exit-quality block — the tuning lens (separate from the keep/cut verdict):
+    #   avg_mfe   how far winners-and-losers ran in our favor at peak
+    #   avg_giveback  peak MFE − realized → how much profit we hand back (profit-lock)
+    #   winner_mae    avg MAE of WINNERS → how much heat a winner takes; a stop
+    #                 tighter than this is cutting winners (min-stop tuning)
+    #   avg_mae       avg worst adverse over all trades
+    #   avg_t_mfe_min minutes from entry to the favorable peak (when to lock)
+    #   mae_before_mfe_pct  % of trades that went AGAINST first then worked —
+    #                 high → entries are early/need wider initial stops
+    mfe_n, mae_n, wmae_n = bucket["mfe_n"], bucket["mae_n"], bucket["wmae_n"]
+    gb_n, tmfe_n, ord_n  = bucket["gb_n"], bucket["tmfe_n"], bucket["order_n"]
+    avg_mfe      = round(bucket["mfe_sum"]  / mfe_n,  2) if mfe_n  else None
+    avg_mae      = round(bucket["mae_sum"]  / mae_n,  2) if mae_n  else None
+    winner_mae   = round(bucket["wmae_sum"] / wmae_n, 2) if wmae_n else None
+    avg_giveback = round(bucket["gb_sum"]   / gb_n,   2) if gb_n   else None
+    avg_t_mfe_min = round(bucket["tmfe_sum"] / tmfe_n, 1) if tmfe_n else None
+    mae_before_mfe_pct = round(100 * bucket["mae_first"] / ord_n, 1) if ord_n else None
+
     return {
         "n": n, "win_rate": win_rate, "avg_win": avg_win, "avg_loss": avg_loss,
         "payoff": payoff,
@@ -130,6 +187,11 @@ def _stats(bucket: dict, cost_pct: float, min_n: int, notional: float = _NOTIONA
         "total_return_pct": total_gross, "net_total_pct": net_total,
         "pnl_per_notional": pnl_cash,
         "verdict": verdict, "reason": reason,
+        # exit-quality (None until MFE/MAE + timing accrue)
+        "avg_mfe": avg_mfe, "avg_mae": avg_mae, "winner_mae": winner_mae,
+        "avg_giveback": avg_giveback, "mfe_sample": mfe_n,
+        "avg_t_mfe_min": avg_t_mfe_min, "mae_before_mfe_pct": mae_before_mfe_pct,
+        "timing_sample": ord_n,
     }
 
 
@@ -167,13 +229,16 @@ def compute(rows: list, group_by: str = "detector",
             continue
         is_win = (r.get("result") == "win") or (r.get("result") is None and pct > 0)
 
+        sbd = r.get("score_breakdown")
+        if not isinstance(sbd, dict):
+            sbd = None
         fields = _seg_fields(r, group_by)
         key = _seg_key(fields)
         if key not in segs:
             segs[key] = _new_bucket()
             seg_fields[key] = fields
-        _accumulate(segs[key], pct, is_win)
-        _accumulate(portfolio, pct, is_win)
+        _accumulate(segs[key], pct, is_win, sbd)
+        _accumulate(portfolio, pct, is_win, sbd)
 
     out = []
     for key, bucket in segs.items():
