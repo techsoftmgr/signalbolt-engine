@@ -207,6 +207,58 @@ def _current_price(ticker: str) -> Optional[float]:
         return None
 
 
+# ── MFE / MAE excursion capture ───────────────────────────────────────────────
+
+def _in_quote_window() -> bool:
+    """RTH + extended hours (4:00 AM – 8:00 PM ET, Mon–Fri) — the window where
+    live prints exist for excursion capture. Skips overnight/weekends (no fresh
+    trades → nothing to record)."""
+    now = _now_et()
+    if now.weekday() >= 5:
+        return False
+    return 4 <= now.hour < 20
+
+
+def _capture_excursion(sb, sig) -> None:
+    """Record running MFE (peak favorable) / MAE (peak adverse) unrealized % on a
+    signal — INCLUDING the big after-hours / pre-market excursions — so profit
+    GIVE-BACK (peak − realized) is measurable per signal. MEASUREMENT ONLY: never
+    closes or moves a stop. Stored in score_breakdown.{mfe_pct,mae_pct} (JSONB,
+    no migration); the row is written only when a NEW extreme is set."""
+    try:
+        entry = float(sig.get("entry_price") or 0)
+    except (TypeError, ValueError):
+        return
+    if entry <= 0:
+        return
+    ticker = sig.get("ticker")
+    price  = _current_price(ticker)
+    if not price or price <= 0:
+        return
+    is_long = (sig.get("direction") or "").upper() == "LONG"
+    pnl = ((price - entry) / entry * 100.0) if is_long else ((entry - price) / entry * 100.0)
+    # Phantom-print guard for MEASUREMENT: a single bad SIP tick shouldn't inflate
+    # the recorded peak. A real earnings gap is well under this; >60% in one read
+    # is almost always a bad print.
+    if abs(pnl) > 60.0:
+        return
+    sbd     = sig.get("score_breakdown") or {}
+    cur_mfe = sbd.get("mfe_pct")
+    cur_mae = sbd.get("mae_pct")
+    new_mfe = pnl if cur_mfe is None else max(float(cur_mfe), pnl)
+    new_mae = pnl if cur_mae is None else min(float(cur_mae), pnl)
+    if new_mfe == cur_mfe and new_mae == cur_mae:
+        return  # no new extreme — skip the write
+    merged = dict(sbd)
+    merged["mfe_pct"] = round(new_mfe, 2)
+    merged["mae_pct"] = round(new_mae, 2)
+    try:
+        sb.table("signals").update({"score_breakdown": merged}).eq("id", sig["id"]).execute()
+        sig["score_breakdown"] = merged   # keep local copy fresh for downstream checks
+    except Exception as e:
+        logger.debug(f"[monitor] MFE/MAE update failed for {ticker}: {e}")
+
+
 # ── Status derivation ─────────────────────────────────────────────────────────
 
 def _derive_status(price: float, entry: float, t1: float, sl: float,
@@ -641,12 +693,24 @@ def _monitor_stocks(sb: Client) -> None:
         return
 
     logger.info(f"[monitor] Checking {len(rows)} active stock signal(s)")
-    near_close  = _is_near_market_close()
-    eod_warning = _is_eod_warning()
-    market_open = _is_market_hours()
-    now_utc     = datetime.now(timezone.utc)
+    near_close     = _is_near_market_close()
+    eod_warning    = _is_eod_warning()
+    market_open    = _is_market_hours()
+    capture_window = _in_quote_window()   # RTH + extended hours
+    now_utc        = datetime.now(timezone.utc)
 
     for sig in rows:
+        # ── MFE/MAE capture (ALL active signals incl. manual/momentum; RTH +
+        #    extended hours). Records running peak-favorable / peak-adverse
+        #    unrealized % so give-back = peak − realized is measurable per signal,
+        #    INCLUDING the big after-hours / pre-market runs. Measurement only —
+        #    runs before every skip so coverage is complete, never trades. ──
+        if capture_window:
+            try:
+                _capture_excursion(sb, sig)
+            except Exception:
+                pass
+
         # MANUAL override: the admin owns this signal. The engine must not trail,
         # move the stop, EOD-close, time-stop, or reverse-exit it — nothing — until
         # it's flipped back to engine management. (Manual create + agentic control.)
