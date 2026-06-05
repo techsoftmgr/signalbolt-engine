@@ -82,7 +82,8 @@ def _new_bucket() -> dict:
             "wmae_sum": 0.0, "wmae_n": 0,            # MAE of WINNERS — the stop-tuning stat
             "gb_sum": 0.0, "gb_n": 0,                # give-back: peak MFE − realized
             "tmfe_sum": 0.0, "tmfe_n": 0,            # minutes entry → peak (profit-lock timing)
-            "order_n": 0, "mae_first": 0}            # of trades w/ both timings, how many took heat FIRST
+            "order_n": 0, "mae_first": 0,            # of trades w/ both timings, how many took heat FIRST
+            "alpha_sum": 0.0, "alpha_n": 0, "alpha_beat": 0}  # excess vs SPY + how many beat the market
 
 
 def _accumulate(bucket: dict, pct: float, is_win: bool, sbd: dict | None = None) -> None:
@@ -129,6 +130,15 @@ def _accumulate(bucket: dict, pct: float, is_win: bool, sbd: dict | None = None)
                 bucket["mae_first"] += 1
         except (TypeError, ValueError):
             bucket["order_n"] -= 1
+    alpha = sbd.get("alpha_pct")
+    if alpha is not None:
+        try:
+            alpha = float(alpha)
+            bucket["alpha_sum"] += alpha; bucket["alpha_n"] += 1
+            if alpha > 0:
+                bucket["alpha_beat"] += 1
+        except (TypeError, ValueError):
+            pass
 
 
 def _stats(bucket: dict, cost_pct: float, min_n: int, notional: float = _NOTIONAL) -> dict:
@@ -177,6 +187,10 @@ def _stats(bucket: dict, cost_pct: float, min_n: int, notional: float = _NOTIONA
     avg_giveback = round(bucket["gb_sum"]   / gb_n,   2) if gb_n   else None
     avg_t_mfe_min = round(bucket["tmfe_sum"] / tmfe_n, 1) if tmfe_n else None
     mae_before_mfe_pct = round(100 * bucket["mae_first"] / ord_n, 1) if ord_n else None
+    # alpha vs SPY — did this segment make MONEY or just ride the tape?
+    alpha_n = bucket["alpha_n"]
+    avg_alpha = round(bucket["alpha_sum"] / alpha_n, 2) if alpha_n else None
+    market_beat_rate = round(100 * bucket["alpha_beat"] / alpha_n, 1) if alpha_n else None
 
     return {
         "n": n, "win_rate": win_rate, "avg_win": avg_win, "avg_loss": avg_loss,
@@ -192,6 +206,8 @@ def _stats(bucket: dict, cost_pct: float, min_n: int, notional: float = _NOTIONA
         "avg_giveback": avg_giveback, "mfe_sample": mfe_n,
         "avg_t_mfe_min": avg_t_mfe_min, "mae_before_mfe_pct": mae_before_mfe_pct,
         "timing_sample": ord_n,
+        # alpha vs SPY (None until enriched): made money vs rode the market
+        "avg_alpha": avg_alpha, "market_beat_rate": market_beat_rate, "alpha_sample": alpha_n,
     }
 
 

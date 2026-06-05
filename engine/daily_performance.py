@@ -277,6 +277,16 @@ def compute_and_store(sb) -> dict | None:
             except Exception as e:
                 logger.debug(f"[daily_perf] price fetch failed: {e}")
 
+        # Enrich today's closed with alpha-vs-SPY (excess over market exposure)
+        # before aggregating — folded here so it adds NO new scheduled job.
+        try:
+            from engine import alpha
+            spy_oc = alpha._spy_oc_by_date(10)
+            if spy_oc:
+                alpha.enrich(sb, closed, spy_oc)
+        except Exception as e:
+            logger.debug(f"[daily_perf] alpha enrich failed: {e}")
+
         row = _aggregate(closed, active, prices, regime_rows, trade_date)
 
         # WHY the notable movers ran/dumped — match a news headline to each big
