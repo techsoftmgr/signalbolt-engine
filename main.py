@@ -684,6 +684,15 @@ def get_regime_history(hours: int = 48):
         return {"hours": int(hours), "count": 0, "transitions": [], "error": str(e)}
 
 
+@app.post("/admin/run-bo-poc")
+def run_bo_poc_now(request: Request):
+    """Manually fire the BO_POC breakout scan (fidelity-matched confirmed-daily-
+    close 20d-high breakout). For on-demand testing. Admin."""
+    _user_id, sb = _require_admin_jwt(request)
+    from engine import bo_poc
+    return {"fired": bo_poc.scan(sb)}
+
+
 @app.post("/admin/historical-backtest")
 def post_historical_backtest(request: Request, years: int = 2, hold_days: int = 10,
                              cost_pct: float = 0.15, universe: str = None):

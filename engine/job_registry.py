@@ -38,6 +38,7 @@ JOBS: list[dict] = [
 
     # ── daily (post-close / EOD) ──
     {"id": "momentum_scan",      "label": "Momentum Scan",          "cadence": DAILY,    "schedule": "10:00a ET, Mon–Fri",       "category": "Signals",  "what": "Systematic cross-sectional momentum — fires TREND_MOMENTUM swings."},
+    {"id": "bo_poc",             "label": "BO_POC Breakout POC",    "cadence": DAILY,    "schedule": "4:10p ET, Mon–Fri",        "category": "Signals",  "what": "Fidelity-matched confirmed-daily-close 20d-high breakout (validates the backtested archetype live)."},
     {"id": "drawdown_regime_log","label": "Drawdown-Regime Log",    "cadence": DAILY,    "schedule": "4:12p ET",                 "category": "Market",   "what": "Logs index % off 52-wk high (the deep-value accumulation window)."},
     {"id": "gate_validator",     "label": "Gate Validator",         "cadence": DAILY,    "schedule": "4:15p ET",                 "category": "Quant",    "what": "Judges rejected signals — would they have lost? (gate-correctness %)."},
     {"id": "deep_value_signal",  "label": "Deep-Value Combine",     "cadence": DAILY,    "schedule": "4:22p ET",                 "category": "Signals",  "what": "Fires the rare crash/deep-value buy when the regime + quality gates open."},
