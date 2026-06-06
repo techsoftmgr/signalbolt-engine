@@ -684,6 +684,17 @@ def get_regime_history(hours: int = 48):
         return {"hours": int(hours), "count": 0, "transitions": [], "error": str(e)}
 
 
+@app.get("/admin/detector-policy")
+def get_detector_policy(request: Request, days: int = 45):
+    """ADVISORY detector-tuning policy: per (detector × regime bucket), the
+    recommended size multiplier + action (FULL/HALF/THROTTLE/MEASURING) from
+    realized net expectancy + alpha. Read-only — does NOT change firing. The
+    'brain' for the future auto-sizer; review before any enforcement. Admin."""
+    _user_id, sb = _require_admin_jwt(request)
+    from engine import detector_policy
+    return detector_policy.compute(sb, days=max(7, min(int(days), 180)))
+
+
 @app.get("/jobs/status")
 def get_jobs_status():
     """Daily Jobs report — every scheduled job (catalog) merged with its last-run

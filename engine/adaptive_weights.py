@@ -74,8 +74,19 @@ def get_weights(strategy_type: str, regime_type: str = "ANY") -> dict:
     """
     now = time.time()
 
-    # Try regime-specific first, then ANY
-    for regime_key in (regime_type, "ANY"):
+    # Resolve the live regime → its bucket (RISK_ON/NEUTRAL/RISK_OFF) since the
+    # optimizer now learns per-bucket. Priority: exact regime row (legacy) →
+    # bucket row → ANY-regime learned → hardcoded default.
+    try:
+        from engine.regime_buckets import bucket_of
+        bucket = bucket_of(regime_type)
+    except Exception:
+        bucket = "ANY"
+    lookup, _seen = [], set()
+    for k in (regime_type, bucket, "ANY"):
+        if k and k not in _seen:
+            _seen.add(k); lookup.append(k)
+    for regime_key in lookup:
         cache_key = (strategy_type, regime_key)
         if cache_key in _cache:
             weights, ts = _cache[cache_key]

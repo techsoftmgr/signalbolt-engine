@@ -466,20 +466,26 @@ def run_full_optimization() -> dict:
         else:
             summary[strategy]["ANY"] = {"updated": False}
 
-        # ── Step 4: Optimize per regime (if enough data) ────────────────────
-        regimes_found = set(p.get("regime_type", "ANY") for p in real_points)
-        for regime in regimes_found:
-            if regime in ("ANY", "", None):
+        # ── Step 4: Optimize per regime BUCKET (if enough data) ─────────────
+        # Bucketed (RISK_ON / NEUTRAL / RISK_OFF) rather than the 7 raw regimes
+        # so a cell can actually reach MIN_SAMPLES. NOTE: only fires when the
+        # data spans >1 bucket — today the legacy strategies are ~100%
+        # TRENDING_BULL (RISK_ON), so this stays dormant until the engine has
+        # traded across regimes (measured, not forced).
+        from engine.regime_buckets import bucket_of
+        buckets_found = set(bucket_of(p.get("regime_type")) for p in real_points)
+        buckets_found.discard("ANY")
+        for bucket in buckets_found:
+            bucket_points = [p for p in all_points if bucket_of(p.get("regime_type")) == bucket]
+            if len(bucket_points) < MIN_SAMPLES:
+                logger.info(f"[optimizer] {strategy}/{bucket}: {len(bucket_points)} < {MIN_SAMPLES} — skipping")
                 continue
-            regime_points = [p for p in all_points if p.get("regime_type") == regime]
-            if len(regime_points) < MIN_SAMPLES:
-                continue
-            result = _optimize_one(strategy, regime, regime_points)
+            result = _optimize_one(strategy, bucket, bucket_points)
             if result:
                 adaptive_weights.save_weights(
-                    strategy, regime, result["weights"], result["metrics"]
+                    strategy, bucket, result["weights"], result["metrics"]
                 )
-                summary[strategy][regime] = {
+                summary[strategy][bucket] = {
                     "updated":   True,
                     "objective": result["metrics"]["objective"],
                     "win_rate":  result["metrics"]["win_rate"],
