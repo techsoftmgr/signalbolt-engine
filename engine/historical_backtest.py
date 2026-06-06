@@ -103,7 +103,7 @@ DETECTORS = {
 
 # Documented but NOT YET registered (fidelity work pending) / un-backtestable:
 PENDING = ["BREAKOUT_FORMING", "BREAKDOWN_FORMING", "PEAK", "TURNAROUND",
-           "PULLBACK", "SWING_BREAKOUT", "TREND_MOMENTUM (cross-sectional)"]
+           "PULLBACK", "SWING_BREAKOUT"]   # TREND_MOMENTUM now via _momentum_pass
 CANNOT_BACKTEST = ["OPTIONS_FLOW", "DARK_POOL", "DEEP_VALUE",
                    "EMA_RECLAIM (intraday)", "GAP_ENGINE (intraday)"]
 
@@ -144,6 +144,70 @@ def _regime_allows(direction: str, regime: str) -> bool:
     return regime != "RISK_ON"
 
 
+def _spy_edge(net, direction, edate, spy_close, spy_dates, hold_days):
+    se = spy_close.get(edate)
+    if not se:
+        return None
+    fut = [x for x in spy_dates if x > edate][:hold_days]
+    if not fut:
+        return None
+    sx = spy_close.get(fut[-1])
+    if not sx:
+        return None
+    sret = (sx - se) / se * 100
+    bench = sret if direction == "LONG" else -sret
+    return round(net - bench, 3)
+
+
+def _momentum_pass(bars, spy_close, spy_dates, regime, hold_days, exit_params,
+                   cost_pct, regime_gate, top_n=3, rebal=10, lookback=126):
+    """Cross-sectional momentum (TREND_MOMENTUM): every `rebal` bars, rank the
+    universe by `lookback`-day return among uptrend names (px>SMA50>SMA200), go
+    LONG the top `top_n`. The academically-standard momentum factor."""
+    import numpy as np
+    from engine.replay_backtest import replay
+    info = {}
+    for tk, df in bars.items():
+        if len(df) < 200:
+            continue
+        info[tk] = (df, df["close"].values.astype(float),
+                    df["close"].rolling(50).mean().values,
+                    df["close"].rolling(200).mean().values,
+                    {str(df.index[i].date())[:10]: i for i in range(len(df))})
+    out = []
+    for rd in spy_dates[200::rebal]:
+        cands = []
+        for tk, (df, closes, sma50, sma200, pos) in info.items():
+            i = pos.get(rd)
+            if i is None or i < lookback or i >= len(closes) - hold_days - 1:
+                continue
+            c, c0 = closes[i], closes[i - lookback]
+            if c0 <= 0 or np.isnan(sma50[i]) or np.isnan(sma200[i]):
+                continue
+            if not (c > sma50[i] > sma200[i]):     # uptrend filter (long-only)
+                continue
+            cands.append((c / c0 - 1, tk, i))
+        cands.sort(reverse=True)
+        for _mom, tk, i in cands[:top_n]:
+            rgm = regime.get(rd, "NEUTRAL")
+            if regime_gate and not _regime_allows("LONG", rgm):
+                continue
+            df, closes = info[tk][0], info[tk][1]
+            fwd = df.iloc[i + 1: i + 1 + hold_days]
+            fwd_bars = [(float(r.high), float(r.low), float(r.close)) for r in fwd.itertuples()]
+            if not fwd_bars:
+                continue
+            res = replay("LONG", float(closes[i]), fwd_bars, {**exit_params, "cost_pct": cost_pct})
+            if res.get("outcome") is None:
+                continue
+            net = res["realized_net_pct"]
+            out.append({"detector": "TREND_MOMENTUM", "direction": "LONG", "regime": rgm,
+                        "net": net,
+                        "edge": _spy_edge(net, "LONG", rd, spy_close, spy_dates, hold_days),
+                        "date": rd})
+    return out
+
+
 def run(universe: list, years: int = 3, hold_days: int = 10,
         exit_params: dict | None = None, cost_pct: float = _DEFAULT_COST,
         regime_gate: bool = False) -> dict:
@@ -168,10 +232,13 @@ def run(universe: list, years: int = 3, hold_days: int = 10,
 
         trades = []   # {detector, direction, regime, net, edge, date}
         scanned = 0
+        bars = {}
         for tk in universe:
             df = get_bars(tk, "1Day", days)
-            if df is None or len(df) < _WARMUP + hold_days + 5:
-                continue
+            if df is not None and len(df) >= _WARMUP + hold_days + 5:
+                bars[tk] = df
+        # ── single-name predicate pass ──
+        for tk, df in bars.items():
             last_fire = {}   # detector -> last bar index fired (cooldown)
             for i in range(_WARMUP, len(df) - hold_days - 1):
                 win = df.iloc[: i + 1]
@@ -216,6 +283,13 @@ def run(universe: list, years: int = 3, hold_days: int = 10,
                         edge = round(net - bench, 3)
                     trades.append({"detector": name, "direction": d, "regime": rgm,
                                    "net": net, "edge": edge, "date": edate})
+
+        # ── cross-sectional momentum pass (TREND_MOMENTUM) ──
+        try:
+            trades += _momentum_pass(bars, spy_close, spy_dates, regime,
+                                     hold_days, exit_params, cost_pct, regime_gate)
+        except Exception as _me:
+            logger.debug(f"[hist_backtest] momentum pass failed: {_me}")
 
         # ── aggregate ──
         def _agg(rows):
