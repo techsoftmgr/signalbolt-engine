@@ -92,18 +92,106 @@ def _compression(win):
     return None
 
 
-# Tier-1 single-name predicates registered so far (extended + validated over time)
+def _rsi(closes, period=14):
+    import numpy as np
+    if len(closes) < period + 1:
+        return 50.0
+    delta = np.diff(closes[-(period + 1):])
+    gain = np.where(delta > 0, delta, 0.0).mean()
+    loss = np.where(delta < 0, -delta, 0.0).mean()
+    if loss == 0:
+        return 100.0
+    return 100.0 - 100.0 / (1.0 + gain / loss)
+
+
+def _breakout_forming(win):
+    # LONG: pressing the 20-day high on volume, NOT yet broken (anticipatory)
+    if len(win) < 21:
+        return None
+    today = win.iloc[-1]; prior = win.iloc[-21:-1]; hi = prior["high"].max()
+    if (today["close"] < hi and today["close"] >= hi * 0.985
+            and today["volume"] >= 1.5 * prior["volume"].mean()):
+        return "LONG"
+    return None
+
+
+def _breakdown_forming(win):
+    # SHORT: lost the 20-day average on heavy down-volume, not yet at the 20d low
+    if len(win) < 21:
+        return None
+    today = win.iloc[-1]; prior = win.iloc[-20:]
+    ma = prior["close"].mean(); lo = win.iloc[-21:-1]["low"].min()
+    if (today["close"] < ma and today["close"] > lo and today["close"] < today["open"]
+            and today["volume"] >= 1.5 * prior["volume"].mean()):
+        return "SHORT"
+    return None
+
+
+def _peak(win):
+    # SHORT: exhaustion top — overbought + bearish reversal near a recent high
+    if len(win) < 21:
+        return None
+    closes = win["close"].values
+    today = win.iloc[-1]; prior = win.iloc[-21:-1]; hi = prior["high"].max()
+    if (_rsi(closes) > 68 and today["close"] < today["open"]
+            and today["close"] < closes[-2] and today["close"] >= hi * 0.95):
+        return "SHORT"
+    return None
+
+
+def _turnaround(win):
+    # LONG: oversold reversal near a recent low (bottoming)
+    if len(win) < 21:
+        return None
+    closes = win["close"].values
+    today = win.iloc[-1]; prior = win.iloc[-21:-1]; lo = prior["low"].min()
+    if (_rsi(closes) < 32 and today["close"] > today["open"]
+            and today["close"] > closes[-2] and today["close"] <= lo * 1.05):
+        return "LONG"
+    return None
+
+
+def _pullback(win):
+    # LONG: pullback reclaim inside an uptrend (dip below SMA20 then back above)
+    if len(win) < 55:
+        return None
+    import numpy as np
+    closes = win["close"].values
+    sma20 = np.mean(closes[-20:]); sma50 = np.mean(closes[-50:])
+    today = win.iloc[-1]
+    if today["close"] > sma50 and sma20 > sma50:
+        if win.iloc[-5:]["low"].min() < sma20 and today["close"] > sma20:
+            return "LONG"
+    return None
+
+
+def _swing_breakout(win):
+    # LONG: break of a 50-day swing high on volume (longer-horizon breakout)
+    if len(win) < 51:
+        return None
+    today = win.iloc[-1]; prior = win.iloc[-51:-1]
+    if today["close"] >= prior["high"].max() and today["volume"] >= 1.4 * prior["volume"].mean():
+        return "LONG"
+    return None
+
+
+# Tier-1 single-name predicates (approximations of the live detectors)
 DETECTORS = {
-    "BREAKOUT":        _breakout,
-    "BREAKDOWN":       _breakdown,
-    "ACCUM_FORMING":   _accum_forming,
-    "DISTRIB_FORMING": _distrib_forming,
-    "COMPRESSION":     _compression,
+    "BREAKOUT":          _breakout,
+    "BREAKDOWN":         _breakdown,
+    "ACCUM_FORMING":     _accum_forming,
+    "DISTRIB_FORMING":   _distrib_forming,
+    "COMPRESSION":       _compression,
+    "BREAKOUT_FORMING":  _breakout_forming,
+    "BREAKDOWN_FORMING": _breakdown_forming,
+    "PEAK":              _peak,
+    "TURNAROUND":        _turnaround,
+    "PULLBACK":          _pullback,
+    "SWING_BREAKOUT":    _swing_breakout,
 }
 
-# Documented but NOT YET registered (fidelity work pending) / un-backtestable:
-PENDING = ["BREAKOUT_FORMING", "BREAKDOWN_FORMING", "PEAK", "TURNAROUND",
-           "PULLBACK", "SWING_BREAKOUT"]   # TREND_MOMENTUM now via _momentum_pass
+# All Tier-1 single-name + TREND_MOMENTUM now registered. Tier-2/3 below.
+PENDING = []   # TREND_MOMENTUM via _momentum_pass; Tier-1 all registered
 CANNOT_BACKTEST = ["OPTIONS_FLOW", "DARK_POOL", "DEEP_VALUE",
                    "EMA_RECLAIM (intraday)", "GAP_ENGINE (intraday)"]
 
