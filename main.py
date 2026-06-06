@@ -707,6 +707,40 @@ def phase2_threat_radar():
     return threat_radar.compute()
 
 
+@app.get("/phase2/community-intel")
+def phase2_community_intel(limit: int = 15):
+    """Hype vs Reality per trending ticker. Gated by PHASE2_COMMUNITY_INTEL."""
+    from engine.phase2 import flags, community_intel
+    if not flags.enabled("community_intel"):
+        return {"enabled": False}
+    from engine import runner
+    return community_intel.compute(runner._supabase(), limit=max(3, min(int(limit), 30)))
+
+
+@app.get("/phase2/watchlist-intel")
+def phase2_watchlist_intel(tickers: str = ""):
+    """Watchlist Intelligence — priority ranking + opportunity board for the given
+    comma-separated tickers. Gated by PHASE2_WATCHLIST_INTEL."""
+    from engine.phase2 import flags, watchlist_intel
+    if not flags.enabled("watchlist_intel"):
+        return {"enabled": False}
+    from engine import runner
+    tks = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    return watchlist_intel.compute(runner._supabase(), tks)
+
+
+@app.get("/phase2/position-coach")
+def phase2_position_coach(ticker: str, entry: float = None, size: float = None,
+                          current: float = None, account: float = None,
+                          risk_tolerance: str = "moderate"):
+    """AI Position Coach — assessment + scenario engine. Gated by PHASE2_POSITION_COACH."""
+    from engine.phase2 import flags, position_coach
+    if not flags.enabled("position_coach"):
+        return {"enabled": False}
+    return position_coach.assess(ticker, entry=entry, size=size, current=current,
+                                 account=account, risk_tolerance=risk_tolerance)
+
+
 @app.post("/admin/run-bo-poc")
 def run_bo_poc_now(request: Request):
     """Manually fire the BO_POC breakout scan (fidelity-matched confirmed-daily-
