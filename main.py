@@ -684,6 +684,36 @@ def get_regime_history(hours: int = 48):
         return {"hours": int(hours), "count": 0, "transitions": [], "error": str(e)}
 
 
+@app.post("/admin/replay-backtest")
+def post_replay_backtest(request: Request, days: int = 45, detector: str = None,
+                         stop_pct: float = 3.0, target_pct: float = None,
+                         trail_pct: float = None, breakeven_at_pct: float = None,
+                         time_stop_bars: int = None, timeframe: str = "15Min",
+                         horizon_days: int = 7):
+    """Replay closed signals on REAL Alpaca SIP bars under a candidate exit policy
+    → aggregate vs the as-traded baseline. The A/B tool for SL/TP tuning. Admin."""
+    _user_id, sb = _require_admin_jwt(request)
+    from engine import replay_backtest
+    params = {"stop_pct": stop_pct, "target_pct": target_pct, "trail_pct": trail_pct,
+              "breakeven_at_pct": breakeven_at_pct, "time_stop_bars": time_stop_bars}
+    return replay_backtest.run_param_set(
+        sb, params, days=max(1, min(int(days), 180)), detector=detector,
+        horizon_days=max(1, min(int(horizon_days), 30)), timeframe=timeframe)
+
+
+@app.get("/admin/exit-optimizer")
+def get_exit_optimizer(request: Request, detector: str, days: int = 90,
+                       timeframe: str = "15Min", horizon_days: int = 7):
+    """ADVISORY learned exit policy for a detector — walk-forward best SL/TP/trail
+    over real SIP bars, gated by a sample floor + OOS improvement. Does NOT change
+    firing/exits. Admin."""
+    _user_id, sb = _require_admin_jwt(request)
+    from engine import exit_optimizer
+    return exit_optimizer.optimize(sb, detector, days=max(7, min(int(days), 365)),
+                                   horizon_days=max(1, min(int(horizon_days), 30)),
+                                   timeframe=timeframe)
+
+
 @app.get("/admin/detector-policy")
 def get_detector_policy(request: Request, days: int = 45):
     """ADVISORY detector-tuning policy: per (detector × regime bucket), the
