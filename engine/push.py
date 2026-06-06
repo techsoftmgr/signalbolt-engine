@@ -41,6 +41,7 @@ _DEFAULT_PREFS = {
     "breakout_alerts":  True, # universe-wide breakout alerts (broke 20-day high on vol)
     "accumulation_alerts": True, # universe-wide unusual-buying (heavy up-volume) alerts
     "premarket_gap_alerts": True, # premarket disaster-gap heads-up for open overnight positions (notification only)
+    "commentary_alerts": True,    # live intraday events on a watched ticker (MACD cross, breakout, VWAP, gap, sharp move)
 }
 
 # Single Supabase client reused for the lifetime of the process
@@ -665,6 +666,53 @@ def send_watchlist_state_alert(ticker: str, title: str, body: str, sb: Client | 
         return len(messages)
     except Exception as e:
         logger.debug(f"[push] watchlist state alert failed for {ticker}: {e}")
+        return 0
+
+
+def send_commentary_alert(
+    ticker: str,
+    title: str,
+    body: str,
+    event_type: str | None = None,
+    sb: Client | None = None,
+) -> int:
+    """
+    Notify users who WATCH `ticker` of a notable LIVE intraday event on it
+    (MACD cross, opening-range break, VWAP reclaim/lose, gap, sharp move) — the
+    push half of the Ticker Commentary "Today's Tape". Watchlist-scoped, gated by
+    the 'commentary_alerts' pref (default on). Returns the number dispatched; the
+    caller (commentary_alerts.run) handles new-event detection + per-day caps so
+    this never spams. Educational awareness, not advice.
+    """
+    try:
+        client = sb or _supabase()
+        _record_alert("commentary", ticker, title, body, stage=event_type,
+                      data={"ticker": ticker, "event": event_type}, sb=client)
+
+        watchers = (
+            client.table("watchlist").select("user_id").eq("ticker", ticker).execute().data
+        ) or []
+        user_ids = list({w["user_id"] for w in watchers if w.get("user_id")})
+        if not user_ids:
+            return 0
+        tokens = _tokens_for_users(user_ids, "commentary_alerts")   # all devices, pref-gated
+        if not tokens:
+            return 0
+        messages = [
+            {
+                "to":    t,
+                "title": title,
+                "body":  body,
+                "data":  {"type": "commentary_alert", "ticker": ticker, "event": event_type},
+                "sound": "default",
+                "badge": 1,
+            }
+            for t in tokens
+        ]
+        _dispatch(messages, f"CMT {ticker} {event_type or ''}")
+        return len(messages)
+    except Exception as e:
+        logger.debug(f"[push] commentary alert failed for {ticker}: {e}")
         return 0
 
 

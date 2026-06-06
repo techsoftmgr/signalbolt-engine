@@ -2907,6 +2907,31 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled watchlist state-change alerts every 15 min")
 
+    # ── Ticker Commentary alerts (V2) — live intraday events on WATCHED tickers ──
+    # Pushes NEW high-severity intraday events (MACD cross / ORB / gap / sharp move
+    # / VWAP) on a user's watched names. Watchlist-scoped + pref-gated; cold-start
+    # seeds (no burst), per-ticker/day cap. ENV-gated by COMMENTARY_ALERTS_ENABLED
+    # so it ships dark and is flipped on via a Fly secret.
+    def _run_commentary_alerts():
+        try:
+            from engine.session_classifier import is_market_open_now
+            if not is_market_open_now():
+                return
+            from engine import commentary_alerts
+            commentary_alerts.run(_supabase())
+        except Exception as _e:
+            logger.error(f"[runner] commentary alerts failed: {_e}")
+
+    scheduler.add_job(
+        _run_commentary_alerts,
+        trigger=IntervalTrigger(minutes=10),
+        id="commentary_alerts",
+        name="Ticker Commentary intraday alerts (10-min)",
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=120),
+    )
+    logger.info("[runner] Scheduled ticker-commentary alerts every 10 min (env-gated)")
+
     # ── Breakdown / heavy-selling alerts (universe-wide, 15-min) ─────────────
     # Two-stage broadcast: EARLY (lost 20-day avg on heavy down-vol) + CONFIRMED
     # (broke 20-day low on vol). Reuses the cached full quant scan; per-ticker
