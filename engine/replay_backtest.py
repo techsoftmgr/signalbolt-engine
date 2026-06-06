@@ -52,6 +52,11 @@ def replay(direction: str, entry: float, bars: list, params: dict) -> dict:
     target_pct = float(target_pct) if target_pct is not None else None
     trail_pct  = float(trail_pct) if trail_pct is not None else None
     be_at      = float(be_at) if be_at is not None else None
+    # MACD profit-lock: once favorable >= macd_lock_arm %, exit at close when the
+    # MACD histogram flips AGAINST the position (the live signal_advisor's intent).
+    macd_hist  = params.get("macd_hist")
+    macd_arm   = params.get("macd_lock_arm")
+    macd_arm   = float(macd_arm) if macd_arm is not None else None
 
     def pnl(price):
         return ((price - entry) if is_long else (entry - price)) / entry * 100.0
@@ -93,6 +98,15 @@ def replay(direction: str, entry: float, bars: list, params: dict) -> dict:
         if trail_pct is not None:
             trailed = peak_pnl - trail_pct
             stop_pnl = trailed if stop_pnl is None else max(stop_pnl, trailed)
+        if (macd_arm is not None and macd_hist is not None and i > 0
+                and i < len(macd_hist)):
+            cp = pnl(close)
+            mp, mn = macd_hist[i - 1], macd_hist[i]
+            if cp >= macd_arm and mp is not None and mn is not None:
+                flipped = (mp > 0 >= mn) if is_long else (mp < 0 <= mn)
+                if flipped:                          # momentum turned against us in profit
+                    realized, reason = cp, "macd_lock"
+                    break
         if time_stop is not None and held >= int(time_stop):
             realized, reason = pnl(close), "time"
             break

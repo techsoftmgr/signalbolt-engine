@@ -92,6 +92,14 @@ def _compression(win):
     return None
 
 
+def _macd_hist_series(closes):
+    """MACD histogram (12/26/9) aligned to each close — for the profit-lock exit."""
+    import pandas as pd
+    s = pd.Series(closes, dtype="float64")
+    macd = s.ewm(span=12, adjust=False).mean() - s.ewm(span=26, adjust=False).mean()
+    return (macd - macd.ewm(span=9, adjust=False).mean()).values
+
+
 def _rsi(closes, period=14):
     import numpy as np
     if len(closes) < period + 1:
@@ -261,11 +269,12 @@ def _momentum_pass(bars, spy_close, spy_dates, regime, hold_days, exit_params,
         info[tk] = (df, df["close"].values.astype(float),
                     df["close"].rolling(50).mean().values,
                     df["close"].rolling(200).mean().values,
-                    {str(df.index[i].date())[:10]: i for i in range(len(df))})
+                    {str(df.index[i].date())[:10]: i for i in range(len(df))},
+                    _macd_hist_series(df["close"].values))
     out = []
     for rd in spy_dates[200::rebal]:
         cands = []
-        for tk, (df, closes, sma50, sma200, pos) in info.items():
+        for tk, (df, closes, sma50, sma200, pos, _m) in info.items():
             i = pos.get(rd)
             if i is None or i < lookback or i >= len(closes) - hold_days - 1:
                 continue
@@ -280,12 +289,14 @@ def _momentum_pass(bars, spy_close, spy_dates, regime, hold_days, exit_params,
             rgm = regime.get(rd, "NEUTRAL")
             if regime_gate and not _regime_allows("LONG", rgm):
                 continue
-            df, closes = info[tk][0], info[tk][1]
+            df, closes, macd = info[tk][0], info[tk][1], info[tk][5]
             fwd = df.iloc[i + 1: i + 1 + hold_days]
             fwd_bars = [(float(r.high), float(r.low), float(r.close)) for r in fwd.itertuples()]
             if not fwd_bars:
                 continue
-            res = replay("LONG", float(closes[i]), fwd_bars, {**exit_params, "cost_pct": cost_pct})
+            res = replay("LONG", float(closes[i]), fwd_bars,
+                         {**exit_params, "cost_pct": cost_pct,
+                          "macd_hist": list(macd[i + 1: i + 1 + hold_days])})
             if res.get("outcome") is None:
                 continue
             net = res["realized_net_pct"]
@@ -327,6 +338,7 @@ def run(universe: list, years: int = 3, hold_days: int = 10,
                 bars[tk] = df
         # ── single-name predicate pass ──
         for tk, df in bars.items():
+            macd_full = _macd_hist_series(df["close"].values)
             last_fire = {}   # detector -> last bar index fired (cooldown)
             for i in range(_WARMUP, len(df) - hold_days - 1):
                 win = df.iloc[: i + 1]
@@ -353,7 +365,9 @@ def run(universe: list, years: int = 3, hold_days: int = 10,
                     if regime_gate and not _regime_allows(d, rgm):
                         continue   # live engine would have blocked this regime/direction
                     last_fire[name] = i
-                    out = replay(d, entry_px, fwd_bars, {**exit_params, "cost_pct": cost_pct})
+                    macd_slice = list(macd_full[i + 1: i + 1 + hold_days])
+                    out = replay(d, entry_px, fwd_bars,
+                                 {**exit_params, "cost_pct": cost_pct, "macd_hist": macd_slice})
                     if out.get("outcome") is None:
                         continue
                     net = out["realized_net_pct"]
