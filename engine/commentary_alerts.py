@@ -41,7 +41,10 @@ def _enabled() -> bool:
 
 
 def _alertworthy(ev: dict) -> bool:
-    return ev.get("type") in _ALERT_TYPES and int(ev.get("severity") or 0) >= _MIN_SEVERITY
+    # Never push counter-trend events — they're "watch only", not actionable.
+    return (ev.get("type") in _ALERT_TYPES
+            and int(ev.get("severity") or 0) >= _MIN_SEVERITY
+            and not ev.get("against_trend"))
 
 
 def _new_events(events: list, last_iso: str | None) -> list:
