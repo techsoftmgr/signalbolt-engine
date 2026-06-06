@@ -239,35 +239,34 @@ def _simulate_outcome(
 
 
 # ---------------------------------------------------------------------------
-# Fetch historical candles (yfinance — no API cost)
+# Fetch historical candles (Alpaca SIP — real tape, NOT yfinance synthetic)
 # ---------------------------------------------------------------------------
 
+# yfinance interval/period strings → Alpaca timeframe
+_TF_MAP = {"5m": "5Min", "15m": "15Min", "30m": "30Min", "1h": "1Hour", "1d": "1Day"}
+
+
 def _fetch_historical(ticker: str, interval: str, period: str) -> pd.DataFrame:
+    """Real OHLCV from Alpaca SIP (replaces the old yfinance source — too weak to
+    tune real-money rules). Returns lowercase-column df with a 'timestamp' column,
+    or empty df on failure."""
     try:
-        df = yf.download(
-            ticker, period=period, interval=interval,
-            auto_adjust=True, progress=False,
-        )
-        if df.empty or len(df) < 50:
+        from engine.alpaca_client import get_bars
+        tf = _TF_MAP.get(interval, "15Min")
+        try:
+            days = int("".join(c for c in str(period) if c.isdigit()) or "60")
+        except Exception:
+            days = 60
+        df = get_bars(ticker, tf, max(2, days))
+        if df is None or df.empty or len(df) < 50:
             return pd.DataFrame()
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [col[0] for col in df.columns]
-
-        df.columns = [c.lower() for c in df.columns]
         df = df.reset_index()
-
-        for col in ("datetime", "date", "Datetime", "Date"):
-            if col in df.columns:
-                df = df.rename(columns={col: "timestamp"})
-                break
-
-        if "timestamp" not in df.columns:
-            df["timestamp"] = df.index
-
+        first = df.columns[0]                       # get_bars indexes by UTC timestamp
+        df = df.rename(columns={first: "timestamp"})
+        df.columns = [str(c).lower() for c in df.columns]
         return df.sort_values("timestamp").reset_index(drop=True)
     except Exception as e:
-        logger.debug(f"[backtest] Fetch error for {ticker}: {e}")
+        logger.debug(f"[backtest] Alpaca fetch error for {ticker}: {e}")
         return pd.DataFrame()
 
 
