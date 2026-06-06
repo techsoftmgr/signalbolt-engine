@@ -143,6 +143,8 @@ def generate(sb, r: dict, kind: str) -> dict:
     try:
         from engine import signal_telemetry
         regime_type, study = signal_telemetry.capture(sb, tk, direction, strat)
+        if not regime_type:
+            regime_type = signal_telemetry.live_regime_type()
     except Exception:
         regime_type, study = "", {}
     try:
