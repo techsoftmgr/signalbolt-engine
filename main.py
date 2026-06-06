@@ -684,6 +684,29 @@ def get_regime_history(hours: int = 48):
         return {"hours": int(hours), "count": 0, "transitions": [], "error": str(e)}
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# PHASE 2 — Trader Intelligence (ADDITIVE, feature-flagged, removable). These
+# endpoints only READ existing data; if a flag is off they return {enabled:false}
+# and do nothing. Deleting this block + engine/phase2/ removes Phase 2 entirely.
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.get("/phase2/flags")
+def phase2_flags():
+    """Current Phase 2 feature-flag state."""
+    from engine.phase2 import flags
+    return {"flags": flags.all_flags()}
+
+
+@app.get("/phase2/threat-radar")
+def phase2_threat_radar():
+    """Market Threat Radar — GREEN/YELLOW/ORANGE/RED + 0-100 score + factors +
+    plain-English summary. Read-only; gated by PHASE2_THREAT_RADAR."""
+    from engine.phase2 import flags, threat_radar
+    if not flags.enabled("threat_radar"):
+        return {"enabled": False}
+    return threat_radar.compute()
+
+
 @app.post("/admin/run-bo-poc")
 def run_bo_poc_now(request: Request):
     """Manually fire the BO_POC breakout scan (fidelity-matched confirmed-daily-
