@@ -72,14 +72,41 @@ def test_opening_gap_emitted():
     assert gaps and gaps[0]["tone"] == "bullish", _types(ev)
 
 
-def test_ideas_are_educational_never_advice():
+def test_intraday_idea_educational_and_rr_floor():
+    # good R:R bullish setup → idea, educational, rr >= floor
+    good = tc._intraday_idea("bullish", price=100.0, swing_lo=98.0, swing_hi=112.0, atr=1.0)
+    assert good is not None and good["rr"] >= tc._MIN_RR
+    assert "not advice" in good["text"].lower()
+    assert "buy now" not in good["text"].lower() and "guaranteed" not in good["text"].lower()
+    # poor R:R (target barely above entry, stop far) → suppressed entirely
+    poor = tc._intraday_idea("bullish", price=100.0, swing_lo=95.0, swing_hi=100.4, atr=1.0)
+    assert poor is None
+
+
+def test_bias_gate_blocks_counter_trend_idea():
+    # a decline→rally produces a bullish MACD cross
     closes = list(np.linspace(100, 90, 30)) + list(np.linspace(90, 106, 18))
-    ev = tc._detect_tf(_df(closes), "5m", prior_close=None, want_ideas=True)
-    ideas = [e["idea"] for e in ev if e.get("idea")]
-    for idea in ideas:
-        t = idea["text"].lower()
-        assert "not advice" in t or "educational" in t
-        assert "buy now" not in t and "guaranteed" not in t and "sure profit" not in t
+    # WITH the tape (bias up) → the bullish cross may carry an idea
+    up = tc._detect_tf(_df(closes), "5m", prior_close=None, want_ideas=True, bias="up")
+    up_macd = [e for e in up if e["type"] == "MACD_CROSS" and e["tone"] == "bullish"]
+    assert up_macd
+    assert any("idea" in e for e in up_macd)            # aligned → idea allowed
+    # AGAINST the tape (bias down) → same bullish cross gets flagged, NO idea
+    dn = tc._detect_tf(_df(closes), "5m", prior_close=None, want_ideas=True, bias="down")
+    dn_macd = [e for e in dn if e["type"] == "MACD_CROSS" and e["tone"] == "bullish"]
+    assert dn_macd
+    assert all("idea" not in e for e in dn_macd)         # counter-trend → never an idea
+    assert all(e.get("against_trend") for e in dn_macd)
+    assert any("counter-trend" in e["detail"].lower() for e in dn_macd)
+
+
+def test_session_bias_up_down_neutral():
+    up5 = _df(list(np.linspace(100, 110, 40)))
+    up15 = tc._resample(up5, "15min")
+    assert tc._session_bias(up5, up15) == "up"
+    dn5 = _df(list(np.linspace(110, 100, 40)))
+    dn15 = tc._resample(dn5, "15min")
+    assert tc._session_bias(dn5, dn15) == "down"
 
 
 def test_cooldown_limits_repeat_events():

@@ -92,25 +92,38 @@ def _round(v) -> float:
 
 
 # ── educational intraday idea (no advice language) ────────────────────────────
-def _intraday_idea(tone: str, price: float, swing_lo: float, swing_hi: float, atr: float) -> dict | None:
+# Stops sit a buffer BEYOND the recent swing (not right at it) so a normal wick
+# doesn't trigger them, and an idea is only returned when R:R clears _MIN_RR —
+# a sub-1 reward-to-risk "idea" is no idea at all.
+_MIN_RR = 1.2
+_STOP_BUFFER_ATR = 0.3
+
+
+def _intraday_idea(tone: str, price: float, swing_lo: float, swing_hi: float, atr: float,
+                   min_rr: float = _MIN_RR) -> dict | None:
     if not price or not atr:
         return None
+    buf = _STOP_BUFFER_ATR * atr
     if tone == "bullish":
-        stop = _round(min(swing_lo, price - 1.2 * atr))
+        stop = _round(min(swing_lo, price - 1.2 * atr) - buf)   # below the swing low + buffer
         tgt = _round(max(swing_hi, price + 1.6 * atr))
         if price <= stop:
             return None
-        rr = (tgt - price) / (price - stop) if price > stop else 0
+        rr = (tgt - price) / (price - stop)
+        if rr < min_rr:
+            return None
         return {"bias": "long", "entry": _round(price), "invalidation": stop, "target": tgt,
                 "rr": round(rr, 1),
                 "text": f"Intraday: setup favors a long near ${_round(price)} — invalidation below "
                         f"${stop}, first upside ~${tgt} (R:R {round(rr,1)}). Educational, not advice."}
     if tone == "bearish":
-        stop = _round(max(swing_hi, price + 1.2 * atr))
+        stop = _round(max(swing_hi, price + 1.2 * atr) + buf)   # above the swing high + buffer
         tgt = _round(min(swing_lo, price - 1.6 * atr))
         if price >= stop:
             return None
-        rr = (price - tgt) / (stop - price) if stop > price else 0
+        rr = (price - tgt) / (stop - price)
+        if rr < min_rr:
+            return None
         return {"bias": "short", "entry": _round(price), "invalidation": stop, "target": tgt,
                 "rr": round(rr, 1),
                 "text": f"Intraday: setup favors a short near ${_round(price)} — invalidation above "
@@ -118,10 +131,37 @@ def _intraday_idea(tone: str, price: float, swing_lo: float, swing_hi: float, at
     return None
 
 
+def _session_bias(df5: pd.DataFrame, df15: pd.DataFrame | None) -> str:
+    """The day's dominant direction from price-vs-VWAP + the 15m EMA9/21.
+    'up' / 'down' require BOTH to agree; otherwise 'neutral'. Ideas only fire WITH
+    this bias; counter-trend events are flagged 'watch only'. Per-ticker intraday
+    only — does NOT use the market regime detector."""
+    try:
+        price = float(df5["close"].iloc[-1])
+        above_vwap = price > _vwap(df5)[-1]
+        if df15 is not None and len(df15) >= 21:
+            e9 = _ema(df15["close"], 9)[-1]
+            e21 = _ema(df15["close"], 21)[-1]
+            if above_vwap and e9 > e21:
+                return "up"
+            if (not above_vwap) and e9 < e21:
+                return "down"
+            return "neutral"
+        # 15m not available yet → VWAP-only lean
+        return "up" if above_vwap else "down"
+    except Exception:
+        return "neutral"
+
+
 # ── event detection (pure walk over one timeframe) ────────────────────────────
 def _detect_tf(df: pd.DataFrame, tf_label: str, prior_close: float | None,
-               want_ideas: bool) -> list[dict]:
-    """Walk the bars of one timeframe and emit transition events. Pure."""
+               want_ideas: bool, bias: str = "neutral") -> list[dict]:
+    """Walk the bars of one timeframe and emit transition events. Pure.
+
+    `bias` ('up'/'down'/'neutral') is the session direction: ideas attach ONLY to
+    events that agree with it, and events that oppose it are flagged
+    `against_trend` (and never carry an idea) so the feed doesn't read as a
+    direction flip on every counter-trend wiggle."""
     n = len(df)
     if n < 16:
         return []
@@ -145,11 +185,20 @@ def _detect_tf(df: pd.DataFrame, tf_label: str, prior_close: float | None,
     def ok(kind: str, i: int) -> bool:
         return (i - last_emit.get(kind, -10_000)) >= _COOLDOWN.get(kind, 4)
 
+    def _against(tone: str) -> bool:
+        return (tone == "bullish" and bias == "down") or (tone == "bearish" and bias == "up")
+
     def emit(kind, i, tone, sev, title, detail, price, idea=None):
         last_emit[kind] = i
+        against = _against(tone)
+        if against:
+            detail = f"{detail} Counter-trend — the tape is {bias}; lower-odds, watch only."
         ev = {"time": idx[i].isoformat(), "tf": tf_label, "type": kind, "tone": tone,
-              "severity": sev, "title": title, "detail": detail, "price": _round(price)}
-        if idea:
+              "severity": sev, "title": title, "detail": detail, "price": _round(price),
+              "against_trend": against}
+        # An idea is attached ONLY when it agrees with the session bias — never
+        # against the tape (that's what produced the losing counter-trend long).
+        if idea and not against:
             ev["idea"] = idea
         events.append(ev)
 
@@ -174,15 +223,18 @@ def _detect_tf(df: pd.DataFrame, tf_label: str, prior_close: float | None,
     for i in range(warm, n):
         atr = float(np.mean(tr[max(0, i - 14):i])) if i > 1 else 0.0
 
-        # MACD histogram sign flip = MACD/signal cross
+        # MACD histogram sign flip = MACD/signal cross. Ideas only when the cross
+        # AGREES with the session bias (no counter-trend ideas).
         if ok("MACD_CROSS", i) and hist[i - 1] is not None:
             if hist[i - 1] <= 0 < hist[i]:
-                idea = _intraday_idea("bullish", px[i], float(np.min(low[max(0, i - 6):i + 1])), sess_hi, atr) if want_ideas and ok("IDEA", i) else None
+                make = want_ideas and bias == "up" and ok("IDEA", i)
+                idea = _intraday_idea("bullish", px[i], float(np.min(low[max(0, i - 6):i + 1])), sess_hi, atr) if make else None
                 if idea: last_emit["IDEA"] = i
                 emit("MACD_CROSS", i, "bullish", 3, f"MACD bullish crossover ({tf_label})",
                      f"MACD crossed above its signal at ${_round(px[i])} — momentum turning up.", px[i], idea)
             elif hist[i - 1] >= 0 > hist[i]:
-                idea = _intraday_idea("bearish", px[i], sess_lo, float(np.max(high[max(0, i - 6):i + 1])), atr) if want_ideas and ok("IDEA", i) else None
+                make = want_ideas and bias == "down" and ok("IDEA", i)
+                idea = _intraday_idea("bearish", px[i], sess_lo, float(np.max(high[max(0, i - 6):i + 1])), atr) if make else None
                 if idea: last_emit["IDEA"] = i
                 emit("MACD_CROSS", i, "bearish", 3, f"MACD bearish crossover ({tf_label})",
                      f"MACD crossed below its signal at ${_round(px[i])} — momentum turning down.", px[i], idea)
@@ -280,12 +332,20 @@ def build(symbol: str, now: datetime | None = None) -> dict:
         if df5 is None or len(df5) < 16:
             return _unavailable(sym, "Not enough bars in the current session yet — check back after the open.")
 
-        events = _detect_tf(df5, "5m", prior_close, want_ideas=True)
+        # Session bias from VWAP + the 15m EMA9/21 — ideas fire only WITH it.
         try:
             df15 = _resample(df5, "15min")
-            events += _detect_tf(df15, "15m", None, want_ideas=False)
         except Exception:
-            pass
+            df15 = None
+        bias = _session_bias(df5, df15)
+
+        # 5m = awareness events (no ideas — too noisy). 15m = where ideas attach.
+        events = _detect_tf(df5, "5m", prior_close, want_ideas=False, bias=bias)
+        if df15 is not None and len(df15) >= 16:
+            try:
+                events += _detect_tf(df15, "15m", None, want_ideas=True, bias=bias)
+            except Exception:
+                pass
 
         # newest first, cap, and pull the most recent idea forward as the "current" idea
         events.sort(key=lambda e: e["time"], reverse=True)
@@ -296,15 +356,19 @@ def build(symbol: str, now: datetime | None = None) -> dict:
         bull = sum(1 for e in events if e["tone"] == "bullish")
         bear = sum(1 for e in events if e["tone"] == "bearish")
         lean = "bullish" if bull > bear + 1 else "bearish" if bear > bull + 1 else "mixed"
-        summary = (f"{len(events)} event(s) today — intraday tape leans {lean} "
-                   f"({bull} bullish / {bear} bearish)." if events
-                   else "Quiet tape so far — no notable intraday technical events yet.")
+        bias_word = {"up": "UP", "down": "DOWN"}.get(bias, "NEUTRAL")
+        ct = " Counter-trend bounces are lower-odds." if bias in ("up", "down") else ""
+        if events:
+            summary = (f"Tape bias: {bias_word}. {len(events)} event(s) today "
+                       f"({bull} bullish / {bear} bearish).{ct}")
+        else:
+            summary = f"Tape bias: {bias_word}. Quiet tape so far — no notable intraday events yet."
 
         return {
             "available": True, "ticker": sym,
             "session_date": str(last_day),
             "as_of": (now or datetime.now(timezone.utc)).isoformat(),
-            "price": last_px, "lean": lean, "summary": summary,
+            "price": last_px, "bias": bias, "lean": lean, "summary": summary,
             "current_idea": current_idea, "events": events,
             "disclaimer": _DISCLAIMER,
         }
