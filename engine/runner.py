@@ -2507,6 +2507,19 @@ def _run_drawdown_regime_log() -> None:
         logger.debug(f"[runner] drawdown regime log failed: {e}")
 
 
+def _run_bo_poc() -> str | None:
+    """BO_POC — fire the fidelity-matched confirmed-daily-close 20d-high breakout
+    POC, once after the close. Isolated; does not touch production BREAKOUT."""
+    try:
+        from engine import bo_poc
+        n = bo_poc.scan(_supabase())
+        logger.info(f"[runner] ═══ BO_POC scan fired {n} ═══")
+        return f"{n} fired"
+    except Exception as e:
+        logger.error(f"[runner] BO_POC scan failed: {e}")
+        return None
+
+
 def _run_fundamentals_refresh() -> None:
     """Rolling refresh of the EDGAR fundamentals quality screen — a stale batch
     each run. Fundamentals change quarterly, so a few runs/day covers the whole
@@ -3238,6 +3251,16 @@ def start_scheduler() -> BackgroundScheduler:
         replace_existing=True,
     )
     logger.info("[runner] Scheduled drawdown-regime log (4:12 PM ET)")
+
+    # ── BO_POC — fidelity-matched breakout POC (after close, Mon-Fri) ────
+    scheduler.add_job(
+        _run_bo_poc,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=16, minute=10, timezone="America/New_York"),
+        id="bo_poc",
+        name="BO_POC fidelity-matched breakout POC (4:10 PM ET)",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled BO_POC breakout POC (4:10 PM ET, Mon-Fri)")
 
     # ── Deep-value combine (crash/deep-value long-term BUY signal) ───────
     # Daily, post-close. Regime-gated → no-ops until a real -20% drawdown, then
