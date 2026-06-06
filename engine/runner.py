@@ -3016,9 +3016,12 @@ def start_scheduler() -> BackgroundScheduler:
             from engine import daily_performance
             row = daily_performance.compute_and_store(_supabase())
             if row:
+                # Lead with the HONEST equal-weight account return (avg/trade);
+                # closed_net_pct is the SUM of trade %s, NOT an account return.
                 return (f"{row.get('closed_n', 0)} closed · win {row.get('closed_win_rate')}% · "
-                        f"net {row.get('closed_net_pct')}% · active {row.get('active_n', 0)} · "
-                        f"giveback {row.get('giveback_pct')}%")
+                        f"acct {row.get('closed_avg_pct')}%/trade (equal-wt) · "
+                        f"Σ {row.get('closed_net_pct')}% (sum, not a return) · "
+                        f"active {row.get('active_n', 0)} · giveback {row.get('giveback_pct')}%")
         except Exception as _e:
             logger.error(f"[runner] daily performance snapshot failed: {_e}")
 
