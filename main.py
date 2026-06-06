@@ -4713,6 +4713,28 @@ async def ticker_commentary_feed(request: Request, symbol: str):
         return {"available": False, "ticker": sym, "note": "Commentary unavailable."}
 
 
+@app.get("/market/commentary")
+async def market_commentary_feed(request: Request):
+    """Market Tape — a market-wide play-by-play (pre-market → after-hours): risk
+    bias header, index technical events (SPY/QQQ), VIX/regime, sector rotation,
+    scheduled catalysts (econ calendar), and a market-moving policy/headline
+    stream. Read-only, best-effort. Technical wording scrubbed for non-admins."""
+    _require_jwt(request)
+    try:
+        from engine import market_commentary
+        res = market_commentary.build()
+        if not _is_admin_request(request):
+            try:
+                from engine import plainspeak
+                res = plainspeak.scrub(res)
+            except Exception:
+                pass
+        return res
+    except Exception as e:
+        logger.debug(f"GET /market/commentary error: {e}")
+        return {"available": False, "note": "Market tape unavailable."}
+
+
 # ── News Reaction Feed ────────────────────────────────────────────────────────
 
 @app.get("/news/reaction")
