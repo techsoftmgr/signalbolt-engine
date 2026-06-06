@@ -54,6 +54,10 @@ def _seg_fields(row: dict, group_by: str) -> dict:
     if group_by == "detector_conviction":
         return {"detector": src, "strategy": strat,
                 "conviction": _conviction_tier(row.get("confidence_score"))}
+    if group_by in ("bucket", "detector_bucket"):
+        from engine.regime_buckets import bucket_of
+        bkt = bucket_of(regime)
+        return {"bucket": bkt} if group_by == "bucket" else {"detector": src, "bucket": bkt}
     return {"detector": src, "strategy": strat}   # default: detector
 
 
@@ -69,6 +73,8 @@ def _label(fields: dict) -> str:
         parts.append(str(fields["strategy"]))
     if fields.get("regime"):
         parts.append(f"[{fields['regime']}]")
+    if fields.get("bucket"):
+        parts.append(f"[{fields['bucket']}]")
     if fields.get("conviction"):
         parts.append(f"@{fields['conviction']}")
     return " · ".join(parts) if parts else "—"
@@ -228,7 +234,8 @@ def compute(rows: list, group_by: str = "detector",
     Rows with result_pct is None are skipped (can't measure edge without P&L).
     """
     if group_by not in ("detector", "regime", "detector_regime",
-                        "conviction", "detector_conviction"):
+                        "conviction", "detector_conviction",
+                        "bucket", "detector_bucket"):
         group_by = "detector"
 
     segs: dict = {}

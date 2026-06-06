@@ -51,6 +51,29 @@ def test_policy_flags_beta_only_winner():
     assert p["action"] == "FULL" and "BETA-only" in p["note"]
 
 
+def test_policy_carries_full_outcome_profile():
+    rows = [_row("D", "PANIC", 2.0, alpha=1.0) for _ in range(25)]
+    for r in rows:
+        r["score_breakdown"]["mfe_pct"] = 5.0
+        r["score_breakdown"]["mae_pct"] = -1.0
+    p = dp.recommend(rows)[0]
+    # the learned profile travels with the recommendation
+    for k in ("win_rate", "payoff", "avg_mfe", "avg_giveback", "winner_mae",
+              "avg_alpha", "market_beat_rate", "total_return_pct"):
+        assert k in p, f"missing profile field {k}"
+    assert p["avg_mfe"] == 5.0 and p["winner_mae"] == -1.0
+
+
+def test_scorecard_detector_bucket_grouping():
+    from engine import scorecard
+    rows = ([_row("D", "PANIC", 1.0) for _ in range(3)] +
+            [_row("D", "TRENDING_BULL", 1.0) for _ in range(3)])
+    segs = scorecard.compute(rows, group_by="detector_bucket", min_n=1)["segments"]
+    buckets = {s["bucket"] for s in segs}
+    assert buckets == {"RISK_OFF", "RISK_ON"}
+    assert all(s["detector"] == "D" for s in segs)
+
+
 def test_policy_buckets_collapse_regimes():
     # PANIC + HIGH_VOL + TRENDING_BEAR all fold into one RISK_OFF cell
     rows = ([_row("D", "PANIC", -2.0) for _ in range(15)] +
