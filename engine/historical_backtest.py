@@ -136,11 +136,23 @@ def _spy_regime(spy_df):
     return out
 
 
+def _regime_allows(direction: str, regime: str) -> bool:
+    """Mirror the LIVE regime-alignment gate: no LONG in a risk-off bucket,
+    no SHORT in a risk-on bucket. NEUTRAL allows both."""
+    if direction == "LONG":
+        return regime != "RISK_OFF"
+    return regime != "RISK_ON"
+
+
 def run(universe: list, years: int = 3, hold_days: int = 10,
-        exit_params: dict | None = None, cost_pct: float = _DEFAULT_COST) -> dict:
+        exit_params: dict | None = None, cost_pct: float = _DEFAULT_COST,
+        regime_gate: bool = False) -> dict:
     """Replay every registered detector over `years` of daily bars for `universe`.
-    Returns per (detector × regime) expectancy, edge-vs-SPY, walk-forward. Never
-    raises (best-effort)."""
+    Returns per (detector × regime) expectancy, edge-vs-SPY, walk-forward.
+
+    regime_gate=True applies the LIVE regime-alignment filter (only count a trade
+    in regimes the live engine would actually allow) for an apples-to-apples
+    comparison. Never raises (best-effort)."""
     try:
         from engine.alpaca_client import get_bars
         from engine.replay_backtest import replay
@@ -183,6 +195,8 @@ def run(universe: list, years: int = 3, hold_days: int = 10,
                         d = None
                     if not d:
                         continue
+                    if regime_gate and not _regime_allows(d, rgm):
+                        continue   # live engine would have blocked this regime/direction
                     last_fire[name] = i
                     out = replay(d, entry_px, fwd_bars, {**exit_params, "cost_pct": cost_pct})
                     if out.get("outcome") is None:

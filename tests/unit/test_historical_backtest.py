@@ -63,3 +63,13 @@ def test_spy_regime_labels():
     # the crash tail (price below 200-SMA) should be RISK_OFF
     assert reg[str(idx[-1].date())[:10]] == "RISK_OFF"
     assert set(reg.values()) <= {"RISK_ON", "NEUTRAL", "RISK_OFF"}
+
+
+def test_regime_gate_mirrors_live_filter():
+    # LONG blocked in risk-off; SHORT blocked in risk-on; NEUTRAL allows both
+    assert hb._regime_allows("LONG", "RISK_ON") is True
+    assert hb._regime_allows("LONG", "RISK_OFF") is False
+    assert hb._regime_allows("LONG", "NEUTRAL") is True
+    assert hb._regime_allows("SHORT", "RISK_OFF") is True
+    assert hb._regime_allows("SHORT", "RISK_ON") is False
+    assert hb._regime_allows("SHORT", "NEUTRAL") is True
