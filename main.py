@@ -684,6 +684,23 @@ def get_regime_history(hours: int = 48):
         return {"hours": int(hours), "count": 0, "transitions": [], "error": str(e)}
 
 
+@app.post("/admin/historical-backtest")
+def post_historical_backtest(request: Request, years: int = 2, hold_days: int = 10,
+                             cost_pct: float = 0.15, universe: str = None):
+    """Replay registered detector ENTRY logic over YEARS of real SIP daily bars →
+    per-detector × regime expectancy, edge-vs-SPY, walk-forward. The DISCOVERY
+    tool (backtest, not wait). Heavy — keep the universe small over HTTP; big runs
+    go via the module. Admin."""
+    _require_admin_jwt(request)
+    from engine import historical_backtest
+    uni = ([u.strip().upper() for u in universe.split(",") if u.strip()] if universe
+           else ["AAPL", "MSFT", "NVDA", "META", "AMD", "TSLA", "AMZN", "GOOGL",
+                 "AVGO", "CRM", "NFLX", "SPY", "QQQ"])
+    return historical_backtest.run(uni, years=max(1, min(int(years), 6)),
+                                   hold_days=max(2, min(int(hold_days), 30)),
+                                   cost_pct=max(0.0, min(cost_pct, 1.0)))
+
+
 @app.post("/admin/replay-backtest")
 def post_replay_backtest(request: Request, days: int = 45, detector: str = None,
                          stop_pct: float = 3.0, target_pct: float = None,
