@@ -4664,6 +4664,22 @@ async def ticker_chart_read(request: Request, symbol: str):
         return {"ticker": sym, "unavailable": True}
 
 
+@app.get("/ticker/{symbol}/commentary")
+async def ticker_commentary_feed(request: Request, symbol: str):
+    """Live intraday commentary — a chronological feed of today's technical EVENTS
+    (MACD/EMA crosses, RSI OB/OS, VWAP reclaim/lose, opening-range breaks, volume
+    spikes, sharp moves, new highs/lows, opening gap) on 5m/15m, plus occasional
+    educational intraday ideas. Read-only, stateless, best-effort."""
+    _require_jwt(request)
+    sym = symbol.upper().strip()
+    try:
+        from engine import ticker_commentary
+        return ticker_commentary.build(sym)
+    except Exception as e:
+        logger.debug(f"GET /ticker/{sym}/commentary error: {e}")
+        return {"available": False, "ticker": sym, "note": "Commentary unavailable."}
+
+
 # ── News Reaction Feed ────────────────────────────────────────────────────────
 
 @app.get("/news/reaction")
