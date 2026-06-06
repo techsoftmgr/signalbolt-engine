@@ -784,6 +784,19 @@ def phase2_portfolio_brokers():
     return {"enabled": True, "supported": brokers.SUPPORTED}
 
 
+@app.get("/phase2/trader-home")
+def phase2_trader_home(tickers: str = ""):
+    """Trader Home Dashboard — aggregates threat radar + watchlist/community intel
+    + signals summary + regime + AI Daily Briefing. Gated by PHASE2_TRADER_HOME;
+    each sub-block also respects its own flag."""
+    from engine.phase2 import flags, trader_home
+    if not flags.enabled("trader_home"):
+        return {"enabled": False}
+    from engine import runner
+    tks = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    return trader_home.dashboard(runner._supabase(), tks)
+
+
 @app.post("/admin/run-bo-poc")
 def run_bo_poc_now(request: Request):
     """Manually fire the BO_POC breakout scan (fidelity-matched confirmed-daily-
