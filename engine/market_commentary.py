@@ -165,6 +165,26 @@ def _gap_event(now: datetime) -> list[dict]:
     return out
 
 
+def _social_events(limit: int = 6) -> list[dict]:
+    """Market-moving social posts (e.g. Trump via TweetShift→Discord). High
+    severity — these move the tape. Empty when the feed isn't configured."""
+    try:
+        from engine import social_feed
+        out = []
+        for p in social_feed.recent_posts(limit):
+            text = (p.get("text") or "").strip()
+            if not text:
+                continue
+            out.append({"time": p.get("created_at"), "type": "SOCIAL", "tone": "neutral",
+                        "severity": 3,
+                        "title": f"{p.get('author') or 'Post'}: {text[:140]}",
+                        "detail": text[:300], "url": p.get("url"),
+                        "source": p.get("author") or "social"})
+        return out
+    except Exception:
+        return []
+
+
 def _sector_event() -> list[dict]:
     try:
         from engine import pulse_service
@@ -194,6 +214,7 @@ def build(now: datetime | None = None) -> dict:
             events += _gap_event(now)
         events += _index_events(phase)
         events += _sector_event()
+        events += _social_events(6)        # market-moving posts (any phase)
         events += _policy_headlines(6)
 
         # sort newest-first where a timestamp exists; undated context floats to top
