@@ -175,14 +175,18 @@ def run_param_set(sb, params: dict, days: int = 45, detector: str | None = None,
     try:
         from datetime import timedelta
         since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        # Order by recency + fetch a generous cap BEFORE the (post-query) detector
+        # filter, so a rare detector's signals aren't dropped by an arbitrary slice.
         rows = (sb.table("signals")
                 .select("ticker,direction,entry_price,result_pct,created_at,score_breakdown,strategy_type")
                 .eq("status", "closed").gte("created_at", since)
-                .neq("strategy_type", "deep_value").limit(limit).execute().data) or []
+                .neq("strategy_type", "deep_value")
+                .order("created_at", desc=True).limit(2000).execute().data) or []
         if detector:
             rows = [r for r in rows
                     if ((r.get("score_breakdown") or {}).get("detector_source") == detector
                         or r.get("strategy_type") == detector)]
+        rows = rows[:limit]
         rep, base = [], []
         for r in rows:
             out = replay_signal(r, params, horizon_days, timeframe)
