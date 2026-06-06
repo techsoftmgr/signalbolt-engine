@@ -4643,6 +4643,21 @@ async def ticker_chart_read(request: Request, symbol: str):
     try:
         from engine import chart_read
         r = chart_read.analyze(sym)
+        # ── ADDITIVE: attach an optional `decision_support` layer derived purely
+        # from the read above. Never mutates existing fields; fully fail-safe so a
+        # derivation issue can never break the existing Expert Read response. ──
+        if r and not r.get("unavailable"):
+            try:
+                from engine import decision_support
+                sb = None
+                try:
+                    sb = _make_supabase()
+                except Exception:
+                    sb = None
+                hist = decision_support.historical_similar_setups(sb, sym, r.get("taBias"))
+                r["decision_support"] = decision_support.derive(r, historical=hist)
+            except Exception as e:
+                logger.debug(f"decision_support derive failed for {sym}: {e}")
         return r or {"ticker": sym, "unavailable": True}
     except Exception as e:
         logger.debug(f"GET /ticker/{sym}/chart-read error: {e}")
