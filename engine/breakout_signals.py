@@ -23,6 +23,16 @@ import logging
 
 logger = logging.getLogger("signalbolt.breakout_signals")
 
+
+def _live_regime() -> str:
+    """Current regime to stamp at fire (so this detector's signals are regime-
+    sliceable). Never empty / never raises."""
+    try:
+        from engine import signal_telemetry
+        return signal_telemetry.live_regime_type()
+    except Exception:
+        return "RANGING"
+
 # Stop-width guards. These detector cards bypass sl_tp_engine (which caps SL%),
 # so without this a post-parabolic name with a fat ATR gets an absurd stop —
 # e.g. MRVL ran +46% off its 20-day MA, ATR≈6%, so a flat 1.5·ATR stop was
@@ -98,7 +108,7 @@ def generate(sb, r: dict) -> dict:
             + (f"; a loss of {base} (now support) invalidates it" if base else "")
             + f". Targets {t1} / {t2}; trail your stop up."
         ),
-        "regime_type":         "",
+        "regime_type":         _live_regime(),
         "session_mode":        "",
         "confidence_tier":     "B",
         "position_multiplier": 0.25,        # small size — new, unproven detector

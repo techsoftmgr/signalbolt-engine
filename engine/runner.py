@@ -371,6 +371,16 @@ def _is_untradeable(ticker: str, price, strategy_type: str | None = None) -> boo
     return False
 
 
+def _live_regime_type() -> str:
+    """Current regime label to stamp on a signal at fire when the caller didn't
+    pass one — so every detector signal is regime-sliceable. Never empty/raises."""
+    try:
+        from engine import signal_telemetry
+        return signal_telemetry.live_regime_type()
+    except Exception:
+        return "RANGING"
+
+
 def _write_signal(sb: Client, row: dict) -> str | None:
     """Insert signal row, log the 'fired' event, and return the new signal ID."""
     if _is_untradeable(row.get("ticker", ""), row.get("entry_price"), row.get("strategy_type")):
@@ -766,7 +776,7 @@ def _process_mr_ticker(sb: Client, ticker: str, config: dict,
         signal_row.update({
             "strategy_type":       "vwap_reclaim",   # always tagged as VWAP reclaim strategy
             "timeframe":           config.get("interval", "15m"),
-            "regime_type":         regime.get("regime_type", ""),
+            "regime_type":         (regime.get("regime_type") or _live_regime_type()),
             "session_mode":        session.get("mode", ""),
             "confidence_tier":     risk["confidence_tier"],
             "position_multiplier": risk["position_mult"],
@@ -1079,7 +1089,7 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
         "status":             "active",
         "ai_explanation":     None,
         # Quant metadata
-        "regime_type":        regime.get("regime_type", ""),
+        "regime_type":        (regime.get("regime_type") or _live_regime_type()),
         "session_mode":       session.get("mode", ""),
         "confidence_tier":    risk["confidence_tier"],
         "position_multiplier": risk["position_mult"],
@@ -1234,7 +1244,7 @@ def _process_dark_pool_ticker(sb: Client, ticker: str, config: dict,
         "status":             "active",
         "ai_explanation":     None,
         # Quant metadata
-        "regime_type":        regime.get("regime_type", ""),
+        "regime_type":        (regime.get("regime_type") or _live_regime_type()),
         "session_mode":       session.get("mode", ""),
         "confidence_tier":    risk["confidence_tier"],
         "position_multiplier": risk["position_mult"],
@@ -1334,7 +1344,7 @@ def _process_options_flow_ticker(sb: Client, ticker: str, config: dict,
         "status":             "active",
         "ai_explanation":     None,
         # Quant metadata
-        "regime_type":        regime.get("regime_type", ""),
+        "regime_type":        (regime.get("regime_type") or _live_regime_type()),
         "session_mode":       session.get("mode", ""),
         "confidence_tier":    risk["confidence_tier"],
         "position_multiplier": risk["position_mult"],
@@ -1654,7 +1664,7 @@ def _process_predictive_ticker(sb: Client, ticker: str, config: dict,
         "strategy_type":      strategy_type,
         "status":             "active",
         "ai_explanation":     setup_reason,
-        "regime_type":        regime.get("regime_type", ""),
+        "regime_type":        (regime.get("regime_type") or _live_regime_type()),
         "session_mode":       session.get("mode", ""),
         "confidence_tier":    risk["confidence_tier"],
         "position_multiplier": risk["position_mult"],
@@ -1797,7 +1807,7 @@ def _fire_per_tick_predictive(ticker: str, direction: str, price: float,
         "strategy_type":      strategy_type,
         "status":             "active",
         "ai_explanation":     setup_reason,
-        "regime_type":        "",
+        "regime_type":        _live_regime_type(),
         "session_mode":       "",
         "confidence_tier":    risk["confidence_tier"],
         "position_multiplier": risk["position_mult"],
@@ -1963,7 +1973,7 @@ def _fire_momentum(sb: Client, ms, direction: str) -> None:
         "strategy_type":      strategy_type,
         "status":             "active",
         "ai_explanation":     setup_reason,
-        "regime_type":        "",
+        "regime_type":        _live_regime_type(),
         "session_mode":       "",
         "confidence_tier":    risk_chk["confidence_tier"],
         "position_multiplier": pos_mult,

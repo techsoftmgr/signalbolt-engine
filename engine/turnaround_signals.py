@@ -23,6 +23,15 @@ import logging
 
 logger = logging.getLogger("signalbolt.turnaround_signals")
 
+
+def _live_regime() -> str:
+    """Current regime to stamp at fire (regime-sliceable). Never empty/raises."""
+    try:
+        from engine import signal_telemetry
+        return signal_telemetry.live_regime_type()
+    except Exception:
+        return "RANGING"
+
 # Stop-width guards (these cards bypass sl_tp_engine, which caps SL%).
 _MAX_STOP_PCT = 0.05    # never risk more than 5% on a 0.25x detector card
 _MIN_STOP_PCT = 0.015   # …but at least 1.5%, so normal noise can't nick us
@@ -95,7 +104,7 @@ def generate(sb, r: dict) -> dict:
             + (f"; a loss of {inval} invalidates the turn" if inval else "")
             + f". Targets {t1} / {t2}; trail your stop up."
         ),
-        "regime_type":         "",
+        "regime_type":         _live_regime(),
         "session_mode":        "",
         "confidence_tier":     "B",
         "position_multiplier": 0.25,        # small size — new, unproven detector

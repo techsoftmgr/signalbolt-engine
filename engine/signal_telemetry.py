@@ -47,6 +47,27 @@ def get_regime() -> dict:
     return snap
 
 
+def live_regime_type(default: str = "RANGING") -> str:
+    """Best-effort CURRENT regime label to STAMP at fire time. Tries the cached
+    live detect, then the worker's 5-min regime cache, then a neutral default —
+    so a detector signal is never written with an empty regime (which would lose
+    the whole regime dimension for that signal). Never raises."""
+    try:
+        rt = (get_regime() or {}).get("regime_type") or ""
+        if rt:
+            return rt
+    except Exception:
+        pass
+    try:
+        from engine import stream
+        rt = (stream._get_regime() or {}).get("regime_type") or ""
+        if rt:
+            return rt
+    except Exception:
+        pass
+    return default
+
+
 def _count(sb, **eqs) -> int | None:
     """Exact COUNT of active `signals` rows matching the eq filters. Cheap
     (count is returned in the Content-Range header regardless of limit). Fails
