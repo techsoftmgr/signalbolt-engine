@@ -741,6 +741,49 @@ def phase2_position_coach(ticker: str, entry: float = None, size: float = None,
                                  account=account, risk_tolerance=risk_tolerance)
 
 
+@app.get("/phase2/signal-followup/{signal_id}")
+def phase2_signal_followup(signal_id: str):
+    """Post-signal monitoring timeline for an existing signal (signal engine
+    untouched). Gated by PHASE2_SIGNAL_FOLLOWUP."""
+    from engine.phase2 import flags, signal_followup
+    if not flags.enabled("signal_followup"):
+        return {"enabled": False}
+    from engine import runner
+    return signal_followup.timeline(runner._supabase(), signal_id)
+
+
+@app.post("/phase2/portfolio/analyze")
+async def phase2_portfolio_analyze(request: Request):
+    """Portfolio Doctor — health score + insights + AI coach. Body: {holdings, cash}
+    OR {broker, ...}. INVASIVE (broker creds) — gated by PHASE2_PORTFOLIO_DOCTOR
+    (default OFF). Keys are per-request, never stored."""
+    from engine.phase2 import flags, portfolio_doctor, brokers
+    if not flags.enabled("portfolio_doctor"):
+        return {"enabled": False, "note": "Portfolio Doctor is disabled. Enable PHASE2_PORTFOLIO_DOCTOR."}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    holdings = body.get("holdings")
+    cash = float(body.get("cash") or 0)
+    if not holdings and body.get("broker"):
+        try:
+            holdings, bc = brokers.load(body["broker"], **body)
+            cash = cash or bc
+        except ValueError as e:
+            return {"enabled": True, "error": str(e)}
+    return portfolio_doctor.analyze_full(holdings or [], cash)
+
+
+@app.get("/phase2/portfolio/brokers")
+def phase2_portfolio_brokers():
+    """Which broker adapters are wired vs on the roadmap."""
+    from engine.phase2 import flags, brokers
+    if not flags.enabled("portfolio_doctor"):
+        return {"enabled": False}
+    return {"enabled": True, "supported": brokers.SUPPORTED}
+
+
 @app.post("/admin/run-bo-poc")
 def run_bo_poc_now(request: Request):
     """Manually fire the BO_POC breakout scan (fidelity-matched confirmed-daily-
