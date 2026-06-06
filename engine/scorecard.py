@@ -58,6 +58,8 @@ def _seg_fields(row: dict, group_by: str) -> dict:
         from engine.regime_buckets import bucket_of
         bkt = bucket_of(regime)
         return {"bucket": bkt} if group_by == "bucket" else {"detector": src, "bucket": bkt}
+    if group_by == "detector_direction":
+        return {"detector": src, "side": (row.get("direction") or "?").upper()}
     return {"detector": src, "strategy": strat}   # default: detector
 
 
@@ -75,6 +77,8 @@ def _label(fields: dict) -> str:
         parts.append(f"[{fields['regime']}]")
     if fields.get("bucket"):
         parts.append(f"[{fields['bucket']}]")
+    if fields.get("side"):
+        parts.append(f"{fields['side']}")
     if fields.get("conviction"):
         parts.append(f"@{fields['conviction']}")
     return " · ".join(parts) if parts else "—"
@@ -235,7 +239,7 @@ def compute(rows: list, group_by: str = "detector",
     """
     if group_by not in ("detector", "regime", "detector_regime",
                         "conviction", "detector_conviction",
-                        "bucket", "detector_bucket"):
+                        "bucket", "detector_bucket", "detector_direction"):
         group_by = "detector"
 
     segs: dict = {}
