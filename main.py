@@ -3615,7 +3615,7 @@ async def admin_detector_scorecard(request: Request, days: int = 30, cost_pct: f
         rows = (
             sb.table("signals")
               .select("result, result_pct, status, score_breakdown, strategy_type, "
-                      "regime_type, confidence_score, created_at")
+                      "regime_type, confidence_score, created_at, direction")
               .eq("status", "closed")
               .gte("created_at", since)
               .limit(5000)

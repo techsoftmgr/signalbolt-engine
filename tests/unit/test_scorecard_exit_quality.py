@@ -73,3 +73,16 @@ def test_mins_since_entry():
     past = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=60)).isoformat()
     m = _mins_since_entry(past)
     assert m is not None and 59.0 <= m <= 61.0
+
+
+def test_detector_direction_grouping_splits_long_short():
+    rows = [
+        {"result": "win",  "result_pct": 2.0, "confidence_score": 75, "strategy_type": "swing",
+         "direction": "SHORT", "score_breakdown": {"detector_source": "SMC"}},
+        {"result": "loss", "result_pct": -1.0, "confidence_score": 75, "strategy_type": "swing",
+         "direction": "LONG",  "score_breakdown": {"detector_source": "SMC"}},
+    ]
+    segs = scorecard.compute(rows, group_by="detector_direction", min_n=1)["segments"]
+    by = {(s["detector"], s["side"]): s for s in segs}
+    assert ("SMC", "SHORT") in by and ("SMC", "LONG") in by
+    assert by[("SMC", "SHORT")]["n"] == 1 and by[("SMC", "LONG")]["n"] == 1
