@@ -100,6 +100,20 @@ def test_bias_gate_blocks_counter_trend_idea():
     assert any("counter-trend" in e["detail"].lower() for e in dn_macd)
 
 
+def test_downtrend_yields_short_ideas_from_continuation_triggers():
+    # decline → bounce → rollover: a with-trend short should appear at the rollover
+    # (from EMA/VWAP/MACD), not just a single MACD cross.
+    closes = (list(np.linspace(100, 92, 20)) + list(np.linspace(92, 97, 10))
+              + list(np.linspace(97, 93, 16)))
+    ev = tc._detect_tf(_df(closes), "15m", prior_close=None, want_ideas=True, bias="down")
+    ideas = [e for e in ev if e.get("idea")]
+    assert ideas, _types(ev)
+    for e in ideas:                       # every idea is a with-trend short, RR-gated
+        assert e["idea"]["bias"] == "short"
+        assert e["idea"]["rr"] >= tc._MIN_RR
+        assert not e.get("against_trend")
+
+
 def test_session_bias_up_down_neutral():
     up5 = _df(list(np.linspace(100, 110, 40)))
     up15 = tc._resample(up5, "15min")

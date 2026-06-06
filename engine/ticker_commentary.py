@@ -39,7 +39,7 @@ _VOL_SPIKE = 3.0         # bar volume vs trailing avg to flag a volume spike
 # per-(type) cooldown in BARS on the detection timeframe (avoids machine-gun events)
 _COOLDOWN = {
     "MACD_CROSS": 6, "EMA_CROSS": 6, "RSI": 8, "VWAP": 6, "ORB": 9999,
-    "VOLUME": 4, "MOVE": 2, "HOD": 10, "LOD": 10, "LEVEL": 8, "GAP": 9999, "IDEA": 12,
+    "VOLUME": 4, "MOVE": 2, "HOD": 10, "LOD": 10, "LEVEL": 8, "GAP": 9999, "IDEA": 6,
 }
 
 
@@ -202,6 +202,22 @@ def _detect_tf(df: pd.DataFrame, tf_label: str, prior_close: float | None,
             ev["idea"] = idea
         events.append(ev)
 
+    def maybe_idea(tone: str, i: int, atr: float):
+        """Build a with-trend idea for a continuation trigger (MACD / EMA / VWAP),
+        bias-aligned + R:R-gated + IDEA-cooldown'd. Returns None otherwise."""
+        if not (want_ideas and ok("IDEA", i)):
+            return None
+        aligned = (tone == "bullish" and bias == "up") or (tone == "bearish" and bias == "down")
+        if not aligned:
+            return None
+        if tone == "bullish":
+            idea = _intraday_idea("bullish", px[i], float(np.min(low[max(0, i - 6):i + 1])), sess_hi, atr)
+        else:
+            idea = _intraday_idea("bearish", px[i], sess_lo, float(np.max(high[max(0, i - 6):i + 1])), atr)
+        if idea:
+            last_emit["IDEA"] = i
+        return idea
+
     # opening gap (first bar of the session vs prior session close)
     if prior_close and prior_close > 0:
         gp = (px[0] - prior_close) / prior_close * 100
@@ -227,26 +243,25 @@ def _detect_tf(df: pd.DataFrame, tf_label: str, prior_close: float | None,
         # AGREES with the session bias (no counter-trend ideas).
         if ok("MACD_CROSS", i) and hist[i - 1] is not None:
             if hist[i - 1] <= 0 < hist[i]:
-                make = want_ideas and bias == "up" and ok("IDEA", i)
-                idea = _intraday_idea("bullish", px[i], float(np.min(low[max(0, i - 6):i + 1])), sess_hi, atr) if make else None
-                if idea: last_emit["IDEA"] = i
                 emit("MACD_CROSS", i, "bullish", 3, f"MACD bullish crossover ({tf_label})",
-                     f"MACD crossed above its signal at ${_round(px[i])} — momentum turning up.", px[i], idea)
+                     f"MACD crossed above its signal at ${_round(px[i])} — momentum turning up.",
+                     px[i], maybe_idea("bullish", i, atr))
             elif hist[i - 1] >= 0 > hist[i]:
-                make = want_ideas and bias == "down" and ok("IDEA", i)
-                idea = _intraday_idea("bearish", px[i], sess_lo, float(np.max(high[max(0, i - 6):i + 1])), atr) if make else None
-                if idea: last_emit["IDEA"] = i
                 emit("MACD_CROSS", i, "bearish", 3, f"MACD bearish crossover ({tf_label})",
-                     f"MACD crossed below its signal at ${_round(px[i])} — momentum turning down.", px[i], idea)
+                     f"MACD crossed below its signal at ${_round(px[i])} — momentum turning down.",
+                     px[i], maybe_idea("bearish", i, atr))
 
-        # EMA 9/21 cross
+        # EMA 9/21 cross — a with-trend cross is a continuation entry, so it can
+        # carry an idea (fade-the-bounce in a downtrend, buy-the-dip in an uptrend).
         if ok("EMA_CROSS", i):
             if ema9[i - 1] <= ema21[i - 1] and ema9[i] > ema21[i]:
                 emit("EMA_CROSS", i, "bullish", 2, f"9/21 EMA bullish cross ({tf_label})",
-                     f"The 9 EMA crossed above the 21 EMA near ${_round(px[i])} — short-term trend turning up.", px[i])
+                     f"The 9 EMA crossed above the 21 EMA near ${_round(px[i])} — short-term trend turning up.",
+                     px[i], maybe_idea("bullish", i, atr))
             elif ema9[i - 1] >= ema21[i - 1] and ema9[i] < ema21[i]:
                 emit("EMA_CROSS", i, "bearish", 2, f"9/21 EMA bearish cross ({tf_label})",
-                     f"The 9 EMA crossed below the 21 EMA near ${_round(px[i])} — short-term trend turning down.", px[i])
+                     f"The 9 EMA crossed below the 21 EMA near ${_round(px[i])} — short-term trend turning down.",
+                     px[i], maybe_idea("bearish", i, atr))
 
         # RSI overbought / oversold (entering)
         if ok("RSI", i):
@@ -257,14 +272,17 @@ def _detect_tf(df: pd.DataFrame, tf_label: str, prior_close: float | None,
                 emit("RSI", i, "bullish", 1, f"RSI oversold ({tf_label})",
                      f"RSI dropped below 30 ({rsi[i]:.0f}) — washed out; watch for a bounce.", px[i])
 
-        # VWAP reclaim / lose
+        # VWAP reclaim / lose — a classic with-trend continuation trigger, so it
+        # can carry an idea when it agrees with the session bias.
         if ok("VWAP", i):
             if px[i - 1] < vwap[i - 1] and px[i] > vwap[i]:
                 emit("VWAP", i, "bullish", 2, f"Reclaimed VWAP ({tf_label})",
-                     f"Price reclaimed VWAP (${_round(vwap[i])}) — buyers back in control intraday.", px[i])
+                     f"Price reclaimed VWAP (${_round(vwap[i])}) — buyers back in control intraday.",
+                     px[i], maybe_idea("bullish", i, atr))
             elif px[i - 1] > vwap[i - 1] and px[i] < vwap[i]:
                 emit("VWAP", i, "bearish", 2, f"Lost VWAP ({tf_label})",
-                     f"Price lost VWAP (${_round(vwap[i])}) — sellers in control intraday.", px[i])
+                     f"Price lost VWAP (${_round(vwap[i])}) — sellers in control intraday.",
+                     px[i], maybe_idea("bearish", i, atr))
 
         # opening-range break (once each direction)
         if orb_hi and not orb_done["up"] and px[i] > orb_hi:
