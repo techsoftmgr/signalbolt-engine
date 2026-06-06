@@ -2813,6 +2813,24 @@ async def admin_active_signals(request: Request):
 ADMIN_EMAIL = "techsoftmgr@gmail.com"
 
 
+def _is_admin_request(request: Request) -> bool:
+    """Non-raising admin check from the (already JWT-verified) access token's email
+    claim — read locally, no network call. Used to decide whether to return raw
+    technical wording (admin) vs scrubbed friendly wording (everyone else)."""
+    try:
+        import base64
+        import json as _json
+        token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+        if not token or token.count(".") < 2:
+            return False
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = _json.loads(base64.urlsafe_b64decode(payload.encode()))
+        return (claims.get("email") or "").lower() == ADMIN_EMAIL.lower()
+    except Exception:
+        return False
+
+
 def _require_admin_jwt(request: Request):
     """JWT-gated admin check (email match). Returns (user_id, sb)."""
     token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
@@ -4658,7 +4676,15 @@ async def ticker_chart_read(request: Request, symbol: str):
                 r["decision_support"] = decision_support.derive(r, historical=hist)
             except Exception as e:
                 logger.debug(f"decision_support derive failed for {sym}: {e}")
-        return r or {"ticker": sym, "unavailable": True}
+        result = r or {"ticker": sym, "unavailable": True}
+        # Scrub technical wording → friendly for non-admin callers (admins get raw).
+        if not _is_admin_request(request):
+            try:
+                from engine import plainspeak
+                result = plainspeak.scrub(result)
+            except Exception:
+                pass
+        return result
     except Exception as e:
         logger.debug(f"GET /ticker/{sym}/chart-read error: {e}")
         return {"ticker": sym, "unavailable": True}
@@ -4674,7 +4700,14 @@ async def ticker_commentary_feed(request: Request, symbol: str):
     sym = symbol.upper().strip()
     try:
         from engine import ticker_commentary
-        return ticker_commentary.build(sym)
+        res = ticker_commentary.build(sym)
+        if not _is_admin_request(request):
+            try:
+                from engine import plainspeak
+                res = plainspeak.scrub(res)
+            except Exception:
+                pass
+        return res
     except Exception as e:
         logger.debug(f"GET /ticker/{sym}/commentary error: {e}")
         return {"available": False, "ticker": sym, "note": "Commentary unavailable."}
