@@ -68,3 +68,21 @@ def test_cost_subtracted():
     bars = [(107, 105, 106)]
     r = replay("LONG", 100, bars, {"stop_pct": 3, "target_pct": 6, "cost_pct": 0.1})
     assert r["realized_pct"] == 6.0 and r["realized_net_pct"] == 5.9
+
+
+def test_macd_lock_exits_on_flip_in_profit():
+    # LONG in profit (+5%), MACD histogram flips +→- on bar 2 → lock at that close
+    bars = [(104, 100, 103), (106, 104, 105), (105.5, 104, 105)]
+    macd = [0.5, 0.4, -0.2]   # positive, positive, flips negative on bar 3
+    r = replay("LONG", 100, bars, {"stop_pct": 10, "macd_hist": macd,
+                                   "macd_lock_arm": 2.0, "cost_pct": 0.0})
+    assert r["exit_reason"] == "macd_lock" and r["realized_pct"] == 5.0
+
+
+def test_macd_lock_inactive_below_arm():
+    # only +1% profit (< arm 2%) → MACD flip ignored, rides to end
+    bars = [(101, 100, 100.5), (101.5, 100, 101.0)]
+    macd = [0.3, -0.3]
+    r = replay("LONG", 100, bars, {"stop_pct": 10, "macd_hist": macd,
+                                   "macd_lock_arm": 2.0, "cost_pct": 0.0})
+    assert r["exit_reason"] == "end"
