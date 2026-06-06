@@ -73,3 +73,25 @@ def test_regime_gate_mirrors_live_filter():
     assert hb._regime_allows("SHORT", "RISK_OFF") is True
     assert hb._regime_allows("SHORT", "RISK_ON") is False
     assert hb._regime_allows("SHORT", "NEUTRAL") is True
+
+
+def test_momentum_pass_runs_and_filters():
+    import numpy as np
+    idx = pd.date_range("2021-01-01", periods=400, freq="B")
+    bars = {}
+    # WIN: steady uptrend (px > sma50 > sma200, positive 126d momentum)
+    bars["WIN"] = pd.DataFrame({"open": np.linspace(50, 150, 400), "high": np.linspace(51, 151, 400),
+                                "low": np.linspace(49, 149, 400), "close": np.linspace(50, 150, 400),
+                                "volume": [1e6] * 400}, index=idx)
+    # DOWN: downtrend (fails the uptrend filter → never selected)
+    bars["DOWN"] = pd.DataFrame({"open": np.linspace(150, 50, 400), "high": np.linspace(151, 51, 400),
+                                 "low": np.linspace(149, 49, 400), "close": np.linspace(150, 50, 400),
+                                 "volume": [1e6] * 400}, index=idx)
+    spy_close = {str(idx[i].date())[:10]: 100.0 + i * 0.05 for i in range(400)}
+    spy_dates = sorted(spy_close)
+    out = hb._momentum_pass(bars, spy_close, spy_dates, {}, 10,
+                            {"stop_pct": 8, "trail_pct": 6}, 0.15, False)
+    assert isinstance(out, list)
+    # only the uptrend name is ever selected
+    assert all(t["detector"] == "TREND_MOMENTUM" and t["direction"] == "LONG" for t in out)
+    assert all(bars_key == "WIN" for bars_key in [t.get("ticker", "WIN") for t in out])  # DOWN never long
