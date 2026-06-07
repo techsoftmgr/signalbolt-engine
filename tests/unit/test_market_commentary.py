@@ -105,3 +105,18 @@ def test_econ_calendar_never_raises(monkeypatch):
     monkeypatch.setattr(_e, "_finnhub_events", lambda days: (_ for _ in ()).throw(RuntimeError("boom")))
     out = _e.today_and_upcoming()
     assert "today" in out and "upcoming" in out
+
+
+# ── V3: bias track record scoring ─────────────────────────────────────────────
+def test_bias_correct_scoring():
+    assert mc._bias_correct("risk-on", 1.2) is True       # bias up, SPY up → right
+    assert mc._bias_correct("risk-on", -0.5) is False     # bias up, SPY down → wrong
+    assert mc._bias_correct("risk-off", -1.0) is True     # bias down, SPY down → right
+    assert mc._bias_correct("risk-off", 0.8) is False
+    assert mc._bias_correct("neutral", 2.0) is None       # neutral isn't scored
+    assert mc._bias_correct("risk-on", 0.1) is False      # inside the ±0.2% deadband
+
+
+def test_log_and_score_bias_no_sb():
+    assert mc.log_bias_snapshot(None)["logged"] == 0
+    assert mc.score_bias_snapshots(None)["scored"] == 0

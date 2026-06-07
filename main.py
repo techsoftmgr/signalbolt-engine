@@ -4735,6 +4735,32 @@ async def market_commentary_feed(request: Request):
         return {"available": False, "note": "Market tape unavailable."}
 
 
+@app.get("/admin/market-bias-stats")
+async def admin_market_bias_stats(request: Request, days: int = 90):
+    """Market Tape bias track record — of the scored daily bias calls, how often
+    did SPY move the way the bias implied? Admin-only."""
+    _, sb = _require_admin_jwt(request)
+    try:
+        from datetime import datetime, timezone, timedelta
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        rows = (sb.table("market_bias_log").select("bias,correct,forward_return_pct,created_at")
+                .gte("created_at", since).not_.is_("correct", "null")
+                .order("created_at", desc=True).limit(500).execute().data) or []
+        scored = [r for r in rows if r.get("correct") is not None]
+        n = len(scored)
+        wins = sum(1 for r in scored if r.get("correct"))
+        by = {}
+        for b in ("risk-on", "risk-off"):
+            sub = [r for r in scored if r.get("bias") == b]
+            by[b] = {"n": len(sub), "correct_pct": round(sum(1 for r in sub if r.get("correct")) / len(sub) * 100) if sub else None}
+        return {"days": days, "scored": n,
+                "correct_pct": round(wins / n * 100) if n else None,
+                "by_bias": by, "recent": rows[:30]}
+    except Exception as e:
+        logger.debug(f"GET /admin/market-bias-stats error: {e}")
+        return {"scored": 0, "correct_pct": None, "note": "Track record not available yet (table may be empty/uncreated)."}
+
+
 # ── News Reaction Feed ────────────────────────────────────────────────────────
 
 @app.get("/news/reaction")
