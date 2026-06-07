@@ -3264,6 +3264,38 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled entry-gate validator (4:15 PM ET, post-close)")
 
+    # ── Market Tape bias track record (V3) ───────────────────────────────
+    # Log the day's risk-on/off bias near the close, then score it the next
+    # morning (did SPY move the way the bias implied?). Best-effort; no-ops if
+    # the market_bias_log table hasn't been created. NYSE tz → DST-aware.
+    def _run_log_market_bias():
+        try:
+            from engine import market_commentary
+            market_commentary.log_bias_snapshot(_supabase())
+        except Exception as _e:
+            logger.error(f"[runner] log market bias failed: {_e}")
+
+    def _run_score_market_bias():
+        try:
+            from engine import market_commentary
+            market_commentary.score_bias_snapshots(_supabase())
+        except Exception as _e:
+            logger.error(f"[runner] score market bias failed: {_e}")
+
+    scheduler.add_job(
+        _run_log_market_bias,
+        trigger=CronTrigger(hour=15, minute=50, timezone="America/New_York"),
+        id="log_market_bias", name="Market Tape bias snapshot (3:50 PM ET)",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _run_score_market_bias,
+        trigger=CronTrigger(hour=10, minute=15, timezone="America/New_York"),
+        id="score_market_bias", name="Market Tape bias forward scorer (10:15 AM ET)",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled market-bias track record (log 3:50pm / score 10:15am ET)")
+
     # ── EOD phantom-data audit — 4:50 PM ET ──────────────────────────────
     # Verify the day's closes against the real 1-min tape so bad-price/phantom
     # closes are caught same-day (not a month later). Admin-only alert.

@@ -253,3 +253,81 @@ def build(now: datetime | None = None) -> dict:
     except Exception as e:
         logger.debug(f"[market_commentary] build failed: {e}")
         return {"available": False, "note": "Market tape unavailable.", "disclaimer": _DISCLAIMER}
+
+
+# ── V3: bias track record — was the day's risk-on/off call right next session? ──
+_BIAS_HORIZON_DAYS = 1
+
+
+def _bias_correct(bias: str | None, fwd_return_pct: float) -> bool | None:
+    """Pure: did the bias match the forward SPY move? Neutral isn't scored."""
+    if bias == "risk-on":
+        return fwd_return_pct > 0.2
+    if bias == "risk-off":
+        return fwd_return_pct < -0.2
+    return None
+
+
+def log_bias_snapshot(sb, now: datetime | None = None) -> dict:
+    """One row/day: today's market bias + SPY price (for a forward track record).
+    Best-effort; no-ops if the table is missing or a row already exists today."""
+    if sb is None:
+        return {"logged": 0}
+    try:
+        now = now or datetime.now(timezone.utc)
+        today = now.date().isoformat()
+        snap = build(now)
+        if not snap.get("available"):
+            return {"logged": 0}
+        exists = (sb.table("market_bias_log").select("id")
+                  .gte("created_at", today + "T00:00:00Z").limit(1).execute().data)
+        if exists:
+            return {"logged": 0, "skipped": True}
+        spy = None
+        try:
+            from engine.alpaca_client import get_latest_price
+            spy = get_latest_price("SPY")
+        except Exception:
+            pass
+        sb.table("market_bias_log").insert({
+            "bias": snap.get("bias"), "vix": snap.get("vix"),
+            "regime_type": snap.get("regime_type"),
+            "spy_price": round(float(spy), 2) if spy else None,
+        }).execute()
+        return {"logged": 1}
+    except Exception as e:
+        logger.debug(f"[market_commentary] log_bias_snapshot failed: {e}")
+        return {"logged": 0}
+
+
+def score_bias_snapshots(sb) -> dict:
+    """Fill the forward outcome for bias rows past the horizon. Best-effort."""
+    if sb is None:
+        return {"scored": 0}
+    try:
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=_BIAS_HORIZON_DAYS)).isoformat()
+        rows = (sb.table("market_bias_log").select("*")
+                .is_("forward_return_pct", "null").lte("created_at", cutoff)
+                .limit(200).execute().data) or []
+    except Exception as e:
+        logger.debug(f"[market_commentary] score fetch failed: {e}")
+        return {"scored": 0}
+    from engine.alpaca_client import get_latest_price
+    n = 0
+    for r in rows:
+        try:
+            entry = float(r.get("spy_price") or 0)
+            now_px = get_latest_price("SPY")
+            if not entry or not now_px:
+                continue
+            ret = (now_px - entry) / entry * 100.0
+            sb.table("market_bias_log").update({
+                "horizon_days": _BIAS_HORIZON_DAYS, "forward_price": round(float(now_px), 2),
+                "forward_return_pct": round(ret, 3), "correct": _bias_correct(r.get("bias"), ret),
+                "scored_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", r["id"]).execute()
+            n += 1
+        except Exception:
+            continue
+    return {"scored": n}
