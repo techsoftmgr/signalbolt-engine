@@ -120,3 +120,31 @@ def test_bias_correct_scoring():
 def test_log_and_score_bias_no_sb():
     assert mc.log_bias_snapshot(None)["logged"] == 0
     assert mc.score_bias_snapshots(None)["scored"] == 0
+
+
+# ── SPY vs QQQ internals (leadership / divergence) ────────────────────────────
+def test_internals_states(monkeypatch):
+    def setp(spy, qqq):
+        monkeypatch.setattr(mc, "_index_day_pct", lambda: {"SPY": spy, "QQQ": qqq})
+        return mc._internals()
+    assert setp(0.4, 1.3)["state"] == "growth_leading"      # Nasdaq leading
+    assert setp(0.9, 0.1)["state"] == "broad_leading"       # S&P leading
+    assert setp(0.6, -0.6)["divergent"] is True             # split → divergent
+    assert setp(0.5, 0.6)["state"] == "in_line"             # together
+    monkeypatch.setattr(mc, "_index_day_pct", lambda: {"SPY": 0.4})  # missing QQQ
+    assert mc._internals() is None
+
+
+def test_divergence_downgrades_bias_and_emits_event(monkeypatch):
+    monkeypatch.setattr(mc, "_phase", lambda now: "open")
+    monkeypatch.setattr(mc, "_market_bias", lambda: {"bias": "risk-on", "vix": 18, "regime_type": None, "above_200ma": True})
+    monkeypatch.setattr(mc, "_internals", lambda: {"spy_pct": 0.5, "qqq_pct": -0.6, "spread": -1.1, "state": "divergent", "leader": "broad", "divergent": True})
+    for name in ("_index_events", "_sector_event", "_social_events", "_policy_headlines", "_gap_event"):
+        monkeypatch.setattr(mc, name, lambda *a, **k: [])
+    import engine.econ_calendar as _ec
+    monkeypatch.setattr(_ec, "today_and_upcoming", lambda now=None, days=7: {"today": [], "upcoming": [], "has_feed": False})
+    out = mc.build(datetime(2026, 6, 6, 15, 0, tzinfo=timezone.utc))
+    assert out["bias"] == "neutral"                          # split downgrades risk-on
+    assert out["internals"]["divergent"] is True
+    assert any(e["type"] == "DIVERGENCE" for e in out["events"])
+    assert "diverging" in out["summary"]

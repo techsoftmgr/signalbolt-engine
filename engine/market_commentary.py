@@ -202,6 +202,53 @@ def _sector_event() -> list[dict]:
     return []
 
 
+def _index_day_pct() -> dict:
+    """{'SPY': pct, 'QQQ': pct} — each index's move vs its prior session close."""
+    out = {}
+    try:
+        from engine.alpaca_client import get_bars
+        for sym in ("SPY", "QQQ"):
+            try:
+                df = get_bars(sym, "5Min", days=4)
+                if df is None or df.empty:
+                    continue
+                last_day = df.index[-1].date()
+                prior = df[df.index.map(lambda t: t.date() != last_day)]
+                if not len(prior):
+                    continue
+                pc = float(prior["close"].iloc[-1])
+                last = float(df["close"].iloc[-1])
+                if pc:
+                    out[sym] = (last - pc) / pc * 100
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def _internals() -> dict | None:
+    """SPY vs QQQ leadership / divergence — a market-internals read. NOT a
+    correlation coefficient (those are ~always high); what matters is who's
+    leading and whether the two indices SPLIT (a narrow, lower-conviction tape)."""
+    p = _index_day_pct()
+    spy, qqq = p.get("SPY"), p.get("QQQ")
+    if spy is None or qqq is None:
+        return None
+    spread = qqq - spy                         # + = Nasdaq leading, - = S&P leading
+    split = (spy > 0.05 and qqq < -0.05) or (spy < -0.05 and qqq > 0.05)
+    if split:
+        state, leader = "divergent", ("tech" if qqq > spy else "broad")
+    elif spread >= 0.4:
+        state, leader = "growth_leading", "tech"
+    elif spread <= -0.4:
+        state, leader = "broad_leading", "broad"
+    else:
+        state, leader = "in_line", "none"
+    return {"spy_pct": round(spy, 2), "qqq_pct": round(qqq, 2), "spread": round(spread, 2),
+            "state": state, "leader": leader, "divergent": split}
+
+
 def build(now: datetime | None = None) -> dict:
     """Assemble the market tape. Never raises."""
     try:
@@ -209,10 +256,24 @@ def build(now: datetime | None = None) -> dict:
         phase = _phase(now)
         b = _market_bias()
 
+        # SPY vs QQQ internals — leadership + divergence. A split = narrow tape →
+        # downgrade a risk-on/off read to NEUTRAL (lower conviction).
+        intern = _internals()
+        bias = b["bias"]
+        if intern and intern["divergent"] and bias in ("risk-on", "risk-off"):
+            bias = "neutral"
+
         events: list[dict] = []
         if phase in ("premarket", "afterhours", "closed"):
             events += _gap_event(now)
         events += _index_events(phase)
+        if intern and intern["divergent"]:
+            spy, qqq = intern["spy_pct"], intern["qqq_pct"]
+            events.append({
+                "time": now.isoformat(), "type": "DIVERGENCE", "tone": "neutral", "severity": 2,
+                "title": f"S&P {spy:+.1f}% vs Nasdaq {qqq:+.1f}% — index divergence",
+                "detail": "The S&P and Nasdaq are splitting — a narrow tape. Treat the move as "
+                          "lower-conviction until the two realign.", "scope": "internals"})
         events += _sector_event()
         events += _social_events(6)        # market-moving posts (any phase)
         events += _policy_headlines(6)
@@ -230,19 +291,25 @@ def build(now: datetime | None = None) -> dict:
             cal = {"today": [], "upcoming": [], "has_feed": False}
 
         # headline summary
-        bias_word = {"risk-on": "RISK-ON", "risk-off": "RISK-OFF"}.get(b["bias"], "NEUTRAL")
+        bias_word = {"risk-on": "RISK-ON", "risk-off": "RISK-OFF"}.get(bias, "NEUTRAL")
         vix_txt = f" · VIX {_round(b['vix'])}" if b.get("vix") else ""
         phase_txt = {"premarket": "Pre-market", "open": "Market open",
                      "afterhours": "After-hours", "closed": "Market closed"}.get(phase, phase)
         cat_txt = ""
         if cal["today"]:
             cat_txt = " · today: " + ", ".join(c.get("event", "") for c in cal["today"][:2])
-        summary = f"{phase_txt} — tape is {bias_word}{vix_txt}{cat_txt}."
+        intern_txt = ""
+        if intern:
+            intern_txt = {"divergent": " · indices diverging",
+                          "growth_leading": " · tech leading",
+                          "broad_leading": " · broad market leading"}.get(intern["state"], "")
+        summary = f"{phase_txt} — tape is {bias_word}{vix_txt}{intern_txt}{cat_txt}."
 
         return {
             "available": True, "phase": phase,
             "as_of": now.isoformat(),
-            "bias": b["bias"], "vix": b.get("vix"), "regime_type": b.get("regime_type"),
+            "bias": bias, "vix": b.get("vix"), "regime_type": b.get("regime_type"),
+            "internals": intern,
             "summary": summary,
             "events": events,
             "catalysts": cal["today"],
