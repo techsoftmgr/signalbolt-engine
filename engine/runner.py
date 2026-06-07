@@ -2932,6 +2932,27 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled ticker-commentary alerts every 10 min (env-gated)")
 
+    # ── Market Tape alerts (V2): market-moving SOCIAL posts (any hour) + major
+    # index events (RTH). NOT RTH-gated at the scheduler level — Trump-type posts
+    # move futures overnight; market_alerts.run() self-gates the market-event part.
+    # ENV-gated by MARKET_ALERTS_ENABLED. ──
+    def _run_market_alerts():
+        try:
+            from engine import market_alerts
+            market_alerts.run()
+        except Exception as _e:
+            logger.error(f"[runner] market alerts failed: {_e}")
+
+    scheduler.add_job(
+        _run_market_alerts,
+        trigger=IntervalTrigger(minutes=3),
+        id="market_alerts",
+        name="Market Tape alerts — social posts + index events (3-min)",
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=150),
+    )
+    logger.info("[runner] Scheduled market-tape alerts every 3 min (env-gated)")
+
     # ── Breakdown / heavy-selling alerts (universe-wide, 15-min) ─────────────
     # Two-stage broadcast: EARLY (lost 20-day avg on heavy down-vol) + CONFIRMED
     # (broke 20-day low on vol). Reuses the cached full quant scan; per-ticker

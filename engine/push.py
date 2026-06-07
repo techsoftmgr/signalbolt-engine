@@ -42,6 +42,8 @@ _DEFAULT_PREFS = {
     "accumulation_alerts": True, # universe-wide unusual-buying (heavy up-volume) alerts
     "premarket_gap_alerts": True, # premarket disaster-gap heads-up for open overnight positions (notification only)
     "commentary_alerts": True,    # live intraday events on a watched ticker (MACD cross, breakout, VWAP, gap, sharp move)
+    "market_alerts":   True,      # market-wide tape events (VIX spike, index key-level break, sector flip)
+    "social_alerts":   True,      # market-moving posts (e.g. Trump via the social feed)
 }
 
 # Single Supabase client reused for the lifetime of the process
@@ -538,6 +540,52 @@ def send_breakout_alert(
         return len(messages)
     except Exception as e:
         logger.debug(f"[push] breakout alert failed for {ticker}: {e}")
+        return 0
+
+
+def send_market_alert(title: str, body: str, kind: str = "market") -> int:
+    """Broadcast a market-wide tape event (VIX spike, index key-level break,
+    sector flip) to all users with 'market_alerts' on (default on). Educational
+    market context. Returns the number dispatched; caller handles dedup/caps."""
+    try:
+        _record_alert("market", None, title, body, stage=kind, data={"kind": kind})
+        tokens = _tokens_for("market_alerts", default=True)
+        if not tokens:
+            return 0
+        messages = [
+            {"to": t, "title": title, "body": body,
+             "data": {"type": "market_alert", "kind": kind},
+             "sound": "default", "badge": 1}
+            for t in tokens
+        ]
+        _dispatch(messages, f"MARKET {kind}")
+        return len(messages)
+    except Exception as e:
+        logger.debug(f"[push] market alert failed: {e}")
+        return 0
+
+
+def send_social_alert(author: str, text: str, url: str | None = None) -> int:
+    """Broadcast a market-moving social post (e.g. Trump via the social feed) to
+    all users with 'social_alerts' on (default on). Returns the number dispatched;
+    the caller handles per-post dedup + cold-start seeding."""
+    try:
+        title = f"🗣️ {author or 'Market-moving post'}"
+        body = (text or "").strip()[:200]
+        _record_alert("social", None, title, body, data={"url": url, "author": author})
+        tokens = _tokens_for("social_alerts", default=True)
+        if not tokens:
+            return 0
+        messages = [
+            {"to": t, "title": title, "body": body,
+             "data": {"type": "social_alert", "url": url},
+             "sound": "default", "badge": 1}
+            for t in tokens
+        ]
+        _dispatch(messages, f"SOCIAL {author}")
+        return len(messages)
+    except Exception as e:
+        logger.debug(f"[push] social alert failed: {e}")
         return 0
 
 
