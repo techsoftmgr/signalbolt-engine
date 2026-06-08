@@ -35,6 +35,20 @@ def _base(**over):
     return r
 
 
+# 0 ── scenario-tree targets never contradict their trigger (DRAM bug class) ──
+def test_scenario_tree_targets_directionally_sane():
+    # Force the fallback path: no scenario targets from chart_read, and an
+    # invalidation that sits ABOVE the bear trigger (the contradictory case).
+    r = _base(scenarios={"bull": {"trigger": 110.0}, "bear": {"trigger": 90.0}},
+              fib={"direction": "up", "goldenPocket": {"low": 84.0, "high": 88.0},
+                   "invalidation": 95.0, "target": 130.0})   # inval 95 > bear trig 90
+    tree = ds.derive(r)["scenario_tree"]
+    bt = tree["bearish"].get("target")
+    bl = tree["bullish"].get("target")
+    assert bt is None or bt < 90.0     # downside target must be below the lose level
+    assert bl is None or bl > 110.0    # upside target must be above the reclaim level
+
+
 # 1 ── quant bullish + technical bullish + near resistance => WAIT
 def test_action_wait_near_resistance():
     r = _base(taBias="bullish", quantBias="bullish", agreement="agree",

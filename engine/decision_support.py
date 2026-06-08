@@ -280,6 +280,14 @@ def _scenario_tree(f: dict, probs: dict) -> dict:
     bull_tgt = f["bull_tgt"] or (f["fib_tgt"] if (f["fib_tgt"] and f["fib_tgt"] > (px or 0)) else None) or f["res"]
     bear_trig = f["bear_trig"] or f["sup"]
     bear_tgt = f["bear_tgt"] or f["inval"] or f["sup"]
+    # Directional sanity (mirror of chart_read._scenarios): an upside target must
+    # sit ABOVE the reclaim level and a downside target BELOW the lose level —
+    # the fallbacks above (res == bull_trig, inval/sup at-or-above bear_trig) can
+    # violate that, so drop a contradictory target rather than show it.
+    if bull_tgt is not None and bull_trig is not None and bull_tgt <= bull_trig:
+        bull_tgt = None
+    if bear_tgt is not None and bear_trig is not None and bear_tgt >= bear_trig:
+        bear_tgt = None
     rng = None
     if bear_trig and bull_trig:
         rng = f"Holds between ${bear_trig} and ${bull_trig}"
