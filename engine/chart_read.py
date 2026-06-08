@@ -297,26 +297,50 @@ def _patterns(df: pd.DataFrame, hi_idx: list[int], lo_idx: list[int], tl: dict) 
 
 
 # ── Fibonacci (auto-anchored to the most recent swing) ────────────────────────
-def _fib_explain(direction: str, gp: dict, target, lo: float, hi: float, inval: float) -> str:
+def _fib_explain(direction: str, gp: dict, target, lo: float, hi: float, inval: float,
+                 status: dict | None = None) -> str:
     """Plain-English read of the Fib overlay — what the levels mean + how to use
-    them (dip/bounce zone, target, invalidation). 'Golden pocket' demystified."""
+    them (dip/bounce zone, target, invalidation). 'Golden pocket' demystified.
+    Price-aware: if price has slipped below (up) / above (down) the zone, the
+    dip-buy/bounce framing is no longer valid — say so instead of implying a buy."""
     band = f"${gp['low']}–${gp['high']}"
+    pos = (status or {}).get("position")
+    failed = (status or {}).get("failed")
     if direction == "up":
+        if failed:
+            return (f"Ran from ${round(lo,2)} up to ${round(hi,2)}, then gave it all back. Price is now below "
+                    f"the 78.6% level (~${round(inval,2)}) — the {band} 'golden pocket' dip-buy zone has FAILED, "
+                    f"so it is overhead resistance now, not a buy area. A reclaim of {band} is the first sign the run is repairing.")
+        if pos == "below":
+            return (f"Ran from ${round(lo,2)} up to ${round(hi,2)}. Price has slipped below the {band} 'golden pocket' "
+                    f"(50–61.8%) dip-buy zone, so that zone is overhead now — it would need to reclaim {band} to put the "
+                    f"dip-buy thesis back in play. A close below ~${round(inval,2)} (78.6%) says the run failed.")
         return (f"Ran from ${round(lo,2)} up to ${round(hi,2)}. The {band} band (50–61.8% "
                 f"retracement — the 'golden pocket') is the most-watched dip-buy zone: a hold/bounce "
                 f"there is a lower-risk add. A close below ~${round(inval,2)} (78.6%) says the run failed. "
                 f"If it resumes, the 1.618 extension targets ~${target}.")
+    if failed:
+        return (f"Fell from ${round(hi,2)} down to ${round(lo,2)}, then reclaimed. Price is now above the 78.6% level "
+                f"(~${round(inval,2)}) — the {band} bounce/sell zone has FAILED, so the drop is reversing. If it resumes, the 1.618 extension targets ~${target}.")
+    if pos == "above":
+        return (f"Fell from ${round(hi,2)} down to ${round(lo,2)}. Price is above the {band} (50–61.8%) bounce/sell "
+                f"zone — a pullback into {band} is where sellers often re-enter. A close above ~${round(inval,2)} (78.6%) says the drop is reversing.")
     return (f"Fell from ${round(hi,2)} down to ${round(lo,2)}. The {band} band (50–61.8% retracement) "
             f"is the most-watched bounce/lower-entry zone: sellers often re-enter there. A close above "
             f"~${round(inval,2)} (78.6%) says the drop is reversing. If the decline resumes, the 1.618 "
             f"extension targets ~${target}.")
 
 
-def _fib(df: pd.DataFrame, lookback: int = 60) -> Optional[dict]:
+def _fib(df: pd.DataFrame, lookback: int = 60, price: float | None = None) -> Optional[dict]:
     """Auto-anchored Fibonacci over the most recent significant swing in the last
     `lookback` bars. Direction = the most recent leg (whichever of the swing
     high/low is more recent). Returns retracement levels + golden pocket (dip/
-    bounce zone) + 1.272/1.618 extension targets + a plain-English read."""
+    bounce zone) + 1.272/1.618 extension targets + a plain-English read.
+
+    `price` makes the zone price-aware: `status.position` (above/inside/below the
+    golden pocket) + `status.failed` (price beyond the 78.6% level → the leg's
+    dip-buy/bounce thesis is broken) so the UI never shows a "buy area" the price
+    has already fallen through."""
     sub = df.tail(lookback)
     if len(sub) < 10:
         return None
@@ -343,12 +367,29 @@ def _fib(df: pd.DataFrame, lookback: int = 60) -> Optional[dict]:
     target = extensions[-1]["price"]          # 1.618 projection
     inval  = at(0.786)                         # break beyond 78.6% = leg failed
 
+    # Price-aware status: where is price vs the golden pocket, and has the leg failed?
+    status = None
+    if price is not None:
+        try:
+            px = float(price)
+            if golden["low"] <= px <= golden["high"]:
+                pos = "inside"
+            elif px > golden["high"]:
+                pos = "above"
+            else:
+                pos = "below"
+            failed = (px < inval) if up_leg else (px > inval)
+            status = {"position": pos, "failed": bool(failed)}
+        except (TypeError, ValueError):
+            status = None
+
     return {
         "direction": direction,
         "swingHigh": round(hi, 2), "swingLow": round(lo, 2),
         "levels": levels, "extensions": extensions,
         "goldenPocket": golden, "target": target, "invalidation": round(inval, 2),
-        "explain": _fib_explain(direction, golden, target, lo, hi, inval),
+        "status": status,
+        "explain": _fib_explain(direction, golden, target, lo, hi, inval, status),
     }
 
 
@@ -517,7 +558,7 @@ def analyze(symbol: str, timeframe: str = "1Day") -> Optional[dict]:
     gap = _gaps(daily, trend_d)
     vol = _volume_regime(daily)
     pats = _patterns(daily, hi_idx, lo_idx, tl)
-    fib = _fib(daily)
+    fib = _fib(daily, price=px)
     scenarios = _scenarios(px, lv, fib, pats)
 
     # MTF
