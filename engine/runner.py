@@ -2973,6 +2973,26 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled per-ticker news alerts every 5 min (env-gated)")
 
+    # ── Market Tape warmer — precompute the market-wide tape every ~60s into the
+    # shared cache so /market/commentary returns instantly (no per-request rebuild
+    # of SPY/QQQ/VIX/sector/news). All hours; best-effort. ──
+    def _run_warm_market_tape():
+        try:
+            from engine import market_commentary
+            market_commentary.build()
+        except Exception as _e:
+            logger.error(f"[runner] market tape warm failed: {_e}")
+
+    scheduler.add_job(
+        _run_warm_market_tape,
+        trigger=IntervalTrigger(seconds=60),
+        id="warm_market_tape",
+        name="Market Tape cache warmer (60s)",
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=20),
+    )
+    logger.info("[runner] Scheduled market-tape cache warmer every 60s")
+
     # ── Breakdown / heavy-selling alerts (universe-wide, 15-min) ─────────────
     # Two-stage broadcast: EARLY (lost 20-day avg on heavy down-vol) + CONFIRMED
     # (broke 20-day low on vol). Reuses the cached full quant scan; per-ticker

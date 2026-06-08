@@ -82,6 +82,29 @@ def test_build_assembles_and_never_raises(monkeypatch):
     assert len(out["events"]) <= mc._MAX_EVENTS
 
 
+def test_build_caches_market_wide(monkeypatch):
+    class _KV:
+        def __init__(self): self.d = {}
+        def get_json(self, k): return self.d.get(k)
+        def set_json(self, k, v, ttl): self.d[k] = v
+    import engine.cache as cache_mod
+    monkeypatch.setattr(cache_mod, "kv", _KV())
+    calls = {"n": 0}
+    def _bias():
+        calls["n"] += 1
+        return {"bias": "neutral", "vix": 18, "regime_type": None, "above_200ma": True}
+    monkeypatch.setattr(mc, "_phase", lambda now: "open")
+    monkeypatch.setattr(mc, "_market_bias", _bias)
+    monkeypatch.setattr(mc, "_internals", lambda: None)
+    for name in ("_index_events", "_sector_event", "_social_events", "_policy_headlines", "_gap_event"):
+        monkeypatch.setattr(mc, name, lambda *a, **k: [])
+    import engine.econ_calendar as _ec
+    monkeypatch.setattr(_ec, "today_and_upcoming", lambda now=None, days=7: {"today": [], "upcoming": [], "has_feed": False})
+    mc.build()   # computes + caches
+    mc.build()   # served from cache (no recompute)
+    assert calls["n"] == 1
+
+
 def test_build_degrades_when_everything_fails(monkeypatch):
     # all sub-blocks raise → build still returns a usable, neutral object
     for name in ("_index_events", "_sector_event", "_policy_headlines", "_gap_event"):
