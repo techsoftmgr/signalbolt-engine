@@ -3336,6 +3336,39 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled market-bias track record (log 3:50pm / score 10:15am ET)")
 
+    # ── Expert Read self-grade (Pass 2) ──────────────────────────────────
+    # Log the levels the daily read flagged near the close, then score after the
+    # horizon (did the flagged support/resistance actually act as support/
+    # resistance?). Descriptive accuracy, not prediction. Best-effort; no-ops if
+    # the read_accuracy_log table hasn't been created.
+    def _run_log_read_accuracy():
+        try:
+            from engine import read_accuracy
+            read_accuracy.log_levels(_supabase())
+        except Exception as _e:
+            logger.error(f"[runner] log read accuracy failed: {_e}")
+
+    def _run_score_read_accuracy():
+        try:
+            from engine import read_accuracy
+            read_accuracy.score_levels(_supabase())
+        except Exception as _e:
+            logger.error(f"[runner] score read accuracy failed: {_e}")
+
+    scheduler.add_job(
+        _run_log_read_accuracy,
+        trigger=CronTrigger(hour=16, minute=5, timezone="America/New_York"),
+        id="log_read_accuracy", name="Expert Read level snapshot (4:05 PM ET)",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _run_score_read_accuracy,
+        trigger=CronTrigger(hour=10, minute=20, timezone="America/New_York"),
+        id="score_read_accuracy", name="Expert Read level forward scorer (10:20 AM ET)",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled read-accuracy self-grade (log 4:05pm / score 10:20am ET)")
+
     # ── EOD phantom-data audit — 4:50 PM ET ──────────────────────────────
     # Verify the day's closes against the real 1-min tape so bad-price/phantom
     # closes are caught same-day (not a month later). Admin-only alert.

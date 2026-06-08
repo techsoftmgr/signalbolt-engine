@@ -4763,6 +4763,20 @@ async def admin_market_bias_stats(request: Request, days: int = 90):
         return {"scored": 0, "correct_pct": None, "note": "Track record not available yet (table may be empty/uncreated)."}
 
 
+@app.get("/admin/read-accuracy")
+async def admin_read_accuracy(request: Request, days: int = 90):
+    """Expert Read self-grade — of the support/resistance levels the daily read
+    flagged, how often did they actually act as support/resistance? Descriptive
+    accuracy, NOT a directional win-rate. Admin-only."""
+    _, sb = _require_admin_jwt(request)
+    try:
+        from engine import read_accuracy
+        return read_accuracy.stats(sb, days=days)
+    except Exception as e:
+        logger.debug(f"GET /admin/read-accuracy error: {e}")
+        return {"available": False, "note": "Track record not available yet (table may be empty/uncreated)."}
+
+
 # ── News Reaction Feed ────────────────────────────────────────────────────────
 
 @app.get("/news/reaction")
