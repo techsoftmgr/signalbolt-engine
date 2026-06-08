@@ -323,12 +323,13 @@ def _fib_explain(direction: str, gp: dict, target, lo: float, hi: float, inval: 
         return (f"Fell from ${round(hi,2)} down to ${round(lo,2)}, then reclaimed. Price is now above the 78.6% level "
                 f"(~${round(inval,2)}) — the {band} bounce/sell zone has FAILED, so the drop is reversing. If it resumes, the 1.618 extension targets ~${target}.")
     if pos == "above":
-        return (f"Fell from ${round(hi,2)} down to ${round(lo,2)}. Price is above the {band} (50–61.8%) bounce/sell "
-                f"zone — a pullback into {band} is where sellers often re-enter. A close above ~${round(inval,2)} (78.6%) says the drop is reversing.")
-    return (f"Fell from ${round(hi,2)} down to ${round(lo,2)}. The {band} band (50–61.8% retracement) "
-            f"is the most-watched bounce/lower-entry zone: sellers often re-enter there. A close above "
-            f"~${round(inval,2)} (78.6%) says the drop is reversing. If the decline resumes, the 1.618 "
-            f"extension targets ~${target}.")
+        return (f"Fell from ${round(hi,2)} down to ${round(lo,2)}. Price sits above the {band} (50–61.8%) zone — "
+                f"a bounce into {band} is where sellers most often re-enter, so it acts as resistance, not a dip-buy. "
+                f"A close above ~${round(inval,2)} (78.6%) says the drop is reversing.")
+    return (f"Fell from ${round(hi,2)} down to ${round(lo,2)} — this is a downtrend, so there's no dip-buy zone yet. "
+            f"The {band} band (50–61.8% retracement) is where a relief bounce most often stalls and sellers re-enter, "
+            f"so treat it as overhead resistance, not a buy. A close above ~${round(inval,2)} (78.6%) would be the "
+            f"first sign the drop is reversing. If the decline resumes, the 1.618 extension targets ~${target}.")
 
 
 def _fib(df: pd.DataFrame, lookback: int = 60, price: float | None = None) -> Optional[dict]:
