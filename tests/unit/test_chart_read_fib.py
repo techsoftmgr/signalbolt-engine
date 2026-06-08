@@ -45,3 +45,35 @@ def test_levels_present_and_ordered():
 def test_flat_returns_none():
     flat = pd.DataFrame({"high": [100.0] * 60, "low": [100.0] * 60, "close": [100.0] * 60})
     assert _fib(flat) is None   # zero range → no fib
+
+
+# ── price-aware status (the COIN "buy area $185–193 while at $162" bug) ─────────
+def _up_df():
+    closes = list(np.linspace(150, 220, 45)) + list(np.linspace(220, 210, 15))
+    return _df(closes)
+
+
+def test_status_none_without_price_backcompat():
+    f = _fib(_up_df())
+    assert f["status"] is None          # no price passed → unchanged behavior
+
+
+def test_price_inside_pocket_is_active():
+    f0 = _fib(_up_df()); gp = f0["goldenPocket"]
+    f = _fib(_up_df(), price=(gp["low"] + gp["high"]) / 2)
+    assert f["status"]["position"] == "inside" and f["status"]["failed"] is False
+
+
+def test_price_below_pocket_is_overhead_not_buy():
+    f0 = _fib(_up_df()); gp, inval = f0["goldenPocket"], f0["invalidation"]
+    f = _fib(_up_df(), price=(gp["low"] + inval) / 2)   # below pocket, above 78.6%
+    assert f["status"]["position"] == "below" and f["status"]["failed"] is False
+    assert "overhead" in f["explain"].lower()
+    assert "dip-buy zone: a hold" not in f["explain"].lower()   # not framed as a buy
+
+
+def test_price_under_invalidation_is_failed():
+    inval = _fib(_up_df())["invalidation"]
+    f = _fib(_up_df(), price=inval - 15)                 # below 78.6% → leg failed
+    assert f["status"]["failed"] is True
+    assert "failed" in f["explain"].lower() and "overhead resistance" in f["explain"].lower()
