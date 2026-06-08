@@ -4678,6 +4678,15 @@ async def ticker_chart_read(request: Request, symbol: str, tf: str = "1Day"):
                 r["decision_support"] = decision_support.derive(r, historical=hist)
             except Exception as e:
                 logger.debug(f"decision_support derive failed for {sym}: {e}")
+            # ── ADDITIVE: app-wide read self-grade (descriptive accuracy, not a
+            # prediction). Cached 1h; renders in-app only when data has accrued. ──
+            try:
+                from engine import read_accuracy
+                tr = read_accuracy.stats_cached(sb)
+                if tr and tr.get("available"):
+                    r["readTrackRecord"] = tr
+            except Exception as e:
+                logger.debug(f"read track record failed for {sym}: {e}")
         result = r or {"ticker": sym, "unavailable": True}
         # Scrub technical wording → friendly for non-admin callers (admins get raw).
         if not _is_admin_request(request):

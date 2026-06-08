@@ -148,3 +148,26 @@ def stats(sb, days: int = 90) -> dict:
         "resistance": {"tested": len(r_tested), "held_pct": round(r_held / len(r_tested) * 100) if r_tested else None},
         "note": "How often flagged levels acted as support/resistance — descriptive accuracy, not a prediction.",
     }
+
+
+_CACHE_KEY = "read_accuracy:stats:v1"
+_CACHE_TTL = 3600   # app-wide aggregate moves slowly; 1h cache avoids a DB hit per read
+
+
+def stats_cached(sb, days: int = 90) -> dict:
+    """App-wide stats with a 1h cache so it can ride along on every chart-read
+    without a per-request DB hit. Falls back to a direct read if cache is down."""
+    try:
+        from engine.cache import kv
+        hit = kv.get_json(_CACHE_KEY)
+        if hit is not None:
+            return hit
+    except Exception:
+        kv = None
+    out = stats(sb, days=days)
+    try:
+        if kv is not None and out.get("available"):
+            kv.set_json(_CACHE_KEY, out, _CACHE_TTL)
+    except Exception:
+        pass
+    return out
