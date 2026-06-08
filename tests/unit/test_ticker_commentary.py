@@ -119,7 +119,7 @@ def test_intraday_idea_educational_and_rr_floor():
     # good R:R bullish setup → idea, educational, rr >= floor
     good = tc._intraday_idea("bullish", price=100.0, swing_lo=98.0, swing_hi=112.0, atr=1.0)
     assert good is not None and good["rr"] >= tc._MIN_RR
-    assert "not advice" in good["text"].lower()
+    assert "educational" in good["text"].lower()
     assert "buy now" not in good["text"].lower() and "guaranteed" not in good["text"].lower()
     # poor R:R (target barely above entry, stop far) → suppressed entirely
     poor = tc._intraday_idea("bullish", price=100.0, swing_lo=95.0, swing_hi=100.4, atr=1.0)

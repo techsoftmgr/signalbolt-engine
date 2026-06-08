@@ -136,8 +136,8 @@ def _intraday_idea(tone: str, price: float, swing_lo: float, swing_hi: float, at
             return None
         return {"bias": "long", "entry": _round(price), "invalidation": stop, "target": tgt,
                 "rr": round(rr, 1),
-                "text": f"Intraday: setup favors a long near ${_round(price)} — invalidation below "
-                        f"${stop}, first upside ~${tgt} (R:R {round(rr,1)}). Educational, not advice."}
+                "text": f"Intraday long plan (if/then) — IF holding near ${_round(price)}: invalidation below "
+                        f"${stop}, first level ~${tgt} (R:R {round(rr,1)}). Educational, not a prediction."}
     if tone == "bearish":
         stop = _round(max(swing_hi, price + 1.2 * atr) + buf)   # above the swing high + buffer
         tgt = _round(min(swing_lo, price - 1.6 * atr))
@@ -148,8 +148,8 @@ def _intraday_idea(tone: str, price: float, swing_lo: float, swing_hi: float, at
             return None
         return {"bias": "short", "entry": _round(price), "invalidation": stop, "target": tgt,
                 "rr": round(rr, 1),
-                "text": f"Intraday: setup favors a short near ${_round(price)} — invalidation above "
-                        f"${stop}, first downside ~${tgt} (R:R {round(rr,1)}). Educational, not advice."}
+                "text": f"Intraday short plan (if/then) — IF rejecting near ${_round(price)}: invalidation above "
+                        f"${stop}, first level ~${tgt} (R:R {round(rr,1)}). Educational, not a prediction."}
     return None
 
 

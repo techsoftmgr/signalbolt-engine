@@ -110,24 +110,25 @@ def _factors(read: dict) -> dict:
 
 # ── Feature 1: Decision Summary (action + reason + confidence + quality + RR) ──
 def _action(f: dict) -> tuple[str, str]:
-    """Action label + one-sentence reason. Priority-ordered. No advice language."""
+    """Action label + one-sentence STATE description (what is true now) — not a
+    forecast. Priority-ordered. No advice/prediction language."""
     if (f["trend_down"] or f["ta_bear"]) and f["lost_support"]:
-        return "AVOID", "Trend is bearish and price has lost a key support level — setup favors downside."
+        return "AVOID", "State: down-trend and a key support level is lost — conditions are not constructive for a long."
     if f["breakout_confirmed"]:
-        return "BREAKOUT CONFIRMATION", "Price has reclaimed resistance with an up-trend — breakout is confirming."
+        return "BREAKOUT CONFIRMATION", "State: price has closed back above resistance in an up-trend — the breakout condition is met."
     if f["near_target"] and (f["trend_up"] or f["ta_bull"]):
-        return "TAKE PROFIT / REDUCE RISK", "Price is already near the measured target — reward is mostly captured and risk increases here."
+        return "TAKE PROFIT / REDUCE RISK", "State: price is already at the measured target — most of the move is behind, risk rises from here."
     if f["quant_bull"] and f["ta_bull"] and f["in_gp"] and not f["trend_down"]:
-        return "BUY ZONE", "Quant and technical reads agree bullish and price is inside the ideal pullback (golden-pocket) zone."
+        return "BUY ZONE", "State: chart and model agree up, and price is inside the pullback (golden-pocket) area."
     if f["quant_bull"] and f["ta_bull"] and f["near_res"]:
-        return "WAIT", "Bullish trend is intact, but price is too close to resistance — cleaner entry on a pullback or a confirmed breakout."
+        return "WAIT", "State: up-trend, but price is at resistance — no trigger met. A daily close above resistance, or a pullback, would set one up."
     if f["disagree"]:
-        return "WATCH", "Technical and quant reads disagree — watch which side resolves before acting."
+        return "WATCH", "State: chart and model disagree — no edge until one side confirms; watch which resolves."
     if f["ta_bull"] and f["quant_bull"]:
-        return "WATCH", "Both reads lean bullish but there is no clean entry trigger yet — watch for a pullback or breakout."
+        return "WATCH", "State: chart and model are both up, but no clean trigger yet — watch for a close above resistance or a pullback."
     if (f["ta_bear"] and f["quant_bear"]) or (f["trend_down"] and f["ta_bear"]):
-        return "AVOID", "Reads lean bearish — setup does not favor a long here."
-    return "WAIT", "No clean edge yet — the read is neutral or undecided."
+        return "AVOID", "State: chart and model are both down — conditions don't support a long here."
+    return "WAIT", "State: no clear edge — conditions are mixed/neutral."
 
 
 def _confidence_label(f: dict) -> str:
@@ -259,6 +260,17 @@ def _drivers(f: dict) -> list:
     add("TA & Quant disagree", False, f["disagree"])
     add("Daily trend bearish", False, f["trend_down"])
     return d[:8]
+
+
+def _scorecard(f: dict) -> dict:
+    """Conditions Scorecard — a factual tally of what's TRUE right now (no
+    forecast %). The user weighs it; we don't predict a direction."""
+    items = _drivers(f)
+    bull = sum(1 for d in items if d["supportive"])
+    bear = len(items) - bull
+    lean = "constructive" if bull > bear else "cautious" if bear > bull else "balanced"
+    return {"items": items, "bullish": bull, "bearish": bear, "total": len(items),
+            "summary": f"{bull} of {len(items)} conditions constructive · {lean}"}
 
 
 # ── Feature 3: Scenario Tree ──────────────────────────────────────────────────
@@ -556,6 +568,7 @@ def derive(read: dict, now: datetime | None = None,
             "bearish_probability": probs["bearish"],
             "probability_confidence": probs["confidence_label"],
             "probability_drivers": _drivers(f),
+            "scorecard": _scorecard(f),
             "scenario_tree": _scenario_tree(f, probs),
             "entry_quality": _entry_quality(f, rr),
             "reasons_for": for_,
