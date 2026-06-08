@@ -39,3 +39,33 @@ def test_swing_low_fallback_when_no_support():
 
 def test_none_when_no_levels():
     assert _scenarios(100.0, {"resistance": None, "support": None}, None, []) is None
+
+
+def test_bear_target_below_trigger_not_just_below_price():
+    # Regression (DRAM): a Fib level below price but ABOVE the breakdown trigger
+    # must NOT be used as the downside target.
+    px = 65.0
+    lv = {"resistance": 70.0, "support": 57.99}
+    fib = {"direction": "up", "swingLow": 50.0, "swingHigh": 75.0,
+           "levels": [{"price": 59.76}, {"price": 68.0}],   # 59.76 is below px but ABOVE 57.99
+           "extensions": [{"price": 84.0}, {"price": 90.0}], "goldenPocket": {"low": 60, "high": 63}}
+    sc = _scenarios(px, lv, fib, [])
+    assert sc["bear"]["trigger"] == 57.99
+    assert sc["bear"]["target"] != 59.76                 # the nonsensical value is gone
+    assert sc["bear"]["target"] < sc["bear"]["trigger"]  # downside target sits BELOW the trigger
+    assert sc["bear"]["target"] == 50.0                  # falls back to the swing low
+
+
+def test_targets_never_contradict_direction():
+    # Whatever the geometry, an upside target is above its trigger and a downside
+    # target is below its trigger (or omitted).
+    px = 100.0
+    lv = {"resistance": 102.0, "support": 99.0}
+    fib = {"direction": "up", "swingLow": 98.0, "swingHigh": 101.0,
+           "levels": [{"price": 99.5}, {"price": 100.5}],
+           "extensions": [{"price": 103.0}, {"price": 104.0}], "goldenPocket": {"low": 99.2, "high": 99.8}}
+    sc = _scenarios(px, lv, fib, [])
+    if sc.get("bull") and sc["bull"].get("target") is not None:
+        assert sc["bull"]["target"] > sc["bull"]["trigger"]
+    if sc.get("bear") and sc["bear"].get("target") is not None:
+        assert sc["bear"]["target"] < sc["bear"]["trigger"]

@@ -433,16 +433,27 @@ def _scenarios(px: float, lv: dict, fib: Optional[dict], pats: list) -> Optional
         bear_trig = bear_pat["neckline"]
     if bear_trig is None and fib and (fib.get("swingLow") or 0) < px:
         bear_trig = fib["swingLow"]                                         # at the lows → the swing low
-    # Bear target: next level to watch BELOW the trigger
+    # Bear target: next level to watch BELOW the trigger (NOT just below price —
+    # a downside target must sit beyond the level you lose, else it's nonsense).
+    bear_ref = bear_trig if bear_trig is not None else px
     bear_tgt = None
-    if bear_pat and 0 < (bear_pat.get("target") or 0) < px:
+    if bear_pat and 0 < (bear_pat.get("target") or 0) < bear_ref:
         bear_tgt = bear_pat["target"]
     elif fib:
         if fib.get("direction") == "down" and fib.get("extensions"):
             bear_tgt = fib["extensions"][0]["price"]                       # 1.272 down-extension
         else:
-            downs = sorted((l["price"] for l in fib.get("levels", []) if l["price"] < px), reverse=True)
+            downs = sorted((l["price"] for l in fib.get("levels", []) if l["price"] < bear_ref), reverse=True)
             bear_tgt = downs[0] if downs else None
+            if bear_tgt is None and (fib.get("swingLow") or 0) and fib["swingLow"] < bear_ref:
+                bear_tgt = fib["swingLow"]                                  # fall back to the swing low
+
+    # ── Sanity: targets must point the right way (above the bull trigger / below
+    # the bear trigger). Drop a target that would contradict its own direction. ──
+    if bull_tgt is not None and bull_trig is not None and bull_tgt <= bull_trig:
+        bull_tgt = None
+    if bear_tgt is not None and bear_trig is not None and bear_tgt >= bear_trig:
+        bear_tgt = None
 
     bull = {"trigger": _round(bull_trig), "then": "bullish — upside / bottom holding",
             "target": _round(bull_tgt)} if bull_trig else None
