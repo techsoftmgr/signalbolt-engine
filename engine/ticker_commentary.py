@@ -29,12 +29,34 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
+try:
+    from zoneinfo import ZoneInfo
+    _ET = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover
+    _ET = None
+
 logger = logging.getLogger("signalbolt.ticker_commentary")
 
 _DISCLAIMER = "Live technical commentary — educational awareness, not financial advice."
 _MAX_EVENTS = 30
-_MOVE_PCT = 1.2          # single-bar % move to flag a surge/dump
-_VOL_SPIKE = 3.0         # bar volume vs trailing avg to flag a volume spike
+_MOVE_PCT = 1.2          # single-bar % move to flag a surge/dump (regular hours)
+_MOVE_PCT_EXT = 2.5      # bigger move required pre/after-hours (thin tape)
+_VOL_SPIKE = 3.0         # bar volume vs trailing avg (regular hours)
+_VOL_SPIKE_EXT = 5.0     # higher bar pre/after-hours so a thin print isn't a "spike"
+
+
+def _bar_session(ts) -> str:
+    """'pre' / 'rth' / 'after' from a (UTC) bar timestamp, evaluated in ET."""
+    try:
+        et = ts.tz_convert(_ET) if hasattr(ts, "tz_convert") else ts.astimezone(_ET)
+        mins = et.hour * 60 + et.minute
+        if mins < 9 * 60 + 30:
+            return "pre"
+        if mins >= 16 * 60:
+            return "after"
+        return "rth"
+    except Exception:
+        return "rth"
 
 # per-(type) cooldown in BARS on the detection timeframe (avoids machine-gun events)
 _COOLDOWN = {
@@ -195,7 +217,7 @@ def _detect_tf(df: pd.DataFrame, tf_label: str, prior_close: float | None,
             detail = f"{detail} Counter-trend — the tape is {bias}; lower-odds, watch only."
         ev = {"time": idx[i].isoformat(), "tf": tf_label, "type": kind, "tone": tone,
               "severity": sev, "title": title, "detail": detail, "price": _round(price),
-              "against_trend": against}
+              "against_trend": against, "session": _bar_session(idx[i])}
         # An idea is attached ONLY when it agrees with the session bias — never
         # against the tape (that's what produced the losing counter-trend long).
         if idea and not against:
@@ -294,22 +316,32 @@ def _detect_tf(df: pd.DataFrame, tf_label: str, prior_close: float | None,
             emit("ORB", i, "bearish", 2, f"Broke the opening range low ({tf_label})",
                  f"Lost the first-30m low ${_round(orb_lo)} — intraday breakdown attempt.", px[i])
 
+        # session-aware thresholds — pre/after-hours tape is thin, so a "spike" or
+        # "sharp move" needs to clear a higher bar before it's worth surfacing.
+        sess_i = _bar_session(idx[i])
+        ext = sess_i in ("pre", "after")
+        sess_word = {"pre": "Premarket ", "after": "After-hours "}.get(sess_i, "")
+        thin = " (thin premarket tape)" if sess_i == "pre" else " (thin after-hours tape)" if sess_i == "after" else ""
+
         # volume spike
         avg_v = float(np.mean(vol[max(0, i - 20):i])) or 1.0
-        if ok("VOLUME", i) and vol[i] >= _VOL_SPIKE * avg_v:
+        vol_mult = _VOL_SPIKE_EXT if ext else _VOL_SPIKE
+        if ok("VOLUME", i) and vol[i] >= vol_mult * avg_v:
             up = px[i] >= px[i - 1]
-            emit("VOLUME", i, "bullish" if up else "bearish", 2, f"Volume spike ({tf_label})",
-                 f"Volume hit ~{vol[i] / avg_v:.1f}× the recent average on a {'green' if up else 'red'} bar.", px[i])
+            emit("VOLUME", i, "bullish" if up else "bearish", 2,
+                 f"{sess_word}Volume spike ({tf_label})",
+                 f"Volume hit ~{vol[i] / avg_v:.1f}× the recent average on a {'green' if up else 'red'} bar{thin}.", px[i])
 
         # sharp single-bar move
+        move_thr = _MOVE_PCT_EXT if ext else _MOVE_PCT
         if ok("MOVE", i) and px[i - 1] > 0:
             chg = (px[i] - px[i - 1]) / px[i - 1] * 100
-            if chg >= _MOVE_PCT:
-                emit("MOVE", i, "bullish", 2, f"Sharp jump ({tf_label})",
-                     f"Popped +{chg:.1f}% in one bar to ${_round(px[i])}.", px[i])
-            elif chg <= -_MOVE_PCT:
-                emit("MOVE", i, "bearish", 2, f"Sharp drop ({tf_label})",
-                     f"Dropped {chg:.1f}% in one bar to ${_round(px[i])}.", px[i])
+            if chg >= move_thr:
+                emit("MOVE", i, "bullish", 2, f"{sess_word}Sharp jump ({tf_label})",
+                     f"Popped +{chg:.1f}% in one bar to ${_round(px[i])}{thin}.", px[i])
+            elif chg <= -move_thr:
+                emit("MOVE", i, "bearish", 2, f"{sess_word}Sharp drop ({tf_label})",
+                     f"Dropped {chg:.1f}% in one bar to ${_round(px[i])}{thin}.", px[i])
 
         # new high / low of day
         if high[i] > sess_hi:

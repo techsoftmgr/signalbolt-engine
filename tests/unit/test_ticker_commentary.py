@@ -51,6 +51,31 @@ def test_rsi_overbought_emitted():
     assert any(e["type"] == "RSI" and "overbought" in e["title"].lower() for e in ev), _types(ev)
 
 
+def test_bar_session_classification():
+    assert tc._bar_session(pd.Timestamp("2026-06-07 10:00", tz="UTC")) == "pre"     # 06:00 ET
+    assert tc._bar_session(pd.Timestamp("2026-06-07 14:00", tz="UTC")) == "rth"     # 10:00 ET
+    assert tc._bar_session(pd.Timestamp("2026-06-07 21:00", tz="UTC")) == "after"   # 17:00 ET
+
+
+def test_events_carry_session_tag():
+    closes = list(np.linspace(100, 90, 30)) + list(np.linspace(90, 104, 16))
+    ev = tc._detect_tf(_df(closes), "5m", prior_close=None, want_ideas=False)
+    assert ev and all("session" in e for e in ev)
+
+
+def test_premarket_volume_spike_needs_bigger_multiple():
+    closes = list(np.linspace(100, 101, 40))
+    # 3.5× the trailing average — fires in RTH, but premarket needs >=5×
+    v_small = [1000.0] * 40; v_small[30] = 3500.0
+    pre = tc._detect_tf(_df(closes, vols=v_small, start="2026-06-05 08:00"), "5m", None, want_ideas=False)
+    assert not any(e["type"] == "VOLUME" for e in pre), [e["type"] for e in pre]
+    # a 6.5× spike DOES clear the premarket bar, and is labeled
+    v_big = [1000.0] * 40; v_big[30] = 6500.0
+    pre2 = tc._detect_tf(_df(closes, vols=v_big, start="2026-06-05 08:00"), "5m", None, want_ideas=False)
+    vs = [e for e in pre2 if e["type"] == "VOLUME"]
+    assert vs and "Premarket" in vs[0]["title"] and vs[0]["session"] == "pre"
+
+
 def test_volume_spike_emitted():
     closes = list(np.linspace(100, 101, 30))
     vols = [1000.0] * 30
