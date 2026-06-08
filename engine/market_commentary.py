@@ -125,12 +125,16 @@ def _index_events(phase: str) -> list[dict]:
                 tc = tcm.build(sym)
                 if not tc.get("available"):
                     continue
-                for e in (tc.get("events") or [])[:6]:
+                for e in (tc.get("events") or []):
+                    if e.get("type") == "NEWS":
+                        continue                # market-wide news = the policy stream, not here
                     ev = dict(e)
                     ev["title"] = f"{label}: {ev.get('title')}"
                     ev["scope"] = "index"
                     ev.pop("idea", None)        # index-level: context, not a trade idea
                     out.append(ev)
+                    if len([x for x in out if x.get("scope") == "index"]) >= 6:
+                        break
             except Exception:
                 continue
     except Exception:

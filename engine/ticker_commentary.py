@@ -359,6 +359,28 @@ def _detect_tf(df: pd.DataFrame, tf_label: str, prior_close: float | None,
 
 
 # ── public ─────────────────────────────────────────────────────────────────────
+def _news_events(symbol: str, limit: int = 4) -> list[dict]:
+    """The ticker's own recent headlines as tappable NEWS events — so a stock-
+    specific catalyst (e.g. ABAT's DOE reinstatement) shows on its own tape.
+    Best-effort; empty on failure."""
+    try:
+        from engine import alpaca_client
+        news = alpaca_client.get_news(symbol, limit=limit) or []
+    except Exception:
+        return []
+    out, seen = [], set()
+    for n in news:
+        head = (n.get("headline") or "").strip()
+        if not head or head in seen:
+            continue
+        seen.add(head)
+        out.append({"time": n.get("created_at") or n.get("time"),
+                    "type": "NEWS", "tone": "neutral", "severity": 2,
+                    "title": head, "detail": (n.get("summary") or "")[:200],
+                    "url": n.get("url"), "source": n.get("source") or "news"})
+    return out
+
+
 def _unavailable(symbol: str, note: str) -> dict:
     return {"available": False, "ticker": symbol, "note": note, "disclaimer": _DISCLAIMER}
 
@@ -397,8 +419,10 @@ def build(symbol: str, now: datetime | None = None) -> dict:
             except Exception:
                 pass
 
+        events += _news_events(sym, 4)     # the ticker's own recent headlines
+
         # newest first, cap, and pull the most recent idea forward as the "current" idea
-        events.sort(key=lambda e: e["time"], reverse=True)
+        events.sort(key=lambda e: e.get("time") or "", reverse=True)
         current_idea = next((e["idea"] for e in events if e.get("idea")), None)
         events = events[:_MAX_EVENTS]
 

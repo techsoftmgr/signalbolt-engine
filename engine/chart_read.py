@@ -438,6 +438,35 @@ _BASE_TF = {
 }
 
 
+def _recent_catalyst(sym: str) -> Optional[dict]:
+    """Most-recent material news headline within ~48h, if any. Used to FLAG that a
+    catalyst is driving the tape (so technical levels are less reliable) — we do
+    NOT change the technical math. Best-effort; never raises."""
+    try:
+        from datetime import datetime, timezone
+        from engine.alpaca_client import get_news
+        news = get_news(sym, limit=4) or []
+        if not news:
+            return None
+        news = sorted(news, key=lambda n: (n.get("created_at") or n.get("time") or ""), reverse=True)
+        top = news[0]
+        ts = top.get("created_at") or top.get("time")
+        if ts:
+            try:
+                dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                if (datetime.now(timezone.utc) - dt).total_seconds() > 48 * 3600:
+                    return None
+            except Exception:
+                pass
+        head = (top.get("headline") or "").strip()
+        if not head:
+            return None
+        return {"has_news": True, "headline": head[:160], "url": top.get("url"),
+                "source": top.get("source") or "news", "time": ts}
+    except Exception:
+        return None
+
+
 def analyze(symbol: str, timeframe: str = "1Day") -> Optional[dict]:
     """Full Phase-1 chart read for `symbol` on `timeframe` (1Day default, or
     1Hour for an intraday-swing read). Returns the structured read or None."""
@@ -614,6 +643,7 @@ def analyze(symbol: str, timeframe: str = "1Day") -> Optional[dict]:
 
     return {
         "ticker": sym, "price": round(px, 2), "timeframe": tf,
+        "catalyst": _recent_catalyst(sym),
         "bias": bias, "confidence": int(conf),
         "taBias": ta_bias, "quantBias": quant_bias, "agreement": agreement,
         "shortTerm": short_term, "idea": idea,

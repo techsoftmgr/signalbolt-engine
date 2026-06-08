@@ -81,8 +81,9 @@ _TOKENS: list[tuple[str, str]] = [
 ]
 _TOKEN_RES = [(re.compile(r"\b" + re.escape(t) + r"\b"), p) for t, p in _TOKENS]
 
-# Keys whose string VALUE must never be rewritten (a symbol could match a token).
-_SKIP_KEYS = {"ticker", "symbol"}
+# Keys whose string VALUE must never be rewritten (a symbol could match a token;
+# headline/summary are external verbatim text).
+_SKIP_KEYS = {"ticker", "symbol", "headline", "summary"}
 
 
 def plainify(text: str) -> str:
@@ -95,15 +96,30 @@ def plainify(text: str) -> str:
     return s
 
 
+# External, verbatim content — real headlines/quotes must NOT be reworded (a news
+# title like "Fed signals cut" should stay intact, not become "momentum signals cut").
+_VERBATIM_EVENT_TYPES = {"NEWS", "POLICY", "SOCIAL"}
+_VERBATIM_EVENT_FIELDS = {"title", "detail", "summary"}
+
+
 def scrub(obj):
-    """Return a copy of `obj` with all string leaves plainified. Never raises."""
+    """Return a copy of `obj` with our technical string leaves plainified — but
+    external verbatim text (news/social/policy headlines, catalyst headlines) left
+    intact. Never raises."""
     try:
         if isinstance(obj, str):
             return plainify(obj)
         if isinstance(obj, list):
             return [scrub(x) for x in obj]
         if isinstance(obj, dict):
-            return {k: (v if k in _SKIP_KEYS else scrub(v)) for k, v in obj.items()}
+            verbatim = obj.get("type") in _VERBATIM_EVENT_TYPES
+            out = {}
+            for k, v in obj.items():
+                if k in _SKIP_KEYS or (verbatim and k in _VERBATIM_EVENT_FIELDS):
+                    out[k] = v
+                else:
+                    out[k] = scrub(v)
+            return out
         return obj
     except Exception:
         return obj
