@@ -55,6 +55,23 @@ def test_scrub_preserves_structure_numbers_and_symbols():
     assert "Key pullback area" in out["note"] or "key pullback area" in out["note"]
 
 
+def test_news_headlines_preserved_verbatim():
+    # external headline text must NOT be reworded
+    ev = {"type": "NEWS", "title": "Fed and MACD mentioned", "detail": "VWAP in summary", "price": 1.0}
+    out = ps.scrub(ev)
+    assert out["title"] == "Fed and MACD mentioned"
+    assert out["detail"] == "VWAP in summary"
+    # but a technical (non-verbatim) event still gets plainified
+    tech = {"type": "MACD_CROSS", "title": "MACD bullish crossover", "detail": "reclaimed VWAP"}
+    o2 = ps.scrub(tech)
+    assert "MACD" not in o2["title"] and "VWAP" not in o2["detail"]
+
+
+def test_catalyst_headline_key_preserved():
+    out = ps.scrub({"catalyst": {"has_news": True, "headline": "Fed cuts; MACD on the chart"}})
+    assert out["catalyst"]["headline"] == "Fed cuts; MACD on the chart"
+
+
 def test_scrub_never_raises_on_weird_input():
     assert ps.scrub(None) is None
     assert ps.scrub(42) == 42

@@ -51,6 +51,24 @@ def test_rsi_overbought_emitted():
     assert any(e["type"] == "RSI" and "overbought" in e["title"].lower() for e in ev), _types(ev)
 
 
+def test_news_events_from_ticker(monkeypatch):
+    import engine.alpaca_client as ac
+    monkeypatch.setattr(ac, "get_news", lambda sym, limit=4: [
+        {"headline": "ABAT: DOE project cancellation reinstated", "summary": "positive",
+         "created_at": "2026-06-07T12:00:00Z", "url": "u1", "source": "Benzinga"},
+    ])
+    ev = tc._news_events("ABAT")
+    assert ev and ev[0]["type"] == "NEWS"
+    assert "DOE" in ev[0]["title"] and ev[0]["url"] == "u1"
+    assert ev[0]["severity"] == 2
+
+
+def test_news_events_empty_on_failure(monkeypatch):
+    import engine.alpaca_client as ac
+    monkeypatch.setattr(ac, "get_news", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+    assert tc._news_events("X") == []
+
+
 def test_bar_session_classification():
     assert tc._bar_session(pd.Timestamp("2026-06-07 10:00", tz="UTC")) == "pre"     # 06:00 ET
     assert tc._bar_session(pd.Timestamp("2026-06-07 14:00", tz="UTC")) == "rth"     # 10:00 ET
