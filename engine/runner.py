@@ -2953,6 +2953,26 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled market-tape alerts every 3 min (env-gated)")
 
+    # ── Per-ticker news alerts — fresh headline on a WATCHED ticker (all hours;
+    # catalysts drop premarket/overnight). Watchlist-scoped + pref-gated; cold-
+    # start seeded + per-headline dedup. ENV-gated by NEWS_ALERTS_ENABLED. ──
+    def _run_news_alerts():
+        try:
+            from engine import news_alerts
+            news_alerts.run(_supabase())
+        except Exception as _e:
+            logger.error(f"[runner] news alerts failed: {_e}")
+
+    scheduler.add_job(
+        _run_news_alerts,
+        trigger=IntervalTrigger(minutes=5),
+        id="news_alerts",
+        name="Per-ticker news alerts (5-min)",
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=180),
+    )
+    logger.info("[runner] Scheduled per-ticker news alerts every 5 min (env-gated)")
+
     # ── Breakdown / heavy-selling alerts (universe-wide, 15-min) ─────────────
     # Two-stage broadcast: EARLY (lost 20-day avg on heavy down-vol) + CONFIRMED
     # (broke 20-day low on vol). Reuses the cached full quant scan; per-ticker

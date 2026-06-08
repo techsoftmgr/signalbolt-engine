@@ -44,6 +44,7 @@ _DEFAULT_PREFS = {
     "commentary_alerts": True,    # live intraday events on a watched ticker (MACD cross, breakout, VWAP, gap, sharp move)
     "market_alerts":   True,      # market-wide tape events (VIX spike, index key-level break, sector flip)
     "social_alerts":   True,      # market-moving posts (e.g. Trump via the social feed)
+    "news_alerts":     True,      # a fresh headline landed on a watched ticker
 }
 
 # Single Supabase client reused for the lifetime of the process
@@ -562,6 +563,36 @@ def send_market_alert(title: str, body: str, kind: str = "market") -> int:
         return len(messages)
     except Exception as e:
         logger.debug(f"[push] market alert failed: {e}")
+        return 0
+
+
+def send_news_alert(ticker: str, headline: str, url: str | None = None, sb: Client | None = None) -> int:
+    """Notify users who WATCH `ticker` that a fresh headline landed on it.
+    Watchlist-scoped, pref-gated ('news_alerts', default on). Returns the number
+    dispatched; the caller handles freshness + per-headline dedup + caps."""
+    try:
+        client = sb or _supabase()
+        title = f"📰 {ticker} — News"
+        body = (headline or "").strip()[:200]
+        _record_alert("news", ticker, title, body, data={"ticker": ticker, "url": url}, sb=client)
+        watchers = (client.table("watchlist").select("user_id").eq("ticker", ticker)
+                    .execute().data) or []
+        user_ids = list({w["user_id"] for w in watchers if w.get("user_id")})
+        if not user_ids:
+            return 0
+        tokens = _tokens_for_users(user_ids, "news_alerts")
+        if not tokens:
+            return 0
+        messages = [
+            {"to": t, "title": title, "body": body,
+             "data": {"type": "news_alert", "ticker": ticker, "url": url},
+             "sound": "default", "badge": 1}
+            for t in tokens
+        ]
+        _dispatch(messages, f"NEWS {ticker}")
+        return len(messages)
+    except Exception as e:
+        logger.debug(f"[push] news alert failed for {ticker}: {e}")
         return 0
 
 
