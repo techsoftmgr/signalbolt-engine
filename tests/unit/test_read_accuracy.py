@@ -98,3 +98,34 @@ def test_stats_aggregates(monkeypatch):
     assert out["available"] is True and out["scored"] == 3
     assert out["support"]["tested"] == 2 and out["support"]["held_pct"] == 50
     assert out["resistance"]["tested"] == 2 and out["resistance"]["held_pct"] == 100
+
+
+def test_stats_cached_caches_and_serves(monkeypatch):
+    class _KV:
+        def __init__(self): self.d = {}
+        def get_json(self, k): return self.d.get(k)
+        def set_json(self, k, v, ttl): self.d[k] = v
+    import engine.cache as cache_mod
+    monkeypatch.setattr(cache_mod, "kv", _KV())
+    calls = {"n": 0}
+
+    def _fake_stats(sb, days=90):
+        calls["n"] += 1
+        return {"available": True, "scored": 5, "support": {"tested": 5, "held_pct": 80},
+                "resistance": {"tested": 3, "held_pct": 67}, "note": "x"}
+    monkeypatch.setattr(ra, "stats", _fake_stats)
+    a = ra.stats_cached(object())   # computes + caches
+    b = ra.stats_cached(object())   # served from cache
+    assert a == b and calls["n"] == 1
+
+
+def test_stats_cached_does_not_cache_unavailable(monkeypatch):
+    class _KV:
+        def __init__(self): self.d = {}
+        def get_json(self, k): return self.d.get(k)
+        def set_json(self, k, v, ttl): self.d[k] = v
+    import engine.cache as cache_mod
+    monkeypatch.setattr(cache_mod, "kv", _KV())
+    monkeypatch.setattr(ra, "stats", lambda sb, days=90: {"available": False})
+    ra.stats_cached(object())
+    assert cache_mod.kv.d == {}     # unavailable result is not cached (retries next call)
