@@ -4652,15 +4652,17 @@ async def ticker_overview(request: Request, symbol: str, refresh: bool = False):
 
 
 @app.get("/ticker/{symbol}/chart-read")
-async def ticker_chart_read(request: Request, symbol: str):
+async def ticker_chart_read(request: Request, symbol: str, tf: str = "1Day"):
     """Phase-1 Expert Read — programmatic technical analysis computed from OHLCV
     (trend, regression channel, swing trendlines, key S/R, chart patterns, gaps,
-    volume regime, multi-timeframe confluence). Read-only; best-effort."""
+    volume regime, multi-timeframe confluence). `tf`: 1Day (default, swing) or
+    1Hour (intraday-swing). Read-only; best-effort."""
     _require_jwt(request)
     sym = symbol.upper().strip()
+    timeframe = "1Hour" if str(tf).lower() in ("1h", "1hour", "60min") else "1Day"
     try:
         from engine import chart_read
-        r = chart_read.analyze(sym)
+        r = chart_read.analyze(sym, timeframe=timeframe)
         # ── ADDITIVE: attach an optional `decision_support` layer derived purely
         # from the read above. Never mutates existing fields; fully fail-safe so a
         # derivation issue can never break the existing Expert Read response. ──
