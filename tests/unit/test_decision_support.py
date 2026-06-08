@@ -164,6 +164,26 @@ def test_empty_read_graceful():
 
 
 # extra ── structural completeness of a full derive
+def test_scorecard_present_and_consistent():
+    out = ds.derive(_base(taBias="bullish", quantBias="bullish",
+                          trend={"d1": "up", "h1": "up", "m15": "up"}))
+    sc = out["scorecard"]
+    assert sc["total"] == len(sc["items"])
+    assert sc["bullish"] + sc["bearish"] == sc["total"]
+    assert all(("label" in i and "supportive" in i) for i in sc["items"])
+    assert "condition" in sc["summary"].lower()
+
+
+def test_action_reasons_are_not_predictive():
+    # reasons describe STATE, not a forecast — no "favors"/"will"/"should"
+    for r in (_base(taBias="bullish", quantBias="bullish", trend={"d1": "up", "h1": "up", "m15": "up"},
+                    levels={"resistance": 101.0, "support": 90.0}),
+              _base(taBias="bearish", quantBias="bearish", trend={"d1": "down", "h1": "down", "m15": "down"},
+                    trendlines={"vsSupport": "below", "vsResistance": "below"})):
+        reason = ds.derive(r)["reason"].lower()
+        assert "favors" not in reason and "will " not in reason
+
+
 def test_full_structure_present():
     out = ds.derive(_base(taBias="bullish", quantBias="bullish",
                           trend={"d1": "up", "h1": "up", "m15": "up"}))

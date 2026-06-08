@@ -617,11 +617,11 @@ def analyze(symbol: str, timeframe: str = "1Day") -> Optional[dict]:
             if _rr >= 1.0:
                 idea = {"action": "LONG", "option": "CALL", "entry": round(px, 2), "stop": _stop,
                         "target": _tgt, "rr": round(_rr, 1),
-                        "text": f"Long idea — near {round(px,2)}, stop {_stop} (below support), target {_tgt} "
-                                f"(R:R {round(_rr,1)}). Call buys leverage with defined risk."}
+                        "text": f"Long plan (if/then) — IF holding near {round(px,2)}: invalidation {_stop} "
+                                f"(below support), first level {_tgt} (R:R {round(_rr,1)}). Educational, not a prediction."}
             else:
-                idea = {"action": "WAIT", "text": f"Bullish, but risk/reward is poor at {round(px,2)} "
-                        f"(little room to resistance / far from support) — wait for a pullback toward {_stop}."}
+                idea = {"action": "WAIT", "text": f"State: up-bias but risk/reward is poor at {round(px,2)} "
+                        f"(little room to resistance / far from support) — no clean trigger; a pullback toward {_stop} would set one up."}
         else:
             _res = lv.get("resistance") or (ch and ch.get("upper"))
             _raw = (_res * 1.01) if _res else px * 1.05
@@ -632,11 +632,11 @@ def analyze(symbol: str, timeframe: str = "1Day") -> Optional[dict]:
             if _rr >= 1.0:
                 idea = {"action": "SHORT", "option": "PUT", "entry": round(px, 2), "stop": _stop,
                         "target": _tgt, "rr": round(_rr, 1),
-                        "text": f"Short idea — near {round(px,2)}, stop {_stop} (above resistance), target {_tgt} "
-                                f"(R:R {round(_rr,1)}). Put for defined-risk downside."}
+                        "text": f"Short plan (if/then) — IF rejecting near {round(px,2)}: invalidation {_stop} "
+                                f"(above resistance), first level {_tgt} (R:R {round(_rr,1)}). Educational, not a prediction."}
             else:
-                idea = {"action": "WAIT", "text": f"Bearish, but risk/reward is poor at {round(px,2)} "
-                        f"— wait for a bounce toward {_stop}."}
+                idea = {"action": "WAIT", "text": f"State: down-bias but risk/reward is poor at {round(px,2)} "
+                        f"— no clean trigger; a bounce toward {_stop} would set one up."}
 
     # Plain-English narrative — LEAD with the agreement vs the quant read.
     bullets: list[str] = []
