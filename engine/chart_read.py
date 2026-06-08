@@ -467,6 +467,30 @@ def _recent_catalyst(sym: str) -> Optional[dict]:
         return None
 
 
+def _settled(df, tf: str, now=None):
+    """Drop the still-FORMING last bar so the read is a STABLE plan within its
+    period — the daily read excludes today's bar until the 4 PM ET close (so it
+    doesn't drift intraday); the 1h read excludes the current forming hour. After
+    the bar closes it's included → the read updates once, matching its label.
+    Best-effort: returns df unchanged on any issue."""
+    try:
+        if df is None or len(df) < 2:
+            return df
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
+        now = now or datetime.now(timezone.utc)
+        et = now.astimezone(ZoneInfo("America/New_York"))
+        last = df.index[-1]
+        last_utc = last.tz_convert("UTC") if hasattr(last, "tz_convert") else last
+        if tf == "1Day":
+            forming = (last_utc.date() == now.date()) and (et.hour < 16)
+        else:  # 1Hour (and finer): the bar for the current hour is still forming
+            forming = (last_utc.date() == now.date() and last_utc.hour == now.hour)
+        return df.iloc[:-1] if forming else df
+    except Exception:
+        return df
+
+
 def analyze(symbol: str, timeframe: str = "1Day") -> Optional[dict]:
     """Full Phase-1 chart read for `symbol` on `timeframe` (1Day default, or
     1Hour for an intraday-swing read). Returns the structured read or None."""
@@ -480,6 +504,7 @@ def analyze(symbol: str, timeframe: str = "1Day") -> Optional[dict]:
     except Exception as e:
         logger.debug(f"[chart_read] {sym} {tf} bars fetch failed: {e}")
         return None
+    daily = _settled(daily, tf)                # anchor to the last CLOSED bar (stable plan)
     if daily is None or len(daily) < min_bars:
         return None
 
@@ -641,8 +666,12 @@ def analyze(symbol: str, timeframe: str = "1Day") -> Optional[dict]:
         bullets.append(f"{gap['kind'].capitalize()} gap {gap['dir']} {abs(gap['pct'])}% at {gap['level']} ({f}).")
     bullets.append(f"Volume regime: {vol}.")
 
+    try:
+        as_of = daily.index[-1].isoformat()    # the closed bar this read is anchored to
+    except Exception:
+        as_of = None
     return {
-        "ticker": sym, "price": round(px, 2), "timeframe": tf,
+        "ticker": sym, "price": round(px, 2), "timeframe": tf, "as_of": as_of,
         "catalyst": _recent_catalyst(sym),
         "bias": bias, "confidence": int(conf),
         "taBias": ta_bias, "quantBias": quant_bias, "agreement": agreement,
