@@ -158,6 +158,32 @@ def test_internals_states(monkeypatch):
     assert mc._internals() is None
 
 
+def test_index_events_drops_momentum_chatter(monkeypatch):
+    # the Market Tape should keep only structural index events (GAP/MOVE/ORB/VWAP)
+    # and drop the repetitive MACD/EMA/RSI/HoD-LoD momentum chatter that made the
+    # tape noisy. Index labels are prefixed.
+    import engine.ticker_commentary as tcm
+    monkeypatch.setattr(tcm, "build", lambda sym: {"available": True, "events": [
+        {"time": "2026-06-06T14:00:00Z", "type": "MACD_CROSS", "tone": "bullish", "severity": 1, "title": "Momentum turned up", "detail": "..."},
+        {"time": "2026-06-06T14:01:00Z", "type": "EMA", "tone": "bullish", "severity": 1, "title": "Reclaimed EMA9", "detail": "..."},
+        {"time": "2026-06-06T14:02:00Z", "type": "RSI", "tone": "bearish", "severity": 1, "title": "Overbought", "detail": "..."},
+        {"time": "2026-06-06T14:03:00Z", "type": "VWAP", "tone": "bearish", "severity": 2, "title": "Lost VWAP", "detail": "..."},
+        {"time": "2026-06-06T14:04:00Z", "type": "MOVE", "tone": "bearish", "severity": 2, "title": "Sharp drop -2.5%", "detail": "..."},
+    ]})
+    out = mc._index_events("open")
+    kept = {e["type"] for e in out}
+    assert kept <= mc._INDEX_KEEP                     # only structural types survive
+    assert "MACD_CROSS" not in kept and "EMA" not in kept and "RSI" not in kept
+    assert all(e.get("scope") == "index" for e in out)
+    assert all("idea" not in e for e in out)          # ideas stripped on index events
+    assert any(":" in e["title"] for e in out)        # label-prefixed ("S&P 500: …")
+
+
+def test_index_events_quiet_when_not_open(monkeypatch):
+    assert mc._index_events("premarket") == []
+    assert mc._index_events("closed") == []
+
+
 def test_divergence_downgrades_bias_and_emits_event(monkeypatch):
     monkeypatch.setattr(mc, "_phase", lambda now: "open")
     monkeypatch.setattr(mc, "_market_bias", lambda: {"bias": "risk-on", "vix": 18, "regime_type": None, "above_200ma": True})

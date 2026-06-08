@@ -120,6 +120,13 @@ def _policy_headlines(limit: int = 6) -> list[dict]:
     return out
 
 
+# For the MARKET tape, keep only STRUCTURAL index moves — routine MACD/EMA/RSI
+# crosses ("momentum turned up/down") flip constantly intraday and are low-signal
+# noise here (they belong on the per-ticker tape). Keep gaps, sharp moves,
+# opening-range breaks, and VWAP regime flips.
+_INDEX_KEEP = {"GAP", "MOVE", "ORB", "VWAP"}
+
+
 def _index_events(phase: str) -> list[dict]:
     if phase != "open":
         return []
@@ -132,14 +139,14 @@ def _index_events(phase: str) -> list[dict]:
                 if not tc.get("available"):
                     continue
                 for e in (tc.get("events") or []):
-                    if e.get("type") == "NEWS":
-                        continue                # market-wide news = the policy stream, not here
+                    if e.get("type") not in _INDEX_KEEP:
+                        continue                # drop momentum/EMA/RSI/HoD-LoD chatter
                     ev = dict(e)
                     ev["title"] = f"{label}: {ev.get('title')}"
                     ev["scope"] = "index"
                     ev.pop("idea", None)        # index-level: context, not a trade idea
                     out.append(ev)
-                    if len([x for x in out if x.get("scope") == "index"]) >= 6:
+                    if len([x for x in out if x.get("scope") == "index"]) >= 4:
                         break
             except Exception:
                 continue
