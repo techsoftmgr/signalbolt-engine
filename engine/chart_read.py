@@ -429,18 +429,29 @@ def _tf_trend(symbol: str, timeframe: str, days: int) -> str:
         return "sideways"
 
 
-def analyze(symbol: str) -> Optional[dict]:
-    """Full Phase-1 chart read for `symbol`. Returns the structured read or None."""
+# base-timeframe → (alpaca tf, lookback days, min bars). Daily = the swing read
+# (default); 1Hour = an intraday-swing read that updates through the session
+# (incl. pre/after-hours via SIP) without the noise of sub-hour candles.
+_BASE_TF = {
+    "1Day":  ("1Day", 180, 30),
+    "1Hour": ("1Hour", 60, 60),
+}
+
+
+def analyze(symbol: str, timeframe: str = "1Day") -> Optional[dict]:
+    """Full Phase-1 chart read for `symbol` on `timeframe` (1Day default, or
+    1Hour for an intraday-swing read). Returns the structured read or None."""
     sym = (symbol or "").upper().strip()
     if not sym:
         return None
+    tf, days, min_bars = _BASE_TF.get(timeframe, _BASE_TF["1Day"])
     try:
         from engine.alpaca_client import get_bars
-        daily = get_bars(sym, "1Day", days=180)
+        daily = get_bars(sym, tf, days=days)   # `daily` = the base df for this read
     except Exception as e:
-        logger.debug(f"[chart_read] {sym} bars fetch failed: {e}")
+        logger.debug(f"[chart_read] {sym} {tf} bars fetch failed: {e}")
         return None
-    if daily is None or len(daily) < 30:   # ~6 weeks — covers newer listings (DRAM)
+    if daily is None or len(daily) < min_bars:
         return None
 
     px = float(daily["close"].iloc[-1])
@@ -602,7 +613,7 @@ def analyze(symbol: str) -> Optional[dict]:
     bullets.append(f"Volume regime: {vol}.")
 
     return {
-        "ticker": sym, "price": round(px, 2),
+        "ticker": sym, "price": round(px, 2), "timeframe": tf,
         "bias": bias, "confidence": int(conf),
         "taBias": ta_bias, "quantBias": quant_bias, "agreement": agreement,
         "shortTerm": short_term, "idea": idea,
