@@ -25,6 +25,12 @@ _DISCLAIMER = "Live market context — educational awareness, not financial advi
 _MAX_EVENTS = 30
 _INDEXES = [("SPY", "S&P 500"), ("QQQ", "Nasdaq")]
 
+# The tape is market-WIDE (identical for everyone), so we compute it once and
+# cache the RAW result; the endpoint scrubs per-viewer. A background warmer
+# (runner.py, ~60s) keeps it fresh so requests return instantly.
+_CACHE_KEY = "market_tape:v1"
+_CACHE_TTL = 90
+
 # Headlines that historically move the whole tape (policy / macro / geopolitics).
 # This is the reliable, licensed-news version of a "market-moving posts" feed —
 # it surfaces such statements as reported by the news provider (incl. Trump /
@@ -254,7 +260,17 @@ def _internals() -> dict | None:
 
 
 def build(now: datetime | None = None) -> dict:
-    """Assemble the market tape. Never raises."""
+    """Assemble the market tape. Never raises. Result is cached ~90s (market-wide,
+    so shared across viewers); pass an explicit `now` to bypass the cache."""
+    use_cache = now is None
+    if use_cache:
+        try:
+            from engine import cache
+            cached = cache.kv.get_json(_CACHE_KEY)
+            if cached:
+                return cached
+        except Exception:
+            pass
     try:
         now = now or datetime.now(timezone.utc)
         phase = _phase(now)
@@ -309,7 +325,7 @@ def build(now: datetime | None = None) -> dict:
                           "broad_leading": " · broad market leading"}.get(intern["state"], "")
         summary = f"{phase_txt} — tape is {bias_word}{vix_txt}{intern_txt}{cat_txt}."
 
-        return {
+        result = {
             "available": True, "phase": phase,
             "as_of": now.isoformat(),
             "bias": bias, "vix": b.get("vix"), "regime_type": b.get("regime_type"),
@@ -321,6 +337,13 @@ def build(now: datetime | None = None) -> dict:
             "has_calendar_feed": cal["has_feed"],
             "disclaimer": _DISCLAIMER,
         }
+        if use_cache:
+            try:
+                from engine import cache
+                cache.kv.set_json(_CACHE_KEY, result, _CACHE_TTL)
+            except Exception:
+                pass
+        return result
     except Exception as e:
         logger.debug(f"[market_commentary] build failed: {e}")
         return {"available": False, "note": "Market tape unavailable.", "disclaimer": _DISCLAIMER}
