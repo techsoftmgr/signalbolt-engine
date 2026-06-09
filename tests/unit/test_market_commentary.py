@@ -154,6 +154,13 @@ def test_internals_states(monkeypatch):
     assert setp(0.9, 0.1)["state"] == "broad_leading"       # S&P leading
     assert setp(0.6, -0.6)["divergent"] is True             # split → divergent
     assert setp(0.5, 0.6)["state"] == "in_line"             # together
+    # Direction-aware label: "leading" on a DOWN day is NOT worded bullishly.
+    assert setp(0.9, 0.1)["label"] == "broad market leading"          # both up → bullish wording
+    assert setp(0.4, 1.3)["label"] == "tech leading"                  # both up, tech leads
+    down_broad = setp(-1.0, -2.0)                                     # both down, S&P falls less
+    assert down_broad["state"] == "broad_leading"
+    assert "weakness" in down_broad["label"] and "leading" not in down_broad["label"]
+    assert "holding up better" in setp(-1.0, -0.3)["label"]           # both down, tech falls less
     monkeypatch.setattr(mc, "_index_day_pct", lambda: {"SPY": 0.4})  # missing QQQ
     assert mc._internals() is None
 

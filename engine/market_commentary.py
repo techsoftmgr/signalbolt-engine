@@ -262,8 +262,19 @@ def _internals() -> dict | None:
         state, leader = "broad_leading", "broad"
     else:
         state, leader = "in_line", "none"
+    # Direction-aware label — "leading" on a DOWN day means "falling less", not
+    # strength, so don't word it bullishly when both indices are red.
+    both_down = spy < 0 and qqq < 0
+    if split:
+        label = "diverging"
+    elif state == "growth_leading":
+        label = "tech leading" if not both_down else "tech holding up better, broad market weaker"
+    elif state == "broad_leading":
+        label = "broad market leading" if not both_down else "tech-led weakness — S&P holding up better"
+    else:
+        label = "moving together"
     return {"spy_pct": round(spy, 2), "qqq_pct": round(qqq, 2), "spread": round(spread, 2),
-            "state": state, "leader": leader, "divergent": split}
+            "state": state, "leader": leader, "divergent": split, "label": label}
 
 
 def build(now: datetime | None = None) -> dict:
