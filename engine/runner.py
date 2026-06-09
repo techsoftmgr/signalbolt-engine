@@ -2993,6 +2993,46 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled market-tape cache warmer every 60s")
 
+    # ── Overnight (Blue Ocean) display-only price poll ───────────────────────
+    # During the ~8pm-4am ET overnight session, poll Alpaca's OVERNIGHT feed for
+    # the watched tickers and publish to price_store so the watchlist / quote
+    # screens show a live overnight price (tagged 'overnight'). Flag-gated
+    # (OVERNIGHT_DATA_ENABLED, default OFF) + subscription-gated (returns {} if
+    # the feed isn't on the plan). ISOLATED from the signal/stop stream — no
+    # signals fire and no T1/T2/SL checks run on this thin tape.
+    def _run_overnight_poll():
+        try:
+            if os.environ.get("OVERNIGHT_DATA_ENABLED", "false").lower() not in ("1", "true", "yes", "on"):
+                return
+            from engine import session_classifier as _sc
+            if not _sc.is_overnight_now():
+                return
+            from engine.alpaca_client import get_overnight_prices
+            from engine import price_store, stream as _stream
+            try:
+                tickers = _stream._load_watchlist_tickers(limit=60)
+            except Exception:
+                tickers = []
+            if not tickers:
+                return
+            prices = get_overnight_prices(tickers)
+            for tk, p in (prices or {}).items():
+                if p and p > 0:
+                    price_store.update(tk, float(p))   # tagged 'overnight' by price_store
+            if prices:
+                logger.info(f"[runner] overnight poll published {len(prices)} prices")
+        except Exception as _e:
+            logger.error(f"[runner] overnight poll failed: {_e}")
+
+    scheduler.add_job(
+        _run_overnight_poll,
+        trigger=IntervalTrigger(seconds=20),
+        id="overnight_price_poll",
+        name="Overnight display-only price poll (20s, flag-gated)",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled overnight price poll every 20s (flag-gated)")
+
     # ── Breakdown / heavy-selling alerts (universe-wide, 15-min) ─────────────
     # Two-stage broadcast: EARLY (lost 20-day avg on heavy down-vol) + CONFIRMED
     # (broke 20-day low on vol). Reuses the cached full quant scan; per-ticker

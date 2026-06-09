@@ -235,11 +235,17 @@ def seed(ticker: str, price: float, change_pct: float, session: str) -> None:
 def _market_session_now() -> str:
     now = datetime.now(ET)
     m   = now.hour * 60 + now.minute
-    if   m < 240:   return "closed"   # before 4:00 AM ET
-    elif m < 570:   return "pre"      # 4:00–9:29 AM ET
+    wd  = now.weekday()   # Mon=0 .. Sun=6
+    # Overnight (Blue Ocean) ~8pm-4am ET, Sun night → Fri morning. A tick in this
+    # window is the overnight session, so it's tagged 'overnight' for the UI chip
+    # (display-only; the signal engine never streams here).
+    if m >= 1200:                          # 8:00 PM+
+        return "overnight" if wd in (6, 0, 1, 2, 3) else "closed"
+    if m < 240:                            # before 4:00 AM
+        return "overnight" if wd in (0, 1, 2, 3, 4) else "closed"
+    if   m < 570:   return "pre"      # 4:00–9:29 AM ET
     elif m < 960:   return "market"   # 9:30 AM–3:59 PM ET
-    elif m < 1200:  return "post"     # 4:00–7:59 PM ET
-    else:            return "closed"
+    else:            return "post"     # 4:00–7:59 PM ET
 
 
 # ── Called from Alpaca trade stream ──────────────────────────────────────────
