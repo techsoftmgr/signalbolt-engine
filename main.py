@@ -1221,9 +1221,19 @@ def get_prices(tickers: str):
     # the app's REST fallback fought the WS overnight tick → an after-hours ↔
     # overnight flip every ~20s (the watchlist flicker). Best-effort.
     try:
-        if os.environ.get("OVERNIGHT_DATA_ENABLED", "false").lower() in ("1", "true", "yes", "on"):
-            from engine.session_classifier import is_overnight_now
-            if is_overnight_now():
+        from engine.session_classifier import is_overnight_now
+        _ov_flag = os.environ.get("OVERNIGHT_DATA_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+        # The poller (on the worker) sets a Redis heartbeat 'overnight:live' while
+        # active, so /prices follows it even when the flag isn't set on THIS (web)
+        # process — without this, web serves SIP after-hours and fights the WS
+        # overnight tick (the after-hours↔overnight flip).
+        _ov_live = _ov_flag
+        if not _ov_live:
+            try:
+                _ov_live = bool(_kv.get_json("overnight:live"))
+            except Exception:
+                _ov_live = False
+        if _ov_live and is_overnight_now():
                 from engine.alpaca_client import get_overnight_prices
                 ov = get_overnight_prices(symbols)
                 for sym, op in (ov or {}).items():
