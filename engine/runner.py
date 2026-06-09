@@ -3007,6 +3007,15 @@ def start_scheduler() -> BackgroundScheduler:
             from engine import session_classifier as _sc
             if not _sc.is_overnight_now():
                 return
+            # Heartbeat so the WEB process (which serves /prices) knows the
+            # overnight feature is live without the flag being set on it too —
+            # else /prices serves SIP after-hours and fights the WS overnight
+            # tick (the after-hours↔overnight flip). TTL self-heals if the poller stops.
+            try:
+                from engine.cache import kv as _ovkv
+                _ovkv.set_json("overnight:live", True, ttl_sec=90)
+            except Exception:
+                pass
             from engine.alpaca_client import get_overnight_prices
             from engine import price_store, stream as _stream
             try:
