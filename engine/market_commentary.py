@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger("signalbolt.market_commentary")
 
-_DISCLAIMER = "Live market context — educational awareness, not financial advice."
+_DISCLAIMER = "Live market context for educational awareness. Not financial advice."
 _MAX_EVENTS = 30
 _INDEXES = [("SPY", "S&P 500"), ("QQQ", "Nasdaq")]
 
@@ -270,7 +270,7 @@ def _internals() -> dict | None:
     elif state == "growth_leading":
         label = "tech leading" if not both_down else "tech holding up better, broad market weaker"
     elif state == "broad_leading":
-        label = "broad market leading" if not both_down else "tech-led weakness — S&P holding up better"
+        label = "broad market leading" if not both_down else "tech-led weakness, S&P holding up better"
     else:
         label = "moving together"
     return {"spy_pct": round(spy, 2), "qqq_pct": round(qqq, 2), "spread": round(spread, 2),
@@ -309,8 +309,8 @@ def build(now: datetime | None = None) -> dict:
             spy, qqq = intern["spy_pct"], intern["qqq_pct"]
             events.append({
                 "time": now.isoformat(), "type": "DIVERGENCE", "tone": "neutral", "severity": 2,
-                "title": f"S&P {spy:+.1f}% vs Nasdaq {qqq:+.1f}% — index divergence",
-                "detail": "The S&P and Nasdaq are splitting — a narrow tape. Treat the move as "
+                "title": f"S&P {spy:+.1f}% vs Nasdaq {qqq:+.1f}%: index divergence",
+                "detail": "The S&P and Nasdaq are splitting, which makes for a narrow tape. Treat the move as "
                           "lower-conviction until the two realign.", "scope": "internals"})
         events += _sector_event()
         events += _social_events(6)        # market-moving posts (any phase)
@@ -337,11 +337,11 @@ def build(now: datetime | None = None) -> dict:
         if cal["today"]:
             cat_txt = " · today: " + ", ".join(c.get("event", "") for c in cal["today"][:2])
         intern_txt = ""
-        if intern:
-            intern_txt = {"divergent": " · indices diverging",
-                          "growth_leading": " · tech leading",
-                          "broad_leading": " · broad market leading"}.get(intern["state"], "")
-        summary = f"{phase_txt} — tape is {bias_word}{vix_txt}{intern_txt}{cat_txt}."
+        if intern and intern.get("divergent"):
+            intern_txt = " · indices diverging"
+        elif intern and intern.get("label") and intern["label"] != "moving together":
+            intern_txt = f" · {intern['label']}"
+        summary = f"{phase_txt}: tape is {bias_word}{vix_txt}{intern_txt}{cat_txt}."
 
         result = {
             "available": True, "phase": phase,

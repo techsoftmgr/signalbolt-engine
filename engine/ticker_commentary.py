@@ -37,7 +37,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("signalbolt.ticker_commentary")
 
-_DISCLAIMER = "Live technical commentary — educational awareness, not financial advice."
+_DISCLAIMER = "Live technical commentary for educational awareness. Not financial advice."
 _MAX_EVENTS = 30
 _MOVE_PCT = 1.2          # single-bar % move to flag a surge/dump (regular hours)
 _MOVE_PCT_EXT = 2.5      # bigger move required pre/after-hours (thin tape)
@@ -136,8 +136,8 @@ def _intraday_idea(tone: str, price: float, swing_lo: float, swing_hi: float, at
             return None
         return {"bias": "long", "entry": _round(price), "invalidation": stop, "target": tgt,
                 "rr": round(rr, 1),
-                "text": f"Intraday long plan (if/then) — IF holding near ${_round(price)}: invalidation below "
-                        f"${stop}, first level ~${tgt} (R:R {round(rr,1)}). Educational, not a prediction."}
+                "text": f"Intraday long plan (if/then). If it holds near ${_round(price)}, invalidation is below "
+                        f"${stop} and the first level is ~${tgt} (R:R {round(rr,1)}). Educational, not a prediction."}
     if tone == "bearish":
         stop = _round(max(swing_hi, price + 1.2 * atr) + buf)   # above the swing high + buffer
         tgt = _round(min(swing_lo, price - 1.6 * atr))
@@ -148,8 +148,8 @@ def _intraday_idea(tone: str, price: float, swing_lo: float, swing_hi: float, at
             return None
         return {"bias": "short", "entry": _round(price), "invalidation": stop, "target": tgt,
                 "rr": round(rr, 1),
-                "text": f"Intraday short plan (if/then) — IF rejecting near ${_round(price)}: invalidation above "
-                        f"${stop}, first level ~${tgt} (R:R {round(rr,1)}). Educational, not a prediction."}
+                "text": f"Intraday short plan (if/then). If it rejects near ${_round(price)}, invalidation is above "
+                        f"${stop} and the first level is ~${tgt} (R:R {round(rr,1)}). Educational, not a prediction."}
     return None
 
 
@@ -214,7 +214,7 @@ def _detect_tf(df: pd.DataFrame, tf_label: str, prior_close: float | None,
         last_emit[kind] = i
         against = _against(tone)
         if against:
-            detail = f"{detail} Counter-trend — the tape is {bias}; lower-odds, watch only."
+            detail = f"{detail} Counter-trend: the tape is {bias}, so this is lower-odds. Watch only."
         ev = {"time": idx[i].isoformat(), "tf": tf_label, "type": kind, "tone": tone,
               "severity": sev, "title": title, "detail": detail, "price": _round(price),
               "against_trend": against, "session": _bar_session(idx[i])}
@@ -266,11 +266,11 @@ def _detect_tf(df: pd.DataFrame, tf_label: str, prior_close: float | None,
         if ok("MACD_CROSS", i) and hist[i - 1] is not None:
             if hist[i - 1] <= 0 < hist[i]:
                 emit("MACD_CROSS", i, "bullish", 3, f"MACD bullish crossover ({tf_label})",
-                     f"MACD crossed above its signal at ${_round(px[i])} — momentum turning up.",
+                     f"MACD crossed above its signal at ${_round(px[i])}; momentum is turning up.",
                      px[i], maybe_idea("bullish", i, atr))
             elif hist[i - 1] >= 0 > hist[i]:
                 emit("MACD_CROSS", i, "bearish", 3, f"MACD bearish crossover ({tf_label})",
-                     f"MACD crossed below its signal at ${_round(px[i])} — momentum turning down.",
+                     f"MACD crossed below its signal at ${_round(px[i])}; momentum is turning down.",
                      px[i], maybe_idea("bearish", i, atr))
 
         # EMA 9/21 cross — a with-trend cross is a continuation entry, so it can
@@ -278,43 +278,43 @@ def _detect_tf(df: pd.DataFrame, tf_label: str, prior_close: float | None,
         if ok("EMA_CROSS", i):
             if ema9[i - 1] <= ema21[i - 1] and ema9[i] > ema21[i]:
                 emit("EMA_CROSS", i, "bullish", 2, f"9/21 EMA bullish cross ({tf_label})",
-                     f"The 9 EMA crossed above the 21 EMA near ${_round(px[i])} — short-term trend turning up.",
+                     f"The 9 EMA crossed above the 21 EMA near ${_round(px[i])}; short-term trend is turning up.",
                      px[i], maybe_idea("bullish", i, atr))
             elif ema9[i - 1] >= ema21[i - 1] and ema9[i] < ema21[i]:
                 emit("EMA_CROSS", i, "bearish", 2, f"9/21 EMA bearish cross ({tf_label})",
-                     f"The 9 EMA crossed below the 21 EMA near ${_round(px[i])} — short-term trend turning down.",
+                     f"The 9 EMA crossed below the 21 EMA near ${_round(px[i])}; short-term trend is turning down.",
                      px[i], maybe_idea("bearish", i, atr))
 
         # RSI overbought / oversold (entering)
         if ok("RSI", i):
             if rsi[i - 1] < 70 <= rsi[i]:
                 emit("RSI", i, "bearish", 1, f"RSI overbought ({tf_label})",
-                     f"RSI pushed above 70 ({rsi[i]:.0f}) — stretched; momentum strong but extended.", px[i])
+                     f"RSI pushed above 70 ({rsi[i]:.0f}). Momentum is strong but stretched.", px[i])
             elif rsi[i - 1] > 30 >= rsi[i]:
                 emit("RSI", i, "bullish", 1, f"RSI oversold ({tf_label})",
-                     f"RSI dropped below 30 ({rsi[i]:.0f}) — washed out; watch for a bounce.", px[i])
+                     f"RSI dropped below 30 ({rsi[i]:.0f}). Washed out, so watch for a bounce.", px[i])
 
         # VWAP reclaim / lose — a classic with-trend continuation trigger, so it
         # can carry an idea when it agrees with the session bias.
         if ok("VWAP", i):
             if px[i - 1] < vwap[i - 1] and px[i] > vwap[i]:
                 emit("VWAP", i, "bullish", 2, f"Reclaimed VWAP ({tf_label})",
-                     f"Price reclaimed VWAP (${_round(vwap[i])}) — buyers back in control intraday.",
+                     f"Price reclaimed VWAP (${_round(vwap[i])}); buyers are back in control intraday.",
                      px[i], maybe_idea("bullish", i, atr))
             elif px[i - 1] > vwap[i - 1] and px[i] < vwap[i]:
                 emit("VWAP", i, "bearish", 2, f"Lost VWAP ({tf_label})",
-                     f"Price lost VWAP (${_round(vwap[i])}) — sellers in control intraday.",
+                     f"Price lost VWAP (${_round(vwap[i])}); sellers are in control intraday.",
                      px[i], maybe_idea("bearish", i, atr))
 
         # opening-range break (once each direction)
         if orb_hi and not orb_done["up"] and px[i] > orb_hi:
             orb_done["up"] = True
             emit("ORB", i, "bullish", 2, f"Broke the opening range high ({tf_label})",
-                 f"Cleared the first-30m high ${_round(orb_hi)} — intraday breakout attempt.", px[i])
+                 f"Cleared the first-30m high ${_round(orb_hi)}; an intraday breakout attempt.", px[i])
         if orb_lo and not orb_done["down"] and px[i] < orb_lo:
             orb_done["down"] = True
             emit("ORB", i, "bearish", 2, f"Broke the opening range low ({tf_label})",
-                 f"Lost the first-30m low ${_round(orb_lo)} — intraday breakdown attempt.", px[i])
+                 f"Lost the first-30m low ${_round(orb_lo)}; an intraday breakdown attempt.", px[i])
 
         # session-aware thresholds — pre/after-hours tape is thin, so a "spike" or
         # "sharp move" needs to clear a higher bar before it's worth surfacing.
@@ -402,7 +402,7 @@ def build(symbol: str, now: datetime | None = None) -> dict:
 
         df5 = _session_slice(raw)
         if df5 is None or len(df5) < 16:
-            return _unavailable(sym, "Not enough bars in the current session yet — check back after the open.")
+            return _unavailable(sym, "Not enough bars in the current session yet. Check back after the open.")
 
         # Session bias from VWAP + the 15m EMA9/21 — ideas fire only WITH it.
         try:
@@ -436,7 +436,7 @@ def build(symbol: str, now: datetime | None = None) -> dict:
             summary = (f"Tape bias: {bias_word}. {len(events)} event(s) today "
                        f"({bull} bullish / {bear} bearish).{ct}")
         else:
-            summary = f"Tape bias: {bias_word}. Quiet tape so far — no notable intraday events yet."
+            summary = f"Tape bias: {bias_word}. Quiet tape so far, with no notable intraday events yet."
 
         return {
             "available": True, "ticker": sym,
