@@ -4786,6 +4786,44 @@ async def admin_read_accuracy(request: Request, days: int = 90):
         return {"available": False, "note": "Track record not available yet (table may be empty/uncreated)."}
 
 
+@app.get("/admin/overnight-selftest")
+async def admin_overnight_selftest(request: Request):
+    """One-tap check that the Alpaca OVERNIGHT feed is accessible on this plan,
+    BEFORE flipping OVERNIGHT_DATA_ENABLED. Calls the overnight feed directly for
+    a few liquid names and reports what came back. Admin-only. Most meaningful
+    during the 8pm-4am ET session (outside it the feed may legitimately be empty)."""
+    _require_admin_jwt(request)
+    from engine.alpaca_client import get_overnight_prices
+    from engine import session_classifier as _sc
+    test_tickers = ["AAPL", "TSLA", "NVDA", "SPY"]
+    prices, error = {}, None
+    try:
+        prices = get_overnight_prices(test_tickers)
+    except Exception as e:                       # should already be caught inside, belt-and-suspenders
+        error = str(e)
+    in_session = _sc.is_overnight_now()
+    enabled = os.environ.get("OVERNIGHT_DATA_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+    if prices:
+        verdict = "OK — the overnight feed returned data, so your Alpaca plan includes it. ✅"
+    elif in_session:
+        verdict = ("NO DATA during the overnight session — your Alpaca plan most likely does NOT include "
+                   "the overnight feed (or these names haven't traded yet tonight). ⚠️")
+    else:
+        verdict = ("Outside the overnight session (8pm–4am ET) — the feed can legitimately be empty now. "
+                   "Re-run during overnight hours to confirm access.")
+    return {
+        "feed": "overnight",
+        "in_overnight_session": in_session,
+        "flag_OVERNIGHT_DATA_ENABLED": enabled,
+        "tickers_tested": test_tickers,
+        "prices": prices,
+        "count": len(prices),
+        "error": error,
+        "verdict": verdict,
+        "note": "This hits Alpaca's overnight feed directly. The flag only affects the background poller, not this test.",
+    }
+
+
 # ── News Reaction Feed ────────────────────────────────────────────────────────
 
 @app.get("/news/reaction")
