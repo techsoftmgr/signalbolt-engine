@@ -1214,6 +1214,33 @@ def get_prices(tickers: str):
             _kv.set_json(f"prices:{sym}", data, ttl_sec=ttl_int)
         result.update(fresh)
 
+    # ── Overnight (Blue Ocean) override ──────────────────────────────────────
+    # During the 8pm-4am ET overnight session (flag-gated) replace the SIP
+    # after-hours print with the live overnight price + session='overnight', so
+    # this REST endpoint AGREES with the /ws/prices overnight feed. Without it
+    # the app's REST fallback fought the WS overnight tick → an after-hours ↔
+    # overnight flip every ~20s (the watchlist flicker). Best-effort.
+    try:
+        if os.environ.get("OVERNIGHT_DATA_ENABLED", "false").lower() in ("1", "true", "yes", "on"):
+            from engine.session_classifier import is_overnight_now
+            if is_overnight_now():
+                from engine.alpaca_client import get_overnight_prices
+                ov = get_overnight_prices(symbols)
+                for sym, op in (ov or {}).items():
+                    if not op or op <= 0:
+                        continue
+                    base = dict(result.get(sym) or {})
+                    bp, chg = base.get("price"), base.get("changePercent")
+                    prev_close = bp / (1 + chg / 100) if (bp and chg not in (None, -100)) else None
+                    base["price"] = round(float(op), 2)
+                    base["changePercent"] = round((op - prev_close) / prev_close * 100, 3) if prev_close else chg
+                    base["session"] = "overnight"
+                    base.pop("extendedPrice", None)
+                    base.pop("extendedChangePercent", None)
+                    result[sym] = base
+    except Exception as _e:
+        logger.debug(f"[prices] overnight override skipped: {_e}")
+
     # Stamp staleAfter on every entry (cached + freshly fetched alike) so
     # the UI has a uniform contract. Non-destructive: spread into a copy
     # so we don't mutate the cached dicts.
