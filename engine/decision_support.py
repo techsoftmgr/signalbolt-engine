@@ -113,22 +113,22 @@ def _action(f: dict) -> tuple[str, str]:
     """Action label + one-sentence STATE description (what is true now) — not a
     forecast. Priority-ordered. No advice/prediction language."""
     if (f["trend_down"] or f["ta_bear"]) and f["lost_support"]:
-        return "AVOID", "State: down-trend and a key support level is lost — conditions are not constructive for a long."
+        return "AVOID", "Downtrend, and a key support level has been lost. Not a constructive spot to be long."
     if f["breakout_confirmed"]:
-        return "BREAKOUT CONFIRMATION", "State: price has closed back above resistance in an up-trend — the breakout condition is met."
+        return "BREAKOUT CONFIRMATION", "Price has closed back above resistance in an uptrend, so the breakout has confirmed."
     if f["near_target"] and (f["trend_up"] or f["ta_bull"]):
-        return "TAKE PROFIT / REDUCE RISK", "State: price is already at the measured target — most of the move is behind, risk rises from here."
+        return "TAKE PROFIT / REDUCE RISK", "Price is already at the measured target. Most of the move is behind it and risk climbs from here."
     if f["quant_bull"] and f["ta_bull"] and f["in_gp"] and not f["trend_down"]:
-        return "BUY ZONE", "State: chart and model agree up, and price is inside the pullback (golden-pocket) area."
+        return "BUY ZONE", "Chart and model both lean up, and price is sitting in the pullback (golden-pocket) area."
     if f["quant_bull"] and f["ta_bull"] and f["near_res"]:
-        return "WAIT", "State: up-trend, but price is at resistance — no trigger met. A daily close above resistance, or a pullback, would set one up."
+        return "WAIT", "Uptrend, but price is right at resistance with no trigger yet. A daily close above resistance, or a pullback, would set one up."
     if f["disagree"]:
-        return "WATCH", "State: chart and model disagree — no edge until one side confirms; watch which resolves."
+        return "WATCH", "Chart and model disagree, so there's no edge until one side confirms. Watch which way it resolves."
     if f["ta_bull"] and f["quant_bull"]:
-        return "WATCH", "State: chart and model are both up, but no clean trigger yet — watch for a close above resistance or a pullback."
+        return "WATCH", "Chart and model both lean up, but there's no clean trigger yet. Watch for a close above resistance or a pullback."
     if (f["ta_bear"] and f["quant_bear"]) or (f["trend_down"] and f["ta_bear"]):
-        return "AVOID", "State: chart and model are both down — conditions don't support a long here."
-    return "WAIT", "State: no clear edge — conditions are mixed/neutral."
+        return "AVOID", "Chart and model both lean down. Conditions don't support a long here."
+    return "WAIT", "No clear edge right now. Conditions are mixed."
 
 
 def _confidence_label(f: dict) -> str:
@@ -320,15 +320,15 @@ def _entry_quality(f: dict, rr) -> dict:
     first_tgt = f["bull_tgt"] or (f["fib_tgt"] if (f["fib_tgt"] and px and f["fib_tgt"] > px) else None) or f["res"]
 
     if f["breakout_confirmed"]:
-        state, note = "BREAKOUT_CONFIRMATION", "Breakout is confirming — risk is defined below the breakout level."
+        state, note = "BREAKOUT_CONFIRMATION", "Breakout is confirming. Risk is defined just below the breakout level."
     elif f["lost_support"]:
-        state, note = "AVOID_UNTIL_RECLAIMED", "Support is lost — avoid until price reclaims the broken level."
+        state, note = "AVOID_UNTIL_RECLAIMED", "Support is lost. Best to wait until price reclaims the broken level."
     elif f["in_gp"] and not f["trend_down"]:
-        state, note = "DIP_BUY_ZONE", "Price is in the Fibonacci pullback zone — a lower-risk area to watch."
+        state, note = "DIP_BUY_ZONE", "Price is in the Fibonacci pullback zone, a lower-risk area to watch."
     elif f["near_res"] and f["far_from_sup"]:
-        state, note = "DO_NOT_CHASE", "Do not chase — wait for a pullback or breakout confirmation."
+        state, note = "DO_NOT_CHASE", "Don't chase here. Wait for a pullback or a confirmed breakout."
     else:
-        state, note = "WAIT", "No clean entry trigger yet — wait for confirmation."
+        state, note = "WAIT", "No clean entry trigger yet. Wait for confirmation."
 
     return {
         "current": px, "ideal_pullback_zone": pullback, "breakout_trigger": breakout,
@@ -380,9 +380,9 @@ def _risk_meter(f: dict) -> dict:
     r -= 8 if f["vol_strong"] else 0
     r = _clamp(r, 0, 100)
     level = "High" if r >= 62 else "Low" if r <= 38 else "Medium"
-    expl = {"High": "Multiple risk factors are active — size and timing matter most here.",
+    expl = {"High": "Several risk factors are active, so size and timing matter most here.",
             "Medium": "A balanced mix of supportive and cautionary factors.",
-            "Low": "Conditions are relatively constructive, but risk is never zero."}[level]
+            "Low": "Conditions are relatively constructive, though risk is never zero."}[level]
 
     factors = []
     def add(label, increases, cond):
@@ -451,7 +451,7 @@ def _freshness(now: datetime, calculated_at: datetime | None) -> dict:
         "calculated_at": ca.isoformat(),
         "age_seconds": age,
         "status": status,
-        "data_freshness": "Real-time — computed on request",
+        "data_freshness": "Real-time, computed on request",
         "next_refresh": None,
     }
 

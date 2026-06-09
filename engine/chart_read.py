@@ -209,27 +209,27 @@ def _pattern_explain(p: dict) -> str:
     tgt = p.get("target")
     tgt_s = f"${tgt}" if tgt is not None else "the measured move"
     if t == "Bull Flag":
-        return (f"A brief pause after a sharp run-up — flags usually resolve in the "
-                f"prior direction (up here). A push out of the range targets ~{tgt_s}.")
+        return (f"A brief pause after a sharp run-up. Flags usually resolve in the "
+                f"prior direction (up here), and a push out of the range targets ~{tgt_s}.")
     if t == "Bear Flag":
-        return (f"A brief pause after a sharp drop — flags usually resolve in the "
-                f"prior direction (down here). A break lower targets ~{tgt_s}.")
+        return (f"A brief pause after a sharp drop. Flags usually resolve in the "
+                f"prior direction (down here), and a break lower targets ~{tgt_s}.")
     if t == "Double Top":
-        return (f"Price stalled twice near ${p.get('level')} and failed to break higher "
-                f"— a possible top. A close below the ${p.get('neckline')} neckline targets ~{tgt_s}.")
+        return (f"Price stalled twice near ${p.get('level')} and failed to break higher, "
+                f"a possible top. A close below the ${p.get('neckline')} neckline targets ~{tgt_s}.")
     if t == "Double Bottom":
-        return (f"Price held twice near ${p.get('level')} and bounced — a possible bottom. "
+        return (f"Price held twice near ${p.get('level')} and bounced, a possible bottom. "
                 f"A close above the ${p.get('neckline')} neckline targets ~{tgt_s}.")
     if t == "Ascending Triangle":
-        return (f"Rising lows pressing into flat resistance at ${p.get('upper')} — buyers "
+        return (f"Rising lows pressing into flat resistance at ${p.get('upper')}, with buyers "
                 f"gaining control. A break above ${p.get('upper')} targets ~{tgt_s}.")
     if t == "Descending Triangle":
-        return (f"Falling highs pressing into flat support at ${p.get('lower')} — sellers "
+        return (f"Falling highs pressing into flat support at ${p.get('lower')}, with sellers "
                 f"gaining control. A break below ${p.get('lower')} targets ~{tgt_s}.")
     if t == "Symmetrical Triangle":
-        return (f"The range is tightening between ${p.get('lower')} and ${p.get('upper')} — "
-                f"a breakout is brewing; its direction decides the move. Measured move ~{tgt_s}.")
-    return f"{t} forming — measured target ~{tgt_s}."
+        return (f"The range is tightening between ${p.get('lower')} and ${p.get('upper')}. "
+                f"A breakout is brewing and its direction decides the move. Measured move ~{tgt_s}.")
+    return f"{t} forming, measured target ~{tgt_s}."
 
 
 # ── Patterns (robust set) ─────────────────────────────────────────────────────
@@ -309,24 +309,24 @@ def _fib_explain(direction: str, gp: dict, target, lo: float, hi: float, inval: 
     if direction == "up":
         if failed:
             return (f"Ran from ${round(lo,2)} up to ${round(hi,2)}, then gave it all back. Price is now below "
-                    f"the 78.6% level (~${round(inval,2)}) — the {band} 'golden pocket' dip-buy zone has FAILED, "
-                    f"so it is overhead resistance now, not a buy area. A reclaim of {band} is the first sign the run is repairing.")
+                    f"the 78.6% level (~${round(inval,2)}), so the {band} golden pocket dip-buy zone has FAILED. "
+                    f"It's overhead resistance now, not a buy area. A reclaim of {band} would be the first sign the run is repairing.")
         if pos == "below":
-            return (f"Ran from ${round(lo,2)} up to ${round(hi,2)}. Price has slipped below the {band} 'golden pocket' "
-                    f"(50–61.8%) dip-buy zone, so that zone is overhead now — it would need to reclaim {band} to put the "
+            return (f"Ran from ${round(lo,2)} up to ${round(hi,2)}. Price has slipped below the {band} golden pocket "
+                    f"(50–61.8%) dip-buy zone, so that zone sits overhead. Price would need to reclaim {band} to put the "
                     f"dip-buy thesis back in play. A close below ~${round(inval,2)} (78.6%) says the run failed.")
-        return (f"Ran from ${round(lo,2)} up to ${round(hi,2)}. The {band} band (50–61.8% "
-                f"retracement — the 'golden pocket') is the most-watched dip-buy zone: a hold/bounce "
-                f"there is a lower-risk add. A close below ~${round(inval,2)} (78.6%) says the run failed. "
+        return (f"Ran from ${round(lo,2)} up to ${round(hi,2)}. The {band} band (the 50–61.8% retracement, the "
+                f"golden pocket) is the most-watched dip-buy zone, where a hold or bounce is a lower-risk add. "
+                f"A close below ~${round(inval,2)} (78.6%) says the run failed. "
                 f"If it resumes, the 1.618 extension targets ~${target}.")
     if failed:
         return (f"Fell from ${round(hi,2)} down to ${round(lo,2)}, then reclaimed. Price is now above the 78.6% level "
-                f"(~${round(inval,2)}) — the {band} bounce/sell zone has FAILED, so the drop is reversing. If it resumes, the 1.618 extension targets ~${target}.")
+                f"(~${round(inval,2)}), so the {band} bounce/sell zone has FAILED and the drop is reversing. If it resumes, the 1.618 extension targets ~${target}.")
     if pos == "above":
-        return (f"Fell from ${round(hi,2)} down to ${round(lo,2)}. Price sits above the {band} (50–61.8%) zone — "
-                f"a bounce into {band} is where sellers most often re-enter, so it acts as resistance, not a dip-buy. "
+        return (f"Fell from ${round(hi,2)} down to ${round(lo,2)}. Price sits above the {band} (50–61.8%) zone. "
+                f"A bounce into {band} is where sellers most often re-enter, so it acts as resistance, not a dip-buy. "
                 f"A close above ~${round(inval,2)} (78.6%) says the drop is reversing.")
-    return (f"Fell from ${round(hi,2)} down to ${round(lo,2)} — this is a downtrend, so there's no dip-buy zone yet. "
+    return (f"Fell from ${round(hi,2)} down to ${round(lo,2)}. This is a downtrend, so there's no dip-buy zone yet. "
             f"The {band} band (50–61.8% retracement) is where a relief bounce most often stalls and sellers re-enter, "
             f"so treat it as overhead resistance, not a buy. A close above ~${round(inval,2)} (78.6%) would be the "
             f"first sign the drop is reversing. If the decline resumes, the 1.618 extension targets ~${target}.")
@@ -455,9 +455,9 @@ def _scenarios(px: float, lv: dict, fib: Optional[dict], pats: list) -> Optional
     if bear_tgt is not None and bear_trig is not None and bear_tgt >= bear_trig:
         bear_tgt = None
 
-    bull = {"trigger": _round(bull_trig), "then": "bullish — upside / bottom holding",
+    bull = {"trigger": _round(bull_trig), "then": "bullish (upside opens up / a bottom is holding)",
             "target": _round(bull_tgt)} if bull_trig else None
-    bear = {"trigger": _round(bear_trig), "then": "bearish — downside resumes",
+    bear = {"trigger": _round(bear_trig), "then": "bearish (downside resumes)",
             "target": _round(bear_tgt)} if bear_trig else None
     if not bull and not bear:
         return None
@@ -469,7 +469,7 @@ def _scenarios(px: float, lv: dict, fib: Optional[dict], pats: list) -> Optional
         parts.append(f"lose ${bear['trigger']} = bearish" + (f" (→ ${bear['target']})" if bear.get("target") else ""))
     return {"bull": bull, "bear": bear,
             "summary": "Let price pick the side: " + "; ".join(parts) + ".",
-            "note": "Until one triggers it's undecided — react, don't predict."}
+            "note": "Until one of these triggers, it's undecided. React to the level, don't anticipate it."}
 
 
 # ── Per-timeframe + MTF ───────────────────────────────────────────────────────
@@ -658,7 +658,7 @@ def analyze(symbol: str, timeframe: str = "1Day") -> Optional[dict]:
     # non-conflicting read. This is why the hub can always offer SOMETHING even when
     # no tracked signal has fired (the #3 gap). Conflicting/neutral → "wait".
     idea = {"action": "WAIT",
-            "text": "No clean idea — read is neutral or the TA & Quant verdicts conflict. Wait for alignment."}
+            "text": "No clean idea right now: the read is neutral or the chart and model verdicts conflict. Wait for them to line up."}
     if bias != "neutral" and agreement != "disagree":
         if bias == "bullish":
             _sup = lv.get("support") or (ch and ch.get("lower"))
@@ -670,11 +670,11 @@ def analyze(symbol: str, timeframe: str = "1Day") -> Optional[dict]:
             if _rr >= 1.0:
                 idea = {"action": "LONG", "option": "CALL", "entry": round(px, 2), "stop": _stop,
                         "target": _tgt, "rr": round(_rr, 1),
-                        "text": f"Long plan (if/then) — IF holding near {round(px,2)}: invalidation {_stop} "
-                                f"(below support), first level {_tgt} (R:R {round(_rr,1)}). Educational, not a prediction."}
+                        "text": f"Long plan (if/then). If it holds near {round(px,2)}, invalidation is {_stop} "
+                                f"(below support) and the first level is {_tgt} (R:R {round(_rr,1)}). Educational, not a prediction."}
             else:
-                idea = {"action": "WAIT", "text": f"State: up-bias but risk/reward is poor at {round(px,2)} "
-                        f"(little room to resistance / far from support) — no clean trigger; a pullback toward {_stop} would set one up."}
+                idea = {"action": "WAIT", "text": f"Up-bias, but the risk/reward is poor at {round(px,2)} "
+                        f"(little room to resistance, far from support). No clean trigger yet; a pullback toward {_stop} would set one up."}
         else:
             _res = lv.get("resistance") or (ch and ch.get("upper"))
             _raw = (_res * 1.01) if _res else px * 1.05
@@ -685,35 +685,35 @@ def analyze(symbol: str, timeframe: str = "1Day") -> Optional[dict]:
             if _rr >= 1.0:
                 idea = {"action": "SHORT", "option": "PUT", "entry": round(px, 2), "stop": _stop,
                         "target": _tgt, "rr": round(_rr, 1),
-                        "text": f"Short plan (if/then) — IF rejecting near {round(px,2)}: invalidation {_stop} "
-                                f"(above resistance), first level {_tgt} (R:R {round(_rr,1)}). Educational, not a prediction."}
+                        "text": f"Short plan (if/then). If it rejects near {round(px,2)}, invalidation is {_stop} "
+                                f"(above resistance) and the first level is {_tgt} (R:R {round(_rr,1)}). Educational, not a prediction."}
             else:
-                idea = {"action": "WAIT", "text": f"State: down-bias but risk/reward is poor at {round(px,2)} "
-                        f"— no clean trigger; a bounce toward {_stop} would set one up."}
+                idea = {"action": "WAIT", "text": f"Down-bias, but the risk/reward is poor at {round(px,2)}. "
+                        f"No clean trigger yet; a bounce toward {_stop} would set one up."}
 
     # Plain-English narrative — LEAD with the agreement vs the quant read.
     bullets: list[str] = []
     if agreement == "agree":
-        bullets.append(f"✅ Technicals AGREE with the quant read — both {ta_bias}. Confirmation; higher confidence.")
+        bullets.append(f"✅ Technicals agree with the quant read: both {ta_bias}. That's confirmation and higher confidence.")
     elif agreement == "disagree":
-        bullets.append(f"⚠️ Technicals DISAGREE with the quant read — TA says {ta_bias}, quant says {quant_bias}. "
-                       f"Conflicting — treat as low-confidence and watch which side resolves.")
+        bullets.append(f"⚠️ Technicals disagree with the quant read: TA says {ta_bias}, quant says {quant_bias}. "
+                       f"Conflicting, so treat it as low-confidence and watch which side resolves.")
     elif agreement == "partial":
-        bullets.append(f"Technicals {ta_bias} vs quant {quant_bias} — only partial overlap (one is neutral).")
+        bullets.append(f"Technicals {ta_bias} vs quant {quant_bias}: only partial overlap (one is neutral).")
     bullets.append(f"Daily trend: {trend_d} (the verdict horizon). Short-term 1h/15m is "
-                   f"{short_term} it (15m {t15} · 1h {t1h}).")
+                   f"{short_term} it (15m {t15}, 1h {t1h}).")
     if ch:
-        bullets.append(f"{ch['dir'].capitalize()} regression channel — price in the {ch['position']} "
+        bullets.append(f"{ch['dir'].capitalize()} regression channel, price in the {ch['position']} "
                        f"(~{int(ch['posPct'])}% up the channel; {ch['lower']}–{ch['upper']}).")
     if tl.get("vsSupport") == "testing":
-        bullets.append("Testing its rising support trendline — a hold here is the lower-risk long; a break warns.")
+        bullets.append("Testing its rising support trendline. A hold here is the lower-risk long; a break is a warning.")
     if tl.get("vsResistance") == "testing":
-        bullets.append("Testing its resistance trendline — a clean break/close above opens upside.")
+        bullets.append("Testing its resistance trendline. A clean break and close above opens upside.")
     for p in pats:
         tgt = f", target ~{p['target']}" if p.get("target") else ""
         bullets.append(f"Pattern: {p['type']} ({p['tone']}, {int(p['confidence']*100)}% conf){tgt}.")
     if lv.get("support") or lv.get("resistance"):
-        bullets.append(f"Key levels — support {lv.get('support') or '—'} · resistance {lv.get('resistance') or '—'}.")
+        bullets.append(f"Key levels: support {lv.get('support') or '—'}, resistance {lv.get('resistance') or '—'}.")
     if gap:
         f = "filled" if gap["filled"] else "UNFILLED"
         bullets.append(f"{gap['kind'].capitalize()} gap {gap['dir']} {abs(gap['pct'])}% at {gap['level']} ({f}).")
