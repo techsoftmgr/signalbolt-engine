@@ -932,7 +932,7 @@ async def market_status():
 
     from engine.session_classifier import (
         is_market_open_today, is_market_open_now, today_close_mins_et,
-        _is_early_close, classify,
+        _is_early_close, classify, is_overnight_now,
     )
 
     sess = classify(has_premarket_catalyst=False)
@@ -943,6 +943,7 @@ async def market_status():
     result = {
         "is_open_today":  is_today,
         "is_open_now":    is_market_open_now(),
+        "is_overnight":   is_overnight_now(),   # ~8pm-4am ET Blue Ocean session (display)
         "mode":           sess["mode"],
         "block_reason":   sess["block_reason"],
         "is_early_close": _is_early_close(),
