@@ -92,6 +92,30 @@ def get_latest_prices(tickers: list[str]) -> dict[str, float]:
         return {}
 
 
+def get_overnight_prices(tickers: list[str]) -> dict[str, float]:
+    """Batch latest trade prices from Alpaca's OVERNIGHT feed (the ~8pm-4am ET
+    Blue Ocean session). DISPLAY-ONLY — never route these into signal/stop logic:
+    the overnight tape is thin and gappy (phantom-stop risk). Requires an Alpaca
+    plan that includes the overnight feed; returns {} on ANY error (unsubscribed
+    / unsupported SDK / outside session) so the feature stays safely dormant."""
+    _init()
+    if not _ok or _client is None or not tickers:
+        return {}
+    try:
+        from alpaca.data.requests import StockLatestTradeRequest
+        resp = _client.get_stock_latest_trade(
+            StockLatestTradeRequest(symbol_or_symbols=tickers, feed="overnight")
+        )
+        return {
+            t: float(resp[t].price)
+            for t in tickers
+            if t in resp and resp[t].price
+        }
+    except Exception as e:
+        logger.debug(f"[alpaca] overnight prices failed (feed may be unsubscribed): {e}")
+        return {}
+
+
 # ── Quote helpers ─────────────────────────────────────────────────────────────
 
 def get_latest_quote(ticker: str) -> Optional[dict]:

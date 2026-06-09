@@ -232,6 +232,20 @@ def market_session() -> str:
     return "premarket" if _et_minutes() < MARKET_OPEN else "afterhours"
 
 
+def is_overnight_now() -> bool:
+    """True during the ~8pm-4am ET overnight (Blue Ocean) session — Sunday night
+    through Friday morning. DISPLAY-ONLY gate: signals stay RTH-only; this just
+    tells the overnight price poller when to run. (8pm-midnight opens Sun-Thu
+    nights; midnight-4am belongs to the Mon-Fri trading mornings.)"""
+    now = _et_now()
+    h, wd = now.hour, now.weekday()   # Mon=0 .. Sun=6
+    if h >= 20:                       # 8:00 PM – 11:59 PM
+        return wd in (6, 0, 1, 2, 3)  # Sun, Mon, Tue, Wed, Thu nights
+    if h < 4:                         # 12:00 AM – 3:59 AM
+        return wd in (0, 1, 2, 3, 4)  # Mon..Fri mornings
+    return False
+
+
 def _fomc_active_now() -> bool:
     """FOMC announcement usually at 2:00 PM ET — block 1:30-2:30 PM window."""
     if not _is_fomc_day():
