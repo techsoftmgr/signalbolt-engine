@@ -1657,6 +1657,26 @@ def get_history(ticker: str, from_ts: str = "", to_ts: str = "", interval: str =
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _sma200_cached(ticker: str):
+    """Current 200-DAY SMA for a ticker (cached 1h — it only moves once/day).
+    Returns None if <200 daily bars or on any error. Used by /chart-data so the
+    app can draw a 200-day SMA reference line on ANY chart timeframe."""
+    try:
+        from engine.cache import kv as _kv
+        hit = _kv.get_json(f"sma200:{ticker}")
+        if hit is not None:
+            return hit
+        from engine.alpaca_client import get_bars as _gb
+        d = _gb(ticker, timeframe="1Day", days=320)
+        if d is None or len(d) < 200:
+            return None
+        val = round(float(d["close"].astype(float).tail(200).mean()), 2)
+        _kv.set_json(f"sma200:{ticker}", val, ttl_sec=3600)
+        return val
+    except Exception:
+        return None
+
+
 @app.get("/chart-data/{ticker}")
 def get_chart_data(ticker: str, timeframe: str = "15Min", bars: int = 60):
     """
@@ -1708,7 +1728,8 @@ def get_chart_data(ticker: str, timeframe: str = "15Min", bars: int = 60):
                     "v": int(row["volume"]) if "volume" in row else 0,
                 })
 
-            return {"candles": candles, "ticker": ticker, "timeframe": timeframe, "source": "alpaca"}
+            return {"candles": candles, "ticker": ticker, "timeframe": timeframe,
+                    "source": "alpaca", "sma200": _sma200_cached(ticker)}
     except Exception as e:
         logger.warning(f"[chart-data] Alpaca path failed for {ticker}: {e} — trying yfinance")
 
