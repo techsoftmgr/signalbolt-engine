@@ -46,3 +46,54 @@ def test_aggregate_empty():
 
 def test_stats_no_sb():
     assert css.stats(None)["available"] is False
+
+
+# ---- backfill (offline, fake supabase) ----
+class _Q:
+    def __init__(self, data): self._data = data
+    def select(self, *a, **k): return self
+    def eq(self, *a, **k): return self
+    def order(self, *a, **k): return self
+    def limit(self, *a, **k): return self
+    def execute(self): return type("R", (), {"data": self._data})()
+
+
+class _SB:
+    def __init__(self, signals, events): self._s = signals; self._e = events
+    def table(self, name): return _Q(self._s if name == "signals" else self._e)
+
+
+def test_backfill_dryrun_finds_opposing_pair():
+    # A filled+closed SHORT on XYZ that lost (-3%); a turn_forming LONG fired while it was open.
+    signals = [
+        {"id": "pos1", "ticker": "XYZ", "direction": "SHORT", "strategy_type": "breakdown",
+         "entry_price": 100.0, "result_pct": -3.0, "status": "closed",
+         "created_at": "2026-06-01T15:00:00+00:00", "closed_at": "2026-06-05T20:00:00+00:00"},
+        {"id": "opp1", "ticker": "XYZ", "direction": "LONG", "strategy_type": "turn_forming",
+         "entry_price": 96.0, "result_pct": 2.0, "status": "closed",
+         "created_at": "2026-06-03T15:00:00+00:00", "closed_at": "2026-06-06T20:00:00+00:00"},
+    ]
+    r = css.backfill(_SB(signals, []), commit=False)
+    assert r["pairs"] == 1 and r["committed"] is False
+    ev = r["preview"][0]
+    assert ev["signal_id"] == "pos1" and ev["event_type"] == "counter_signal"
+    # SHORT entered 100, lock at 96 = +4% locked
+    assert "+4.0%" in ev["note"] and ev["price"] == 96.0
+
+
+def test_backfill_skips_already_recorded_and_open():
+    signals = [
+        {"id": "pos1", "ticker": "XYZ", "direction": "SHORT", "strategy_type": "breakdown",
+         "entry_price": 100.0, "result_pct": -3.0, "status": "closed",
+         "created_at": "2026-06-01T15:00:00+00:00", "closed_at": "2026-06-05T20:00:00+00:00"},
+        {"id": "opp1", "ticker": "XYZ", "direction": "LONG", "strategy_type": "turn_forming",
+         "entry_price": 96.0, "result_pct": 2.0, "status": "closed",
+         "created_at": "2026-06-03T15:00:00+00:00", "closed_at": "2026-06-06T20:00:00+00:00"},
+        # an open (not closed) short — should be ignored (no hold outcome)
+        {"id": "pos2", "ticker": "XYZ", "direction": "SHORT", "strategy_type": "breakdown",
+         "entry_price": 100.0, "result_pct": None, "status": "active",
+         "created_at": "2026-06-04T15:00:00+00:00", "closed_at": None},
+    ]
+    # pos1 already has a counter_signal event -> skip it; pos2 is open -> skip
+    r = css.backfill(_SB(signals, [{"signal_id": "pos1"}]), commit=False)
+    assert r["pairs"] == 0
