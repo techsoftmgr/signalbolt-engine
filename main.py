@@ -988,6 +988,16 @@ async def markets_ipo(force: bool = False):
     return await anyio.to_thread.run_sync(get_ipo_calendar, force)
 
 
+@app.get("/markets/spac-mergers")
+async def markets_spac_mergers(force: bool = False):
+    """De-SPAC tracker: which SPAC is merging with which private company, with the
+    latest filing stage + a link to the SEC filing. Source: SEC EDGAR S-4 filings.
+    Public, cached 6h. Never errors."""
+    from engine.spac_mergers import get_spac_mergers
+    import anyio
+    return await anyio.to_thread.run_sync(get_spac_mergers, force)
+
+
 @app.get("/market/pulse")
 async def market_pulse(tickers: str = ""):
     """
