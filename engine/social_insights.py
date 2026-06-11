@@ -39,7 +39,7 @@ from engine import cache
 logger = logging.getLogger("signalbolt.social_insights")
 
 # ── Tunables ─────────────────────────────────────────────────────────────────
-_ENRICHED_CACHE_KEY = "social_insights:enriched:v1"
+_ENRICHED_CACHE_KEY = "social_insights:enriched:v2"   # v2: +buzz_why, relevance-filtered catalyst, full coverage
 _ENRICHED_TTL       = 600          # 10 min (matches the upstream trending cache)
 _PULSE_CACHE_KEY    = "social_insights:pulse:v1"
 _PULSE_TTL          = 600
@@ -48,7 +48,7 @@ _CHANGED_TTL        = 900          # 15 min
 _TRACK_CACHE_KEY    = "social_insights:track:v1"
 _TRACK_TTL          = 6 * 3600     # 6 h
 
-_CATALYST_TOP_N  = 10              # fetch "why trending" news for the top N only
+_CATALYST_TOP_N  = 30              # fetch the "why" news for the whole trending set (was top-10)
 _SPARK_POINTS    = 24             # sparkline resolution
 _VIRAL_Z         = 2.0            # z-score threshold for "going viral"
 _VIRAL_MIN_ABS   = 40             # ignore tiny-mention names regardless of z
@@ -177,22 +177,85 @@ def _quant_map() -> dict[str, dict]:
         return {}
 
 
-def _latest_news(ticker: str) -> Optional[dict]:
-    """Latest headline behind the buzz, or None."""
+_NAME_STOP = {"inc", "corp", "co", "ltd", "plc", "the", "class", "holdings", "group",
+              "company", "sa", "nv", "ag", "corporation", "incorporated", "trust", "fund"}
+
+
+def _name_tokens(name: Optional[str]) -> list[str]:
+    import re
+    return [w for w in re.findall(r"[A-Za-z]{3,}", name or "")
+            if w.lower() not in _NAME_STOP]
+
+
+def _headline_relevant(headline: str, ticker: str, name: Optional[str]) -> bool:
+    """True if the headline is actually ABOUT this ticker (not a market roundup
+    that merely tags it). Matches the symbol as a word, $TICKER, or a company-name token."""
+    import re
+    h = (headline or "").lower()
+    if not h:
+        return False
+    if re.search(rf"(^|[^a-z]){re.escape(ticker.lower())}([^a-z]|$)", h) or f"${ticker.lower()}" in h:
+        return True
+    return any(tok.lower() in h for tok in _name_tokens(name))
+
+
+def _latest_news(ticker: str, name: Optional[str] = None) -> Optional[dict]:
+    """The headline behind the buzz. Prefers a headline that's genuinely ABOUT the
+    ticker over a generic market-roundup that just name-drops it; falls back to the
+    latest if none qualify. None on no news."""
     try:
         from engine import alpaca_client
-        items = alpaca_client.get_news(ticker, 1) or []
+        items = alpaca_client.get_news(ticker, 6) or []
         if not items:
             return None
-        n = items[0]
+        pick = next((n for n in items if _headline_relevant(n.get("headline", ""), ticker, name)),
+                    items[0])
         return {
-            "headline":  n.get("headline"),
-            "source":    n.get("source"),
-            "url":       n.get("url"),
-            "createdAt": n.get("created_at"),
+            "headline":  pick.get("headline"),
+            "source":    pick.get("source"),
+            "url":       pick.get("url"),
+            "createdAt": pick.get("created_at"),
+            "ticker_specific": _headline_relevant(pick.get("headline", ""), ticker, name),
         }
     except Exception:
         return None
+
+
+def _buzz_summaries(rows: list) -> dict:
+    """ONE grounded Haiku call → {ticker: '<=8-word why it's being talked about'},
+    based ONLY on each ticker's catalyst headline (no fabrication). Best-effort: {}
+    on any issue. Cheap (one call per refresh, cached with the enriched payload)."""
+    items = []
+    for r in rows:
+        h = (r.get("catalyst") or {}).get("headline")
+        if h and r.get("ticker"):
+            items.append((r["ticker"], h[:140]))
+    if not items:
+        return {}
+    try:
+        import os, json as _json
+        from anthropic import Anthropic
+        key = os.environ.get("ANTHROPIC_API_KEY")
+        if not key:
+            return {}
+        client = Anthropic(api_key=key)
+        listing = "\n".join(f'{t}: "{h}"' for t, h in items[:30])
+        prompt = (
+            "Each line is a stock ticker and the latest news headline about it. For each, "
+            "write a concise (<=8 words) plain-English reason it's being talked about, based "
+            "ONLY on the headline — do not invent facts or give advice. Return STRICT JSON, "
+            'an object mapping ticker to reason, nothing else.\n\n' + listing
+        )
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=700,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        txt = (msg.content[0].text or "").strip()
+        s, e = txt.find("{"), txt.rfind("}")
+        return _json.loads(txt[s:e + 1]) if s >= 0 and e > s else {}
+    except Exception as ex:
+        logger.debug(f"[social] buzz summaries failed: {ex}")
+        return {}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -428,7 +491,15 @@ def get_enriched_trending(sb, limit: int = 30, force: bool = False) -> dict:
         r["sparkline"]   = spark
         r["engine"]      = engine
         r["verdict"]     = verdict
-        r["catalyst"]    = _latest_news(t) if i < _CATALYST_TOP_N else None
+        # WHY behind the buzz — now for ALL trending names (was top-10 only), and
+        # relevance-filtered so mega-caps don't show a generic market-roundup.
+        r["catalyst"]    = _latest_news(t, r.get("name")) if i < _CATALYST_TOP_N else None
+
+    # Plain-English "why it's buzzing" line per ticker — one grounded Haiku call.
+    why = _buzz_summaries(rows)
+    if why:
+        for r in rows:
+            r["buzz_why"] = why.get(r.get("ticker"))
 
     payload = {
         "trending":     rows,
@@ -769,10 +840,19 @@ def ticker_detail(sb, ticker: str) -> dict:
     except Exception:
         pass
 
+    # The literal chatter — top Reddit post titles (best-effort; [] if Reddit blocks us).
+    reddit_posts = []
+    try:
+        from engine import reddit_posts as _rp
+        reddit_posts = _rp.top_titles(ticker, limit=5)
+    except Exception:
+        pass
+
     return {
         "ticker":    ticker,
         "history":   history,
         "sparkline": _sparkline(snaps, points=48),
         "news":      news,
+        "reddit_posts": reddit_posts,
         "generated_at": _iso_now(),
     }
