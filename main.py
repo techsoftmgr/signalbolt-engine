@@ -3382,20 +3382,21 @@ async def admin_gate_validation_stats(request: Request, days: int = 7):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/admin/combo-scorecard")
-async def admin_combo_scorecard(request: Request, days: int = 120):
-    """Realized P&L (expectancy) for EVERY signal type, plus the cross-detector
-    combination studies (volume-confirm, location-gate, exit-conviction-stack).
+@app.get("/combo-scorecard")
+async def combo_scorecard_endpoint(request: Request, days: int = 120):
+    """Realized P&L (expectancy) for EVERY signal type — each with a nested
+    by-detector-source breakdown — plus the cross-detector combination studies
+    (volume-confirm, location-gate, exit-conviction-stack). All signed-in users.
     Read-only — does NOT change firing. Thin cells (n < min_confident) are flagged
     so we never tune on noise."""
-    _user_id, sb = _require_admin_jwt(request)
+    _user_id, sb = _require_jwt(request)
     try:
         from engine import combo_scorecard
         return combo_scorecard.scorecard(sb, days=days)
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"GET /admin/combo-scorecard error: {e}")
+        logger.error(f"GET /combo-scorecard error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

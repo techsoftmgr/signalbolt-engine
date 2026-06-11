@@ -56,10 +56,10 @@ def test_scorecard_segments():
         # two breakdowns, different volume buckets
         {"id": "a", "direction": "SHORT", "strategy_type": "breakdown", "entry_price": 100.0,
          "result_pct": -2.0, "status": "closed", "created_at": "2026-06-01T00:00:00+00:00",
-         "score_breakdown": {"relativeVolume": 1.2, "mfe_pct": 1.0}},
+         "score_breakdown": {"relativeVolume": 1.2, "mfe_pct": 1.0, "detector_source": "BREAKDOWN"}},
         {"id": "b", "direction": "SHORT", "strategy_type": "breakdown", "entry_price": 100.0,
          "result_pct": 3.0, "status": "closed", "created_at": "2026-06-02T00:00:00+00:00",
-         "score_breakdown": {"relativeVolume": 2.4, "mfe_pct": 4.0}},
+         "score_breakdown": {"relativeVolume": 2.4, "mfe_pct": 4.0, "detector_source": "BREAKDOWN"}},
         # a reversal near its ma20
         {"id": "c", "direction": "LONG", "strategy_type": "turn_forming", "entry_price": 50.0,
          "result_pct": 1.0, "status": "closed", "created_at": "2026-06-03T00:00:00+00:00",
@@ -72,6 +72,9 @@ def test_scorecard_segments():
     assert out["available"] is True and out["scored"] == 3
     strategies = {r["strategy"] for r in out["per_strategy"]}
     assert "breakdown" in strategies and "turn_forming" in strategies
+    # each strategy carries a nested by-detector-source breakdown
+    bd = next(r for r in out["per_strategy"] if r["strategy"] == "breakdown")
+    assert any(d["detector"] == "BREAKDOWN" and d["n"] == 2 for d in bd["detectors"])
     vbuckets = {r["bucket"] for r in out["volume"]}
     assert "1.0-1.5" in vbuckets and ">=2.0" in vbuckets
     locb = {r["bucket"] for r in out["location"]}
