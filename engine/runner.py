@@ -2932,6 +2932,26 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled ticker-commentary alerts every 10 min (env-gated)")
 
+    # ── Counter-signal exit alerts: an opposing reversal (turnaround vs an open
+    # short / peak vs an open long) forming on a ticker you hold = a cue to book.
+    # RTH-only; ENV-gated REVERSAL_EXIT_ALERTS_ENABLED (default OFF). ──
+    def _run_reversal_exit_alerts():
+        try:
+            from engine import reversal_exit_alerts
+            reversal_exit_alerts.run(_supabase())
+        except Exception as _e:
+            logger.error(f"[runner] reversal-exit alerts failed: {_e}")
+
+    scheduler.add_job(
+        _run_reversal_exit_alerts,
+        trigger=IntervalTrigger(minutes=5),
+        id="reversal_exit_alerts",
+        name="Counter-signal (reversal-aware) exit alerts (5-min, RTH, env-gated)",
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=150),
+    )
+    logger.info("[runner] Scheduled reversal-exit alerts every 5 min (env-gated)")
+
     # ── Market Tape alerts (V2): market-moving SOCIAL posts (any hour) + major
     # index events (RTH). NOT RTH-gated at the scheduler level — Trump-type posts
     # move futures overnight; market_alerts.run() self-gates the market-event part.
