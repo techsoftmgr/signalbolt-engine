@@ -94,12 +94,27 @@ def run(sb) -> dict:
             key = f"revexit:{r['id']}"
             if cache.kv.get_json(key):
                 continue
-            # Live unrealized P&L (direction-aware) for the alert body.
+            # Live unrealized P&L (direction-aware) at the moment the counter-signal fired.
             p = px.get(r["ticker"]); entry = r.get("entry_price")
             pnl = None
             if p and entry:
                 pnl = round((p - entry) / entry * 100 if r["direction"] == "LONG"
                             else (entry - p) / entry * 100, 1)
+            rev_type, stage = opp
+            side = "short" if r["direction"] == "SHORT" else "long"
+            # Record a MEASURED timeline event on the open position (shows in History /
+            # Follow-Up). Captures the detector + the "lock here" P&L + price, so we can
+            # later compare locking at the counter-signal vs the actual final exit.
+            note = (f"Counter-signal: {rev_type} ({stage}) forming vs this {side}"
+                    + (f" — lock here = {pnl:+.1f}%." if pnl is not None else "."))
+            try:
+                sb.table("signal_events").insert({
+                    "signal_id": r["id"], "event_type": "counter_signal",
+                    "price": p, "note": note,
+                }).execute()
+                stats["events"] = stats.get("events", 0) + 1
+            except Exception as _ie:
+                logger.debug(f"[reversal_exit] event log failed: {_ie}")
             push.send_reversal_exit_alert(r["ticker"], r["direction"], pnl, opp, sb)
             cache.kv.set_json(key, True, _DEDUP_TTL)
             stats["alerts"] += 1
