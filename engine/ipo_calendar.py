@@ -18,7 +18,7 @@ from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger("signalbolt.ipo_calendar")
 
-_CACHE_KEY = "markets:ipo:v2"
+_CACHE_KEY = "markets:ipo:v3"   # bump on schema change (v3 = +is_spac/priced) so old cache can't serve stale
 _CACHE_TTL = 6 * 3600          # IPO data moves slowly — refresh every 6h
 _BASE = "https://api.polygon.io/vX/reference/ipos"
 
