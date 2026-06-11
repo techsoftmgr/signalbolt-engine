@@ -37,6 +37,18 @@ def test_get_ipo_calendar_splits_and_maps(monkeypatch):
     assert out["priced"][0]["ticker"] == "CCC" and out["priced"][0]["final_price"] == 18.0
 
 
+def test_row_spac_and_priced_flags():
+    spac = ipo._row({"ticker": "XYZU", "issuer_name": "Foo Acquisition Corp",
+                     "security_type": "SP", "final_issue_price": 10.0})
+    assert spac["is_spac"] is True and spac["priced"] is True
+    cs = ipo._row({"ticker": "SPCX", "issuer_name": "Space Exploration Technologies Corp.",
+                   "security_type": "CS", "final_issue_price": 135.0,
+                   "lowest_offer_price": 135.0, "highest_offer_price": 135.0})
+    assert cs["is_spac"] is False and cs["priced"] is True and cs["final_price"] == 135.0
+    rng = ipo._row({"ticker": "AAA", "issuer_name": "Alpha", "security_type": "CS"})
+    assert rng["priced"] is False and rng["is_spac"] is False
+
+
 def test_get_ipo_calendar_no_key(monkeypatch):
     monkeypatch.delenv("POLYGON_API_KEY", raising=False)
     monkeypatch.setattr(ipo, "_fetch", lambda params: [])
