@@ -124,3 +124,67 @@ def capture(sb, ticker: str, direction: str, strategy_type: str) -> tuple[str, d
                 sb, status="active", direction=direction, strategy_type=strategy_type)
 
     return regime_type, study
+
+
+# Universal market-context fields the combination studies (volume / location /
+# divergence / extension) need to slice realized expectancy. These are pulled
+# from the worker's already-computed quant scan — NO new data fetch — so EVERY
+# strategy (day_trade, breakout, swing, scalping, SMC…) records the same
+# metadata the predictive detectors (breakdown/forming/peak/turnaround) already
+# embed, instead of only those few.
+_CTX_FIELDS = (
+    "relativeVolume", "ma20", "atrPct", "rsi", "dayChangePct",
+    "distToBreakoutPct", "trendScore", "momentumScore",
+    "turnaroundStage", "peakStage", "setupType",
+)
+
+
+def market_context(ticker: str) -> dict:
+    """Fire-time market snapshot pulled from the cached quant scan (quant:scored).
+    Fails open to {} — never fetches, never raises."""
+    try:
+        from engine import cache
+        from engine.quant_score_service import _SCORED_KEY
+        tk = (ticker or "").upper().strip()
+        for r in (cache.kv.get_json(_SCORED_KEY) or []):
+            if r.get("ticker") == tk:
+                return {k: r[k] for k in _CTX_FIELDS if r.get(k) is not None}
+    except Exception as e:
+        logger.debug(f"[telemetry] market_context {ticker} failed: {e}")
+    return {}
+
+
+def classify_asset(ticker: str) -> dict:
+    """Instrument class {asset_class, is_etf}. Fails open to {}."""
+    try:
+        from engine.breakdown_signals import classify_asset as _ca
+        return _ca(ticker) or {}
+    except Exception:
+        return {}
+
+
+def enrich_score_breakdown(sb, row: dict) -> None:
+    """Mutate `row` in place at fire time: fill the universal market-context +
+    instrument-class + regime/sector/concentration `study` metadata that the
+    combination studies need — on EVERY signal, not just the predictive detectors.
+
+    FILL-MISSING ONLY: never clobbers a value a detector already set (so the
+    breakdown/forming/peak/turnaround paths, which embed their own, are
+    unaffected and skip the extra `capture()` cost). Metadata-only — never gates
+    or changes firing; never raises."""
+    try:
+        sbd = row.get("score_breakdown")
+        if not isinstance(sbd, dict):
+            return
+        tk = row.get("ticker", "")
+        for k, v in market_context(tk).items():
+            sbd.setdefault(k, v)
+        for k, v in classify_asset(tk).items():
+            sbd.setdefault(k, v)
+        if "study" not in sbd:
+            rt, study = capture(sb, tk, row.get("direction", ""), row.get("strategy_type", ""))
+            sbd["study"] = study
+            if rt and not row.get("regime_type"):
+                row["regime_type"] = rt
+    except Exception as e:
+        logger.debug(f"[telemetry] enrich_score_breakdown failed: {e}")

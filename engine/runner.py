@@ -399,6 +399,16 @@ def _write_signal(sb: Client, row: dict) -> str | None:
             row["score_breakdown"].setdefault("initial_stop", row["stop_loss"])
     except Exception:
         pass
+    # Universal fire-time telemetry: stamp the same market-context + instrument +
+    # regime/concentration metadata that the predictive detectors embed, onto
+    # EVERY signal (day_trade/breakout/swing/scalping/SMC) — so the combination
+    # studies (volume / location / divergence) can later slice ANY strategy's
+    # realized expectancy. Metadata-only, fill-missing, fails open.
+    try:
+        from engine import signal_telemetry
+        signal_telemetry.enrich_score_breakdown(sb, row)
+    except Exception:
+        pass
     try:
         result = sb.table("signals").insert(row).execute()
         logger.info(
