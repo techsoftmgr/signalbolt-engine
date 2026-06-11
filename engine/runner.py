@@ -2653,7 +2653,17 @@ def start_scheduler() -> BackgroundScheduler:
     are fired by stream.py at bar-boundary events — within 2-5 seconds of each
     bar close rather than on a fixed polling interval.
     """
-    scheduler = BackgroundScheduler(timezone="UTC")
+    # job_defaults: APScheduler's default misfire_grace_time is 1s, so on a busy
+    # RTH worker — or during the ~1-2 min worker restart on every deploy — a job
+    # whose tick lands in that window is SKIPPED and marked "missed" (cosmetic
+    # noise in the Daily Jobs report; the breakdown_alerts job was healthy at
+    # 569 runs / 0 errors but showed "missed" after a deploy). A 180s grace lets
+    # a slightly-late tick still RUN (catch-up), and coalesce collapses multiple
+    # missed ticks into a single run so high-frequency jobs don't stampede.
+    scheduler = BackgroundScheduler(
+        timezone="UTC",
+        job_defaults={"misfire_grace_time": 180, "coalesce": True},
+    )
     now = datetime.now(timezone.utc)
 
     # Per-job run ledger — records last-run/status/duration of EVERY job below to
