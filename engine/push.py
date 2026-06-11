@@ -45,6 +45,7 @@ _DEFAULT_PREFS = {
     "market_alerts":   True,      # market-wide tape events (VIX spike, index key-level break, sector flip)
     "social_alerts":   True,      # market-moving posts (e.g. Trump via the social feed)
     "news_alerts":     True,      # a fresh headline landed on a watched ticker
+    "reversal_exit_alerts": True, # an opposing reversal (turnaround vs short / peak vs long) is forming on an open position — consider booking
 }
 
 # Single Supabase client reused for the lifetime of the process
@@ -282,6 +283,37 @@ def send_signal_alert(
     ]
 
     _dispatch(messages, f"{ticker} {direction}")
+
+
+def send_reversal_exit_alert(
+    ticker: str,
+    direction: str,
+    pnl_pct: float | None,
+    opp: tuple[str, str],
+    sb=None,
+) -> None:
+    """Heads-up that the engine's OWN opposing detector is forming against an open
+    position — a cue to consider booking/de-risking. Pref-gated ('reversal_exit_alerts')."""
+    rev_type, stage = opp
+    side = "short" if direction == "SHORT" else "long"
+    pnlstr = ""
+    if pnl_pct is not None:
+        pnlstr = f" (+{pnl_pct:.1f}%)" if pnl_pct > 0 else f" ({pnl_pct:.1f}%)"
+    title = f"🔄 {ticker} — reversal vs your {side}"
+    body  = (f"A {rev_type} ({stage}) is forming against your open {side}{pnlstr}. "
+             f"Your own engine sees a base/top building — consider booking or tightening the stop.")
+    notif_data = {"type": "reversal_exit", "ticker": ticker, "direction": direction}
+    _record_alert("reversal_exit", ticker, title, body, stage=rev_type, data=notif_data)
+
+    tokens = _tokens_for("reversal_exit_alerts")
+    if not tokens:
+        logger.info("[push] No tokens with reversal_exit_alerts enabled — skipping")
+        return
+    messages = [
+        {"to": token, "title": title, "body": body, "data": notif_data, "sound": "default", "badge": 1}
+        for token in tokens
+    ]
+    _dispatch(messages, f"{ticker} reversal-exit")
 
 
 def send_stop_protected_alert(
