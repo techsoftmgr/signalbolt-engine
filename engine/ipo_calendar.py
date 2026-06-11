@@ -14,11 +14,11 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger("signalbolt.ipo_calendar")
 
-_CACHE_KEY = "markets:ipo:v1"
+_CACHE_KEY = "markets:ipo:v2"
 _CACHE_TTL = 6 * 3600          # IPO data moves slowly — refresh every 6h
 _BASE = "https://api.polygon.io/vX/reference/ipos"
 
@@ -76,13 +76,22 @@ def get_ipo_calendar(force: bool = False) -> dict:
             pass
 
     has_key = bool(os.environ.get("POLYGON_API_KEY"))
-    upcoming_raw = _fetch({"ipo_status": "pending", "limit": 80})
-    priced_raw = _fetch({"ipo_status": "new", "order": "desc", "sort": "listing_date", "limit": 80})
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    cut90 = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d")
+
+    # Upcoming / in-progress: listing TODAY or later, soonest first. Date-bounded
+    # so the hundreds of undated pending shells/SPACs don't bury the real,
+    # scheduled IPOs (this is why SPCX/SpaceX, listing tomorrow, wasn't showing).
+    upcoming_raw = _fetch({"listing_date.gte": today, "order": "asc",
+                           "sort": "listing_date", "limit": 60})
+    # Recently priced: LAST 90 DAYS ONLY, most recent first. The old ipo_status=new
+    # filter surfaced stale 2014/2017 listings with null/ancient dates.
+    priced_raw = _fetch({"listing_date.gte": cut90, "listing_date.lt": today,
+                         "order": "desc", "sort": "listing_date", "limit": 80})
 
     upcoming = [_row(r) for r in upcoming_raw]
-    # Date ascending; undated (TBD) sink to the bottom.
-    upcoming.sort(key=lambda x: (x["date"] is None, x["date"] or ""))
-    # Recently priced: only rows that actually have a finalized issue price.
+    upcoming.sort(key=lambda x: x["date"] or "9999-12-31")   # soonest first (defensive)
+    # Only rows that actually have a finalized issue price.
     priced = [_row(r) for r in priced_raw if _f(r.get("final_issue_price")) is not None]
 
     out = {
