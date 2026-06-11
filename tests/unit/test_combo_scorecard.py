@@ -100,5 +100,22 @@ def test_concentration_buckets_basket():
     assert cbuckets.get("basket (10+)") == 12
 
 
+def test_advisor_exit_lock_vs_hold():
+    # SHORT @100, held to -2%. First MACD-crossover warning fired at 95 (= +5% if booked).
+    signals = [
+        {"id": "a", "direction": "SHORT", "strategy_type": "breakdown", "entry_price": 100.0,
+         "result_pct": -2.0, "status": "closed", "created_at": "2026-06-01T00:00:00+00:00",
+         "score_breakdown": {}},
+    ]
+    events = [
+        {"signal_id": "a", "event_type": "advisor_momentum", "price": 95.0, "created_at": "2026-06-01T15:00:00+00:00"},
+        {"signal_id": "a", "event_type": "advisor_momentum", "price": 96.0, "created_at": "2026-06-01T15:05:00+00:00"},  # later → ignored
+    ]
+    ax = cs.scorecard(_SB(signals, events), days=120)["advisor_exit"]
+    assert ax["n"] == 1
+    assert ax["avg_lock_pnl"] == 5.0 and ax["avg_hold_pnl"] == -2.0   # book +5% vs hold -2%
+    assert ax["edge"] == 7.0 and ax["lock_beat_hold_pct"] == 100
+
+
 def test_scorecard_no_sb():
     assert cs.scorecard(None)["available"] is False

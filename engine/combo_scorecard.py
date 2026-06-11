@@ -29,8 +29,14 @@ MIN_CONFIDENT = 30
 _VOL_TAGGED = {"breakdown", "breakdown_forming", "distrib_forming", "peak_forming",
                "turn_forming", "accum_forming", "turnaround", "peak", "breakout_forming"}
 _REVERSAL = {"turn_forming", "turnaround", "peak_forming", "distrib_forming"}
-# Independent "consider booking" events fired on an open position.
-_WARN_EVENTS = {"near_stop", "reversal", "counter_signal"}
+# Independent DANGER warnings (trade turning AGAINST you), counted by distinct
+# type so spam of one type still counts once — the user's "stack independent
+# warnings" idea: more agreeing = stronger exit. Deliberately EXCLUDES
+# advisor_momentum (that fires only while IN PROFIT — a "consider booking"
+# advisory, not a danger signal; mixing it inverts the stack since high counts
+# then just mark winners that ran). The MACD crossover is measured separately
+# via advisor_exit (book-at-first-crossover vs hold).
+_WARN_EVENTS = {"near_stop", "reversal", "counter_signal", "advisor_adverse_move"}
 
 
 def _sbd(s: dict) -> dict:
@@ -122,19 +128,29 @@ def scorecard(sb, days: int = 120) -> dict:
     location = [{"bucket": b, **_agg(lbuckets[b])}
                 for b in ("near (<1%)", "mid (1-3%)", "far (>3%)") if lbuckets[b]]
 
-    # 4) Exit-conviction stack — # of independent warning events fired on a position.
+    # 4) Exit-conviction stack — # of independent warning events fired on a position
+    #    + advisor-exit (book at the FIRST MACD-crossover "consider booking" warning
+    #    vs hold) — the AVGO-short question, measured.
     exit_stack: list = []
     peak_gap = None
+    advisor_exit: dict = {}
     try:
+        from engine.counter_signal_stats import _lock_pnl
         byid = {s["id"]: s for s in sigs}
         ids = list(byid.keys())
         warn_by: dict[str, set] = defaultdict(set)
+        first_adv: dict[str, tuple] = {}   # sig_id -> (created_at, price) of earliest advisor_momentum
         for i in range(0, len(ids), 50):
-            evs = (sb.table("signal_events").select("signal_id,event_type")
+            evs = (sb.table("signal_events").select("signal_id,event_type,price,created_at")
                    .in_("signal_id", ids[i:i + 50]).execute().data) or []
             for e in evs:
-                if e.get("event_type") in _WARN_EVENTS:
-                    warn_by[e["signal_id"]].add(e["event_type"])
+                et = e.get("event_type")
+                if et in _WARN_EVENTS:
+                    warn_by[e["signal_id"]].add(et)
+                if et == "advisor_momentum" and e.get("price") is not None:
+                    sid = e["signal_id"]; ca = e.get("created_at") or ""
+                    if sid not in first_adv or ca < first_adv[sid][0]:
+                        first_adv[sid] = (ca, e["price"])
         cbuckets: dict[int, list] = defaultdict(list)
         for sid, s in byid.items():
             cbuckets[len(warn_by.get(sid, ()))].append(s)
@@ -144,6 +160,24 @@ def scorecard(sb, days: int = 120) -> dict:
                 for s in warned if _sbd(s).get("mfe_pct") is not None and s.get("result_pct") is not None]
         if gaps:
             peak_gap = round(sum(gaps) / len(gaps), 2)
+
+        # Book-at-first-MACD-crossover vs hold (the AVGO-short test).
+        ax = []
+        for sid, (_ca, price) in first_adv.items():
+            s = byid.get(sid)
+            if not s or s.get("entry_price") is None or s.get("result_pct") is None:
+                continue
+            lp = _lock_pnl(s.get("direction"), s["entry_price"], price)
+            if lp is not None:
+                ax.append((lp, float(s["result_pct"])))
+        if ax:
+            n = len(ax)
+            avg_lock = round(sum(a for a, _ in ax) / n, 2)
+            avg_hold = round(sum(h for _, h in ax) / n, 2)
+            beat = sum(1 for a, h in ax if a > h)
+            advisor_exit = {"n": n, "avg_lock_pnl": avg_lock, "avg_hold_pnl": avg_hold,
+                            "edge": round(avg_lock - avg_hold, 2),
+                            "lock_beat_hold_pct": round(beat / n * 100), "thin": n < MIN_CONFIDENT}
     except Exception as e:
         logger.debug(f"[combo_scorecard] exit_stack failed: {e}")
 
@@ -185,6 +219,7 @@ def scorecard(sb, days: int = 120) -> dict:
         "location": location,
         "exit_stack": exit_stack,
         "exit_stack_peak_gap": peak_gap,   # avg pts peak(MFE) beat the final exit, on warned positions
+        "advisor_exit": advisor_exit,      # book at FIRST MACD-crossover warning vs hold (lock-vs-hold)
         "concentration": concentration,    # same-day same-direction cohort-size expectancy
         "divergence": {"available": False, "note": "Needs sector-ETF history join — scheduled."},
         "note": f"Realized P&L on CLOSED signals. Cells under n={MIN_CONFIDENT} are thin — don't tune on them.",

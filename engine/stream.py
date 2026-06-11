@@ -1496,6 +1496,14 @@ _bar_health_structure_last: dict[str, float] = {}   # ticker → monotonic
 _BAR_HEALTH_RSI_THROTTLE_S       = 270.0   # 4.5 min — fires on 5-min bars
 _BAR_HEALTH_STRUCTURE_THROTTLE_S = 870.0   # 14.5 min — fires on 15-min bars
 
+# Dedup state for the MACD-crossover ("consider booking") advisor: alert ONCE when
+# the cross first appears, then stay quiet while it persists — re-arm (allow another
+# alert) only once it un-crosses and crosses again. Without this the same cross
+# re-prints every 5-min bar for hours (AVGO short 2026-06-10: 21 identical alerts).
+# sig_id → True while inside an active cross episode. In-memory (lost on restart =
+# at most one re-alert per signal; acceptable, same as the throttles above).
+_advisor_mom_episode: dict[str, bool] = {}
+
 
 def _check_signal_health_rsi(symbol: str, close: float) -> None:
     """
@@ -1531,8 +1539,15 @@ def _check_signal_health_rsi(symbol: str, close: float) -> None:
                 if pnl_pct < 0.3:
                     continue
 
+                sid = str(sig["id"])
                 book_now, reason = _momentum_check(symbol, direction)
-                if book_now:
+                if not book_now:
+                    # Cross cleared → re-arm so the NEXT fresh cross alerts again.
+                    _advisor_mom_episode.pop(sid, None)
+                elif not _advisor_mom_episode.get(sid):
+                    # Fresh cross → alert ONCE, then mark the episode so the same
+                    # cross persisting on later bars stays quiet (dedup).
+                    _advisor_mom_episode[sid] = True
                     note = (
                         f"📊 {reason} — P&L: {pnl_pct:+.1f}% @ ${close:.2f}. "
                         f"Consider booking profit."
@@ -1550,7 +1565,7 @@ def _check_signal_health_rsi(symbol: str, close: float) -> None:
                         pass
                     logger.info(
                         f"[stream] 📊 RSI/MACD health: {symbol} {direction} "
-                        f"pnl={pnl_pct:+.1f}% — {reason}"
+                        f"pnl={pnl_pct:+.1f}% — {reason} (first cross — alerting once)"
                     )
 
             except Exception as _se:
