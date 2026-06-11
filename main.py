@@ -4883,6 +4883,22 @@ async def admin_overnight_selftest(request: Request):
     }
 
 
+@app.get("/counter-signal-stats")
+async def counter_signal_stats(request: Request, days: int = 90):
+    """Counter-signal exit track record (ALL signed-in users) — when the engine's
+    OWN opposing detector formed on an open position, did BOOKING at that signal
+    beat HOLDING? Reports the P&L% at the opposite signal (lock) vs the actual
+    final result, plus 'how often locking won', segmented by forming/confirmed."""
+    _require_jwt(request)
+    try:
+        from engine import counter_signal_stats as css
+        sb = _make_supabase()
+        return css.stats(sb, days=days)
+    except Exception as e:
+        logger.debug(f"GET /counter-signal-stats error: {e}")
+        return {"available": False, "note": "Track record not available yet."}
+
+
 # ── News Reaction Feed ────────────────────────────────────────────────────────
 
 @app.get("/news/reaction")
