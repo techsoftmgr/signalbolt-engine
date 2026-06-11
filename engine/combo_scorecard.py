@@ -80,12 +80,21 @@ def scorecard(sb, days: int = 120) -> dict:
     if not sigs:
         return {"available": False, "scored": 0, "note": "No closed signals in this window yet."}
 
-    # 1) Per-strategy P&L — the "P&L for others", every signal type.
+    # 1) Per-strategy P&L — the "P&L for others", every signal type — each with a
+    #    nested by-DETECTOR-SOURCE breakdown (the actual setup that fired it, finer
+    #    than strategy_type) so the UI can expand strategy → detectors.
+    def _by_detector(rows: list[dict]) -> list[dict]:
+        bd: dict[str, list] = defaultdict(list)
+        for r in rows:
+            bd[_sbd(r).get("detector_source") or "—"].append(r)
+        return sorted([{"detector": k, **_agg(v)} for k, v in bd.items()],
+                      key=lambda x: x.get("n", 0), reverse=True)
+
     by_strat: dict[str, list] = defaultdict(list)
     for s in sigs:
         by_strat[s.get("strategy_type") or "?"].append(s)
     per_strategy = sorted(
-        [{"strategy": k, **_agg(v)} for k, v in by_strat.items()],
+        [{"strategy": k, **_agg(v), "detectors": _by_detector(v)} for k, v in by_strat.items()],
         key=lambda x: x.get("n", 0), reverse=True)
 
     # 2) Volume study — bucket vol-tagged directional types by relativeVolume.
