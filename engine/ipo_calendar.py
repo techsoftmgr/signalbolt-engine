@@ -33,13 +33,20 @@ def _f(v):
 
 
 def _row(r: dict) -> dict:
+    sec = (r.get("security_type") or "").upper()
+    blob = f"{r.get('issuer_name') or ''} {r.get('security_description') or ''}".lower()
+    # Polygon tags SPACs as security_type 'SP' (units); name fallback for safety.
+    is_spac = sec == "SP" or any(w in blob for w in ("acquisition corp", "acquisition company", "blank check"))
+    final = _f(r.get("final_issue_price"))
     return {
         "ticker":      r.get("ticker"),
         "name":        r.get("issuer_name"),
         "date":        r.get("listing_date"),          # 'YYYY-MM-DD' or None (TBD)
         "price_low":   _f(r.get("lowest_offer_price")),
         "price_high":  _f(r.get("highest_offer_price")),
-        "final_price": _f(r.get("final_issue_price")),
+        "final_price": final,
+        "priced":      final is not None,              # price finalized (may await listing)
+        "is_spac":     is_spac,
         "exchange":    r.get("primary_exchange"),
         "currency":    r.get("currency_code") or "USD",
         "status":      r.get("ipo_status"),
