@@ -147,6 +147,34 @@ def scorecard(sb, days: int = 120) -> dict:
     except Exception as e:
         logger.debug(f"[combo_scorecard] exit_stack failed: {e}")
 
+    # 5) Concentration — same-day, same-DETECTOR cohort size (correlation proxy).
+    #    Whole-universe same-direction doesn't discriminate (the engine fires many
+    #    names daily). The meaningful unit is "did THIS detector dump a correlated
+    #    basket on one day" — the failure mode behind the TREND_MOMENTUM 5/29 batch
+    #    and the 6/4 breakdown blow-up. One reversal day then sinks the whole cohort.
+    concentration: list = []
+    try:
+        from collections import Counter
+
+        def _daydet(r: dict) -> tuple:
+            ca = r.get("created_at") or ""
+            det = _sbd(r).get("detector_source") or r.get("strategy_type") or "?"
+            return (ca[:10], det)
+
+        cohort = Counter(_daydet(s) for s in sigs if s.get("created_at"))
+
+        def _cbucket(c: int) -> str:
+            return ("solo (1)" if c <= 1 else "small (2-4)" if c <= 4
+                    else "cluster (5-9)" if c <= 9 else "basket (10+)")
+
+        cob: dict[str, list] = defaultdict(list)
+        for s in sigs:
+            cob[_cbucket(cohort.get(_daydet(s), 1))].append(s)
+        concentration = [{"bucket": b, **_agg(cob[b])}
+                         for b in ("solo (1)", "small (2-4)", "cluster (5-9)", "basket (10+)") if cob[b]]
+    except Exception as e:
+        logger.debug(f"[combo_scorecard] concentration failed: {e}")
+
     return {
         "available": True,
         "since": since,
@@ -157,6 +185,7 @@ def scorecard(sb, days: int = 120) -> dict:
         "location": location,
         "exit_stack": exit_stack,
         "exit_stack_peak_gap": peak_gap,   # avg pts peak(MFE) beat the final exit, on warned positions
+        "concentration": concentration,    # same-day same-direction cohort-size expectancy
         "divergence": {"available": False, "note": "Needs sector-ETF history join — scheduled."},
         "note": f"Realized P&L on CLOSED signals. Cells under n={MIN_CONFIDENT} are thin — don't tune on them.",
     }

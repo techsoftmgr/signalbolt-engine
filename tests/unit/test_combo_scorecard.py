@@ -82,6 +82,22 @@ def test_scorecard_segments():
     # exit-stack: 'a' has 1 warning, b & c have 0
     counts = {r["warnings"]: r["n"] for r in out["exit_stack"]}
     assert counts.get(0) == 2 and counts.get(1) == 1
+    # concentration: a/b/c fired on 3 different days -> all solo cohorts
+    cbuckets = {r["bucket"]: r["n"] for r in out["concentration"]}
+    assert cbuckets.get("solo (1)") == 3
+
+
+def test_concentration_buckets_basket():
+    # 12 LONGs all fired the SAME day -> a "basket (10+)" cohort
+    signals = [
+        {"id": f"x{i}", "direction": "LONG", "strategy_type": "swing_trade", "entry_price": 100.0,
+         "result_pct": -2.0, "status": "closed", "created_at": "2026-05-29T14:00:00+00:00",
+         "score_breakdown": {}}
+        for i in range(12)
+    ]
+    out = cs.scorecard(_SB(signals, []), days=120)
+    cbuckets = {r["bucket"]: r["n"] for r in out["concentration"]}
+    assert cbuckets.get("basket (10+)") == 12
 
 
 def test_scorecard_no_sb():
