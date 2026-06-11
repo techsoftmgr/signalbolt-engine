@@ -978,6 +978,16 @@ async def earnings_calendar(tickers: str = ""):
     return await anyio.to_thread.run_sync(get_weekly_earnings, tlist)
 
 
+@app.get("/markets/ipo")
+async def markets_ipo(force: bool = False):
+    """IPO calendar: in-progress (expected date + price range) + recently priced
+    (finalized issue price). Source: Polygon. Public, cached 6h. Never errors —
+    returns source='unavailable' + empty lists if the Polygon key is absent."""
+    from engine.ipo_calendar import get_ipo_calendar
+    import anyio
+    return await anyio.to_thread.run_sync(get_ipo_calendar, force)
+
+
 @app.get("/market/pulse")
 async def market_pulse(tickers: str = ""):
     """
