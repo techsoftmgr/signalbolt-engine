@@ -25,7 +25,7 @@ from engine import cache
 
 logger = logging.getLogger("signalbolt.social_sentiment")
 
-CACHE_KEY = "social_sentiment:trending:v1"
+CACHE_KEY = "social_sentiment:trending:v2"   # v2: reddit_sentiment is None when absent (no fake 50/50)
 CACHE_TTL = 600   # 10 minutes
 HTTP_TIMEOUT = 8
 
@@ -81,10 +81,15 @@ def _fetch_apewisdom() -> dict[str, dict]:
         rank      = int(row.get("rank") or 0)
         prev_rank = int(row.get("rank_24h_ago") or 0)
         rank_chg  = (prev_rank - rank) if prev_rank > 0 else None   # positive = moved up
+        # ApeWisdom is a MENTION counter — its API does NOT return a real bull/bear
+        # sentiment_score. Only set a sentiment when the field is genuinely present;
+        # otherwise None, so the UI HIDES the bar instead of showing a fake 50/50
+        # for every ticker (which was misleading).
+        ss = row.get("sentiment_score")
         try:
-            sent_score = float(row.get("sentiment_score") or 50) / 100.0   # → 0..1 bullish weight
-        except Exception:
-            sent_score = 0.5
+            sent_score = round(float(ss) / 100.0, 3) if ss not in (None, "") else None
+        except (TypeError, ValueError):
+            sent_score = None
         out[t] = {
             "ticker":            t,
             "name":              row.get("name", ""),
@@ -92,8 +97,8 @@ def _fetch_apewisdom() -> dict[str, dict]:
             "reddit_change_pct": change,
             "reddit_rank":       rank,
             "reddit_rank_change":rank_chg,
-            "reddit_sentiment":  round(sent_score, 3),
-            "reddit_sentiment_label": row.get("sentiment", ""),
+            "reddit_sentiment":  sent_score,
+            "reddit_sentiment_label": row.get("sentiment", "") or None,
             "sources":           {"reddit"},
         }
     return out
