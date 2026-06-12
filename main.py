@@ -1002,11 +1002,19 @@ async def markets_spac_mergers(force: bool = False):
 async def markets_movers(request: Request, limit: int = 20):
     """Market movers — biggest % gainers / losers + unusual-volume names across our
     broad liquid universe (filtered to real common stocks; no warrant/penny junk),
-    overlaid with the quant read + any active signal. Authenticated; 60s cached."""
+    overlaid with the quant read + any active signal. Authenticated.
+
+    Serves the warmer-populated cache; if it isn't warm yet, kicks a background
+    build (coalesced via a lock) and returns a fast 'warming' payload — a user
+    request NEVER runs the ~15-25s build inline (that's what timed the app out)."""
     _require_jwt(request)
-    import anyio
-    from engine.movers_service import compute_movers
-    return await anyio.to_thread.run_sync(compute_movers, max(5, min(limit, 30)))
+    from engine.movers_service import peek_movers, compute_movers
+    cached = peek_movers()
+    if cached:
+        return cached
+    import threading
+    threading.Thread(target=compute_movers, kwargs={"limit": max(5, min(limit, 30))}, daemon=True).start()
+    return {"asOf": None, "gainers": [], "losers": [], "unusualVolume": [], "warming": True}
 
 
 @app.get("/market/pulse")

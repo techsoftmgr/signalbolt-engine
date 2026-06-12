@@ -3067,6 +3067,31 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled market-tape cache warmer every 60s")
 
+    # ── Movers warmer — precompute the Movers tab every ~120s into the shared
+    # cache so /markets/movers returns instantly. The build does ~30 parallel
+    # market-cap lookups + a 250-name bars call (~15-25s cold) — absorbing that
+    # OFF the request path is what keeps the app from timing out (6s budget).
+    # Only on trading days (movers are meaningless on weekends/holidays). ──
+    def _run_warm_movers():
+        try:
+            from engine.session_classifier import is_market_open_today
+            if not is_market_open_today():
+                return
+            from engine import movers_service
+            movers_service.compute_movers(force=True)
+        except Exception as _e:
+            logger.error(f"[runner] movers warm failed: {_e}")
+
+    scheduler.add_job(
+        _run_warm_movers,
+        trigger=IntervalTrigger(seconds=120),
+        id="warm_movers",
+        name="Movers cache warmer (120s, trading days)",
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=25),
+    )
+    logger.info("[runner] Scheduled movers cache warmer every 120s")
+
     # ── Overnight (Blue Ocean) display-only price poll ───────────────────────
     # During the ~8pm-4am ET overnight session, poll Alpaca's OVERNIGHT feed for
     # the watched tickers and publish to price_store so the watchlist / quote

@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 logger = logging.getLogger("signalbolt.movers")
 
 _CACHE_KEY      = "markets:movers:v1"
-_TTL            = 60
+_TTL            = 180   # outlive the 120s warmer interval so a request never hits an empty cache
+_inflight       = threading.Lock()   # coalesce concurrent heavy builds (~15-25s) to one
 _MIN_PRICE      = float(os.environ.get("MOVERS_MIN_PRICE", "5"))            # drop sub-$5 penny names
 _MIN_DOLLARVOL  = float(os.environ.get("MOVERS_MIN_DOLLARVOL", "5000000"))  # $5M floor: just drops dead/halted names. Pumps are already killed by market-cap vetting (screener) + curated-only construction, so this no longer needs to be high.
 _UNUSUAL_RELVOL = float(os.environ.get("MOVERS_UNUSUAL_RELVOL", "2.0"))     # 2× the 20-day avg = unusual
@@ -61,19 +64,22 @@ def _vetted_screener_symbols() -> list[str]:
             cand.append(s)
     if not cand:
         return []
-    out: list[str] = []
+    # Market-cap lookups are slow (Nasdaq + Polygon per symbol) — fetch them in
+    # PARALLEL so vetting ~30 names takes a few seconds, not ~100s sequentially.
+    # (Each tf.get is 24h-cached, so warm runs are instant regardless.)
+    def _vet(s: str):
+        try:
+            from engine import ticker_fundamentals as tf
+            mc = (tf.get(s) or {}).get("market_cap")
+            return s if (mc and mc >= _MIN_MKTCAP) else None
+        except Exception:
+            return None
     try:
-        from engine import ticker_fundamentals as tf
-        for s in cand:
-            try:
-                mc = (tf.get(s) or {}).get("market_cap")
-                if mc and mc >= _MIN_MKTCAP:
-                    out.append(s)
-            except Exception:
-                pass
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            return [r for r in ex.map(_vet, cand) if r]
     except Exception as e:
         logger.debug(f"[movers] screener vetting failed: {e}")
-    return out
+        return []
 
 
 def _candidate_symbols() -> list[str]:
@@ -92,77 +98,99 @@ def _candidate_symbols() -> list[str]:
     return [s for s in syms if _is_common(s)]
 
 
-def compute_movers(limit: int = 20) -> dict:
+def peek_movers() -> dict | None:
+    """Fast, non-blocking read of the cached movers (None if not warmed yet).
+    The endpoint uses this so a user request NEVER triggers the ~15-25s build —
+    that's the warmer's job (runner._run_warm_movers)."""
+    try:
+        from engine import cache
+        return cache.kv.get_json(_CACHE_KEY)
+    except Exception:
+        return None
+
+
+def compute_movers(limit: int = 20, force: bool = False) -> dict:
     """{asOf, gainers[], losers[], unusualVolume[]} — each item: symbol, price,
-    changePct, volume, relVol, rsi?, setupType?, signal?. 60s cached."""
+    changePct, volume, relVol, rsi?, setupType?, signal?. Cached; the heavy build
+    (market-cap vetting + bars) is coalesced to one in-flight worker via a lock."""
     from engine import cache
-    cached = cache.kv.get_json(_CACHE_KEY)
-    if cached:
-        return cached
-
-    syms = _candidate_symbols()
     empty = {"asOf": datetime.now(timezone.utc).isoformat(), "gainers": [], "losers": [], "unusualVolume": []}
-    if not syms:
-        return empty
-
-    from engine.alpaca_client import get_multi_bars
-    bars = get_multi_bars(syms, "1Day", 40) or {}
-    if not bars:
-        return empty
-
-    # Quant overlay (RSI / setup) from the cached scan — present only for tracked names.
-    quant: dict = {}
+    if not force:
+        cached = cache.kv.get_json(_CACHE_KEY)
+        if cached:
+            return cached
+    # Only ONE heavy build at a time — concurrent callers get whatever's cached.
+    if not _inflight.acquire(blocking=False):
+        return cache.kv.get_json(_CACHE_KEY) or empty
     try:
-        for r in (cache.kv.get_json("quant:scored:v1") or []):
-            if r.get("ticker"):
-                quant[r["ticker"]] = r
-    except Exception:
-        pass
+        cached = cache.kv.get_json(_CACHE_KEY)
+        if cached and not force:        # filled while we waited for the lock
+            return cached
 
-    # Active-signal overlay (so a mover we already have a trade on is flagged).
-    sig: dict = {}
-    try:
-        from engine import runner
-        sb = runner._supabase()
-        present = list(bars.keys())
-        for i in range(0, len(present), 200):
-            rows = (sb.table("signals").select("ticker,direction")
-                    .eq("status", "active").in_("ticker", present[i:i + 200]).execute().data) or []
-            for r in rows:
-                sig[r["ticker"]] = r.get("direction")
-    except Exception as e:
-        logger.debug(f"[movers] active-signal overlay failed: {e}")
+        syms = _candidate_symbols()
+        if not syms:
+            return empty
 
-    built: list[dict] = []
-    for s, df in bars.items():
+        from engine.alpaca_client import get_multi_bars
+        bars = get_multi_bars(syms, "1Day", 40) or {}
+        if not bars:
+            return empty
+
+        # Quant overlay (RSI / setup) from the cached scan — present only for tracked names.
+        quant: dict = {}
         try:
-            if df is None or len(df) < 2:
-                continue
-            price = float(df["close"].iloc[-1])
-            prev  = float(df["close"].iloc[-2])
-            vol   = float(df["volume"].iloc[-1])
-            if price < _MIN_PRICE or prev <= 0 or price * vol < _MIN_DOLLARVOL:
-                continue
-            chg = round((price - prev) / prev * 100, 2)
-            avg = float(df["volume"].iloc[-21:-1].mean()) if len(df) >= 21 else float(df["volume"].iloc[:-1].mean() or 0)
-            relvol = round(vol / avg, 2) if avg > 0 else None
-            q = quant.get(s) or {}
-            built.append({
-                "symbol": s, "price": round(price, 2), "changePct": chg, "volume": int(vol),
-                "relVol": relvol, "rsi": q.get("rsi"), "setupType": q.get("setupType"), "signal": sig.get(s),
-            })
+            for r in (cache.kv.get_json("quant:scored:v1") or []):
+                if r.get("ticker"):
+                    quant[r["ticker"]] = r
         except Exception:
-            continue
+            pass
 
-    gainers = sorted([b for b in built if b["changePct"] > 0], key=lambda x: -x["changePct"])[:limit]
-    losers  = sorted([b for b in built if b["changePct"] < 0], key=lambda x:  x["changePct"])[:limit]
-    unusual = sorted([b for b in built if (b["relVol"] or 0) >= _UNUSUAL_RELVOL],
-                     key=lambda x: -(x["relVol"] or 0))[:limit]
+        # Active-signal overlay (so a mover we already have a trade on is flagged).
+        sig: dict = {}
+        try:
+            from engine import runner
+            sb = runner._supabase()
+            present = list(bars.keys())
+            for i in range(0, len(present), 200):
+                rows = (sb.table("signals").select("ticker,direction")
+                        .eq("status", "active").in_("ticker", present[i:i + 200]).execute().data) or []
+                for r in rows:
+                    sig[r["ticker"]] = r.get("direction")
+        except Exception as e:
+            logger.debug(f"[movers] active-signal overlay failed: {e}")
 
-    out = {"asOf": datetime.now(timezone.utc).isoformat(),
-           "gainers": gainers, "losers": losers, "unusualVolume": unusual}
-    try:
-        cache.kv.set_json(_CACHE_KEY, out, _TTL)
-    except Exception:
-        pass
-    return out
+        built: list[dict] = []
+        for s, df in bars.items():
+            try:
+                if df is None or len(df) < 2:
+                    continue
+                price = float(df["close"].iloc[-1])
+                prev  = float(df["close"].iloc[-2])
+                vol   = float(df["volume"].iloc[-1])
+                if price < _MIN_PRICE or prev <= 0 or price * vol < _MIN_DOLLARVOL:
+                    continue
+                chg = round((price - prev) / prev * 100, 2)
+                avg = float(df["volume"].iloc[-21:-1].mean()) if len(df) >= 21 else float(df["volume"].iloc[:-1].mean() or 0)
+                relvol = round(vol / avg, 2) if avg > 0 else None
+                q = quant.get(s) or {}
+                built.append({
+                    "symbol": s, "price": round(price, 2), "changePct": chg, "volume": int(vol),
+                    "relVol": relvol, "rsi": q.get("rsi"), "setupType": q.get("setupType"), "signal": sig.get(s),
+                })
+            except Exception:
+                continue
+
+        gainers = sorted([b for b in built if b["changePct"] > 0], key=lambda x: -x["changePct"])[:limit]
+        losers  = sorted([b for b in built if b["changePct"] < 0], key=lambda x:  x["changePct"])[:limit]
+        unusual = sorted([b for b in built if (b["relVol"] or 0) >= _UNUSUAL_RELVOL],
+                         key=lambda x: -(x["relVol"] or 0))[:limit]
+
+        out = {"asOf": datetime.now(timezone.utc).isoformat(),
+               "gainers": gainers, "losers": losers, "unusualVolume": unusual}
+        try:
+            cache.kv.set_json(_CACHE_KEY, out, _TTL)
+        except Exception:
+            pass
+        return out
+    finally:
+        _inflight.release()
