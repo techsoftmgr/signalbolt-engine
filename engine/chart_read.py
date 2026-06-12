@@ -746,6 +746,36 @@ def analyze(symbol: str, timeframe: str = "1Day") -> Optional[dict]:
 _FULL_TTL = 300   # 5 min — the read is a settled/swing analysis; brief staleness is fine
 
 
+def _market_cap(sym: str):
+    """Market cap from Polygon ticker details, cached 24h (slow-changing). None on miss."""
+    ck = f"mktcap:v1:{sym}"
+    try:
+        from engine import cache
+        c = cache.kv.get_json(ck)
+        if c is not None:
+            return c.get("v") if isinstance(c, dict) else c
+    except Exception:
+        pass
+    val = None
+    try:
+        import os, httpx
+        key = os.environ.get("POLYGON_API_KEY")
+        if key:
+            with httpx.Client(timeout=12) as cl:
+                resp = cl.get(f"https://api.polygon.io/v3/reference/tickers/{sym}", params={"apiKey": key})
+                if resp.status_code == 200:
+                    mc = ((resp.json() or {}).get("results") or {}).get("market_cap")
+                    val = round(float(mc)) if mc else None
+    except Exception as e:
+        logger.debug(f"[chart_read] market_cap {sym} failed: {e}")
+    try:
+        from engine import cache
+        cache.kv.set_json(ck, {"v": val}, 24 * 3600)   # cache even None (don't re-hit a name w/o data)
+    except Exception:
+        pass
+    return val
+
+
 def build_full(symbol: str, timeframe: str = "1Day", sb=None, force: bool = False) -> Optional[dict]:
     """The full Expert-Read payload the hub needs (analyze + decision_support +
     read track-record), CACHED per (ticker, timeframe) so the hub doesn't recompute
@@ -779,6 +809,7 @@ def build_full(symbol: str, timeframe: str = "1Day", sb=None, force: bool = Fals
                     r["readTrackRecord"] = tr
             except Exception as e:
                 logger.debug(f"[chart_read] read track record failed for {sym}: {e}")
+            r["marketCap"] = _market_cap(sym)   # 24h-cached; slow-changing → safe in the 5-min payload
         if r:
             try:
                 from engine import cache
