@@ -20,8 +20,9 @@ logger = logging.getLogger("signalbolt.movers")
 _CACHE_KEY      = "markets:movers:v1"
 _TTL            = 60
 _MIN_PRICE      = float(os.environ.get("MOVERS_MIN_PRICE", "5"))            # drop sub-$5 penny names
-_MIN_DOLLARVOL  = float(os.environ.get("MOVERS_MIN_DOLLARVOL", "20000000")) # $20M traded today = liquid
+_MIN_DOLLARVOL  = float(os.environ.get("MOVERS_MIN_DOLLARVOL", "5000000"))  # $5M floor: just drops dead/halted names. Pumps are already killed by market-cap vetting (screener) + curated-only construction, so this no longer needs to be high.
 _UNUSUAL_RELVOL = float(os.environ.get("MOVERS_UNUSUAL_RELVOL", "2.0"))     # 2× the 20-day avg = unusual
+_MIN_MKTCAP     = float(os.environ.get("MOVERS_MIN_MKTCAP", "1500000000"))  # $1.5B floor to vet screener names
 
 
 def _is_common(s: str) -> bool:
@@ -31,19 +32,63 @@ def _is_common(s: str) -> bool:
     return bool(s) and s.isalpha() and s.isupper() and len(s) <= 5 and not (len(s) == 5 and s[-1] in "WURQ")
 
 
+def _screener(path: str, top: int = 50) -> dict:
+    """Alpaca market-wide screener (keyed by our existing Alpaca creds). top caps at 50."""
+    try:
+        import httpx
+        key = os.environ.get("ALPACA_API_KEY")
+        sec = os.environ.get("ALPACA_SECRET_KEY")
+        if not key or not sec:
+            return {}
+        with httpx.Client(timeout=12, headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec}) as c:
+            r = c.get(f"https://data.alpaca.markets/v1beta1/screener/stocks/{path}", params={"top": top})
+            return r.json() if r.status_code == 200 else {}
+    except Exception as e:
+        logger.debug(f"[movers] screener {path} failed: {e}")
+        return {}
+
+
+def _vetted_screener_symbols() -> list[str]:
+    """Alpaca's market-wide top-50 gainers/losers, but only the ones that survive a
+    market-cap floor — the one reliable filter that separates a real mover (ROKU,
+    MAAS) from a microcap pump-and-dump (UBXG +67%, DSY +33%). Market caps are
+    24h-cached, so only the first refresh of the day pays the lookups."""
+    cand: list[str] = []
+    mv = _screener("movers", 50)
+    for it in (mv.get("gainers") or []) + (mv.get("losers") or []):
+        s = it.get("symbol")
+        if s and _is_common(s) and (it.get("price") or 0) >= _MIN_PRICE:
+            cand.append(s)
+    if not cand:
+        return []
+    out: list[str] = []
+    try:
+        from engine import ticker_fundamentals as tf
+        for s in cand:
+            try:
+                mc = (tf.get(s) or {}).get("market_cap")
+                if mc and mc >= _MIN_MKTCAP:
+                    out.append(s)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug(f"[movers] screener vetting failed: {e}")
+    return out
+
+
 def _candidate_symbols() -> list[str]:
-    """Our curated broad-LIQUID universe (~250 names incl. RIVN/ROKU/ARM/INTC).
-    Deliberately NOT Alpaca's raw market-wide screener: that feed is dominated by
-    microcap pump-and-dumps (UBXG +76% on 150× volume, etc.) that pass any price/
-    dollar-volume floor, and the only reliable discriminator — market cap — is too
-    slow to fetch inline for hundreds of names. The curated universe can't contain
-    pumps, so the movers list stays clean and the real movers surface."""
+    """Hybrid pool: our curated broad-LIQUID universe (~250 names incl.
+    RIVN/ROKU/ARM/INTC) ∪ Alpaca's market-wide top-50 movers vetted by market cap.
+    The curated set guarantees clean, fast coverage of tracked names; the vetted
+    screener adds true market-wide breadth (catches a real mover outside our list,
+    e.g. MAAS) WITHOUT the warrant/penny-pump junk the raw screener is full of."""
     syms: set[str] = set()
     try:
         from engine import prescreener as ps, momentum_detector as md
         syms |= set(ps.EXTENDED_UNIVERSE) | set(md.UNIVERSE)
     except Exception as e:
         logger.debug(f"[movers] universe load failed: {e}")
+    syms |= set(_vetted_screener_symbols())
     return [s for s in syms if _is_common(s)]
 
 
