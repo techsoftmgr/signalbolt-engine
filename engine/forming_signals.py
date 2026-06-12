@@ -45,6 +45,9 @@ _CONFIG = {
     # Volume-leads-price: the EARLIEST tell, before any structural break.
     "accum":     ("LONG",  "ACCUM_FORMING",     "accum_forming",     "LONG"),
     "distrib":   ("SHORT", "DISTRIB_FORMING",   "distrib_forming",   "SHORT"),
+    # Price-IS-moving: an early intraday momentum surge (+X% on heavy volume),
+    # caught while the move is young (~+5%) instead of after it's run +20%.
+    "surge":     ("LONG",  "MOMENTUM_SURGE",    "momentum_surge",    "LONG"),
 }
 
 
@@ -97,6 +100,7 @@ def _conf(kind: str, r: dict) -> int:
         "breakout":  "breakoutScore", "breakdown": "breakdownScore",
         "peak":      "peakScore",     "turn":      "turnaroundScore",
         "accum":     "volumeScore",   "distrib":   "volumeScore",
+        "surge":     "momentumScore",
     }[kind]
     raw = float(r.get(score_field) or r.get("volumeScore") or 58.0)
     return int(min(80, max(55, round(raw))))   # capped below confirmed — unproven
@@ -160,6 +164,7 @@ def generate(sb, r: dict, kind: str) -> dict:
         "turn":      "forming bottom (first higher low / reclaim)",
         "accum":     "high-volume accumulation (big buyers stepping in)",
         "distrib":   "high-volume distribution (heavy selling stepping in)",
+        "surge":     "early momentum surge (moving up fast on heavy volume)",
     }[kind]
 
     signal_row = {
