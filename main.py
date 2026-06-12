@@ -1202,11 +1202,25 @@ def get_prices(tickers: str):
         to_fetch.append(sym)
 
     if to_fetch:
+        from engine import crypto_assets
+        crypto_fetch = [s for s in to_fetch if crypto_assets.is_crypto(s)]
+        stock_fetch  = [s for s in to_fetch if not crypto_assets.is_crypto(s)]
+
+        # ── 0. Crypto (Alpaca crypto feed, keyless, 24/7) ─────────────
+        fresh: dict = {}
+        if crypto_fetch:
+            try:
+                from engine.alpaca_client import get_crypto_snapshots
+                fresh.update(get_crypto_snapshots(crypto_fetch))
+            except Exception as _ce:
+                logger.debug(f"[prices] crypto snapshot failed: {_ce}")
+
         # ── 1. Alpaca SIP (real-time, consistent with signal engine) ──
-        fresh = _alpaca_stock_snapshots(to_fetch)
+        if stock_fetch:
+            fresh.update(_alpaca_stock_snapshots(stock_fetch))
 
         # ── 2. Polygon fallback for any symbols Alpaca missed ─────────
-        missing = [s for s in to_fetch if s not in fresh]
+        missing = [s for s in stock_fetch if s not in fresh]
         if missing:
             poly = _polygon_stock_snapshots(missing)
             fresh.update(poly)
@@ -1215,7 +1229,7 @@ def get_prices(tickers: str):
         # NOTE: yfinance is DELAYED. If we're hitting this for liquid names,
         # the paid Alpaca SIP feed failed — log loudly so we can see it (a
         # silent fallback here is what makes prices disagree with the broker).
-        still_missing = [s for s in to_fetch if s not in fresh]
+        still_missing = [s for s in stock_fetch if s not in fresh]
         if still_missing:
             logger.warning(
                 f"[prices] Alpaca SIP + Polygon missed {still_missing} — "
@@ -1273,8 +1287,14 @@ def get_prices(tickers: str):
 
     # Stamp staleAfter on every entry (cached + freshly fetched alike) so
     # the UI has a uniform contract. Non-destructive: spread into a copy
-    # so we don't mutate the cached dicts.
-    return {sym: {**data, "staleAfter": _stale_after_iso} for sym, data in result.items()}
+    # so we don't mutate the cached dicts. Crypto trades 24/7, so it always
+    # gets the short (live) horizon — never grey it out when stocks are closed.
+    from engine import crypto_assets as _ca
+    _crypto_stale_iso = (_now_dt + timedelta(seconds=int(_PRICES_CACHE_TTL))).isoformat()
+    return {
+        sym: {**data, "staleAfter": (_crypto_stale_iso if _ca.is_crypto(sym) else _stale_after_iso)}
+        for sym, data in result.items()
+    }
 
 
 @app.websocket("/ws/prices")
