@@ -15,9 +15,9 @@ the whole point — get in while the move is young, NOT after it's parabolic.
 
 ENV (all optional):
   MOMENTUM_SURGE_ENABLED      default "true"  — master off-switch
-  MOMENTUM_SURGE_MIN_PCT      default 5.0     — fire once the day's move clears +5%
+  MOMENTUM_SURGE_MIN_PCT      default 4.0     — fire once the day's move clears +4%
   MOMENTUM_SURGE_MAX_PCT      default 12.0    — past this it's a chase; don't fire
-  MOMENTUM_SURGE_MIN_RVOL     default 3.0     — heavy volume confirmation
+  MOMENTUM_SURGE_MIN_RVOL     default 2.5     — heavy volume confirmation (the quality gate)
   MOMENTUM_SURGE_MAX_PER_RUN  default 5
 """
 from __future__ import annotations
@@ -28,9 +28,9 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger("signalbolt.momentum_surge")
 
-_MIN_PCT     = float(os.environ.get("MOMENTUM_SURGE_MIN_PCT", "5"))
+_MIN_PCT     = float(os.environ.get("MOMENTUM_SURGE_MIN_PCT", "4"))
 _MAX_PCT     = float(os.environ.get("MOMENTUM_SURGE_MAX_PCT", "12"))
-_MIN_RVOL    = float(os.environ.get("MOMENTUM_SURGE_MIN_RVOL", "3"))
+_MIN_RVOL    = float(os.environ.get("MOMENTUM_SURGE_MIN_RVOL", "2.5"))
 _MAX_PER_RUN = int(os.environ.get("MOMENTUM_SURGE_MAX_PER_RUN", "5"))
 _DEDUP_TTL   = 18 * 3600   # once per ticker per day
 

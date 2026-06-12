@@ -3194,8 +3194,8 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled breakout alerts every 15 min")
 
-    # ── Momentum Surge — fire an EARLY long on a young (+5%) heavy-volume move,
-    # so we catch ROKU-type runs near +5% instead of after +20%. Regime-free
+    # ── Momentum Surge — fire an EARLY long on a young (+4%) heavy-volume move,
+    # so we catch ROKU-type runs near +4% instead of after +20%. Regime-free
     # (forming_signals), tagged MOMENTUM_SURGE for the scorecard. RTH-gated;
     # every 3 min so the early window isn't missed. Off-switch: MOMENTUM_SURGE_ENABLED. ──
     def _run_momentum_surge():
