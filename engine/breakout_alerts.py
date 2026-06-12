@@ -20,12 +20,20 @@ Runs every ~15 min during REGULAR market hours (gated in runner.py).
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 
 logger = logging.getLogger("signalbolt.breakout_alerts")
 
 _STATE_TTL   = 3 * 24 * 3600
 _DEDUP_TTL   = 36 * 3600
+# A CONFIRMED breakout needs participation — a break of the 20-day high on
+# below-average volume is a classic false breakout (no buyers behind it). Require
+# projected relative volume >= this to fire the LONG/CALL. Env-tunable; set 0 to
+# disable. (Forming/accum states already gate on volume; this closes the gap on
+# the confirmed card — the worst-performing bucket, ~-0.8%/25% win.)
+_BREAKOUT_MIN_RVOL = float(os.environ.get("BREAKOUT_MIN_RVOL", "1.5"))
+
 _MAX_CONFIRM = 3
 _MAX_EARLY   = 3
 _MAX_ACCUM   = 3
@@ -36,6 +44,18 @@ def _strength(r: dict) -> float:
     return max(float(r.get("breakoutScore") or 0.0),
                float(r.get("breakoutQuality") or 0.0),
                0.85 * float(r.get("volumeScore") or 0.0))
+
+
+def _breakout_vol_ok(r: dict) -> bool:
+    """A confirmed breakout needs volume confirmation: require projected relative
+    volume >= _BREAKOUT_MIN_RVOL. Fails OPEN (True) when volume is unknown, so a
+    missing reading never blocks — only a genuinely weak (<threshold) one does."""
+    if _BREAKOUT_MIN_RVOL <= 0:
+        return True
+    rv = r.get("relativeVolume")
+    if not isinstance(rv, (int, float)):
+        return True
+    return rv >= _BREAKOUT_MIN_RVOL
 
 
 def _state_of(r: dict) -> dict:
@@ -187,6 +207,13 @@ def run(sb=None) -> dict:
                 if gen >= _MAX_GEN:
                     break
                 tk = (r.get("ticker") or "").upper()
+                # Volume confirmation — skip a break of the high on weak volume.
+                if not _breakout_vol_ok(r):
+                    rv = r.get("relativeVolume")
+                    logger.info(f"[breakout_alerts] {tk} breakout SKIPPED — "
+                                f"{rv:.2f}x volume < {_BREAKOUT_MIN_RVOL}x (no participation)")
+                    stats["lowvol_skipped"] = stats.get("lowvol_skipped", 0) + 1
+                    continue
                 try:
                     if _runner._has_active_signal(sb, tk, "breakout"):
                         continue   # already tracked this episode
