@@ -3194,6 +3194,32 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled breakout alerts every 15 min")
 
+    # ── Momentum Surge — fire an EARLY long on a young (+5%) heavy-volume move,
+    # so we catch ROKU-type runs near +5% instead of after +20%. Regime-free
+    # (forming_signals), tagged MOMENTUM_SURGE for the scorecard. RTH-gated;
+    # every 3 min so the early window isn't missed. Off-switch: MOMENTUM_SURGE_ENABLED. ──
+    def _run_momentum_surge():
+        try:
+            from engine.session_classifier import is_market_open_now
+            if not is_market_open_now():
+                return
+            from engine import momentum_surge
+            momentum_surge.run(_supabase())
+        except Exception as _e:
+            logger.error(f"[runner] momentum surge failed: {_e}")
+
+    scheduler.add_job(
+        _run_momentum_surge,
+        trigger=IntervalTrigger(minutes=3),
+        id="momentum_surge",
+        name="Momentum Surge detector (3-min, RTH)",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=90),
+    )
+    logger.info("[runner] Scheduled momentum surge every 3 min")
+
     # ── Premarket disaster-gap alerts (notification-only, 8:00–9:30 AM ET) ────
     # Heads-up for OPEN overnight positions (swing/breakout/breakdown/TREND) that
     # gapped hard AGAINST the signal before the open. NEVER closes a position or
