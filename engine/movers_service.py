@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 logger = logging.getLogger("signalbolt.movers")
 
 _CACHE_KEY      = "markets:movers:v1"
-_TTL            = 180   # outlive the 120s warmer interval so a request never hits an empty cache
+_TTL            = 30    # safety-net expiry; the 10s warmer keeps it fresher than this
 _inflight       = threading.Lock()   # coalesce concurrent heavy builds (~15-25s) to one
 _MIN_PRICE      = float(os.environ.get("MOVERS_MIN_PRICE", "5"))            # drop sub-$5 penny names
 _MIN_DOLLARVOL  = float(os.environ.get("MOVERS_MIN_DOLLARVOL", "5000000"))  # $5M floor: just drops dead/halted names. Pumps are already killed by market-cap vetting (screener) + curated-only construction, so this no longer needs to be high.
