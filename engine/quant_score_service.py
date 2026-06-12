@@ -306,6 +306,26 @@ def snapshot(tickers: list[str]) -> dict:
         r = cached.get(tk) or scored_missing.get(tk)
         if r:
             out[tk] = {k: r.get(k) for k in _SNAPSHOT_KEEP}
+
+    # 3) Enrich the requested (watchlist) tickers with slow-changing fundamentals
+    #    — market cap, P/E (price ÷ trailing EPS), next earnings quarter. 24h-cached
+    #    per ticker, so this is ~free after the first daily miss; never blocks output.
+    try:
+        from engine import ticker_fundamentals
+        for tk, row in out.items():
+            try:
+                f = ticker_fundamentals.get(tk) or {}
+                if f.get("market_cap"):
+                    row["marketCap"] = f["market_cap"]
+                if f.get("earnings_period"):
+                    row["earningsPeriod"] = f["earnings_period"]
+                eps, px = f.get("eps"), row.get("price")
+                if eps and px and eps > 0:
+                    row["peRatio"] = round(float(px) / float(eps), 1)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug(f"[quant.snapshot] fundamentals enrich failed: {e}")
     return out
 
 
