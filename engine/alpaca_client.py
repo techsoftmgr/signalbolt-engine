@@ -44,6 +44,135 @@ def _init() -> None:
         logger.warning(f"[alpaca] Client init failed: {e} — will rely on yfinance fallback")
 
 
+# ── Crypto support (additive; isolated from the stock path) ─────────────────────
+# Alpaca crypto needs NO API key/entitlement. A separate historical client serves
+# crypto bars/quotes; stock symbols never touch it. Routing decided by crypto_assets.
+_crypto_client = None
+_crypto_ok     = False
+
+
+def _init_crypto() -> None:
+    global _crypto_client, _crypto_ok
+    if _crypto_ok:
+        return
+    try:
+        from alpaca.data.historical import CryptoHistoricalDataClient
+        _crypto_client = CryptoHistoricalDataClient()   # keyless
+        _crypto_ok     = True
+        logger.info("[alpaca] Crypto client initialised")
+    except Exception as e:
+        logger.warning(f"[alpaca] Crypto client init failed: {e}")
+
+
+def _crypto_tf(timeframe: str):
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+    return {
+        "1Min":  TimeFrame(1,  TimeFrameUnit.Minute),
+        "5Min":  TimeFrame(5,  TimeFrameUnit.Minute),
+        "15Min": TimeFrame(15, TimeFrameUnit.Minute),
+        "1Hour": TimeFrame(1,  TimeFrameUnit.Hour),
+        "1Day":  TimeFrame(1,  TimeFrameUnit.Day),
+        "1Week": TimeFrame(1,  TimeFrameUnit.Week),
+    }.get(timeframe, TimeFrame(1, TimeFrameUnit.Day))
+
+
+def _crypto_bars(bases: list[str], timeframe: str, days: int) -> dict[str, pd.DataFrame]:
+    """{base_symbol: OHLCV df} for crypto. Keyed by the BASE symbol (e.g. 'BTC')
+    so callers see the same key they passed in. {} on any failure."""
+    _init_crypto()
+    if not _crypto_ok or _crypto_client is None or not bases:
+        return {}
+    try:
+        from datetime import datetime, timezone, timedelta
+        from alpaca.data.requests import CryptoBarsRequest
+        from engine import crypto_assets
+        pair_to_base = {}
+        for b in bases:
+            p = crypto_assets.to_pair(b)
+            if p:
+                pair_to_base[p] = crypto_assets.base(b)
+        if not pair_to_base:
+            return {}
+        req = CryptoBarsRequest(
+            symbol_or_symbols=list(pair_to_base.keys()),
+            timeframe=_crypto_tf(timeframe),
+            start=datetime.now(timezone.utc) - timedelta(days=days),
+        )
+        df = _crypto_client.get_crypto_bars(req).df
+        if df is None or df.empty:
+            return {}
+        out: dict[str, pd.DataFrame] = {}
+        for pair, b in pair_to_base.items():
+            try:
+                t_df = df.xs(pair, level=0).copy() if isinstance(df.index, pd.MultiIndex) else df.copy()
+                t_df.columns = [c.lower() for c in t_df.columns]
+                t_df.index   = pd.to_datetime(t_df.index, utc=True)
+                out[b] = t_df
+            except Exception:
+                pass
+        return out
+    except Exception as e:
+        logger.debug(f"[alpaca] crypto bars {bases} failed: {e}")
+        return {}
+
+
+def _crypto_latest_prices(bases: list[str]) -> dict[str, float]:
+    """{base_symbol: last trade price} for crypto. {} on failure."""
+    _init_crypto()
+    if not _crypto_ok or _crypto_client is None or not bases:
+        return {}
+    try:
+        from alpaca.data.requests import CryptoLatestTradeRequest
+        from engine import crypto_assets
+        pair_to_base = {}
+        for b in bases:
+            p = crypto_assets.to_pair(b)
+            if p:
+                pair_to_base[p] = crypto_assets.base(b)
+        if not pair_to_base:
+            return {}
+        resp = _crypto_client.get_crypto_latest_trade(
+            CryptoLatestTradeRequest(symbol_or_symbols=list(pair_to_base.keys()))
+        )
+        out: dict[str, float] = {}
+        for pair, b in pair_to_base.items():
+            t = resp.get(pair) if hasattr(resp, "get") else resp[pair]
+            if t and t.price:
+                out[b] = float(t.price)
+        return out
+    except Exception as e:
+        logger.debug(f"[alpaca] crypto latest prices {bases} failed: {e}")
+        return {}
+
+
+def get_crypto_snapshots(bases: list[str]) -> dict[str, dict]:
+    """{base: {price, changePercent, session, source}} for crypto — the /prices
+    response shape. changePercent is vs the previous completed UTC daily close.
+    24/7 market, so session is always 'market'. {} on failure."""
+    prices = _crypto_latest_prices(bases)
+    if not prices:
+        return {}
+    daily = _crypto_bars(list(prices.keys()), "1Day", 4)
+    out: dict[str, dict] = {}
+    for b, px in prices.items():
+        chg = None
+        try:
+            df = daily.get(b)
+            if df is not None and len(df) >= 2:
+                prev = float(df["close"].iloc[-2])   # last COMPLETED daily close
+                if prev > 0:
+                    chg = round((px - prev) / prev * 100, 3)
+        except Exception:
+            pass
+        out[b] = {
+            "price":         round(px, 2 if px >= 1 else 6),
+            "changePercent": chg,
+            "session":       "market",
+            "source":        "alpaca-crypto",
+        }
+    return out
+
+
 # ── Price helpers ─────────────────────────────────────────────────────────────
 
 def get_latest_price(ticker: str) -> Optional[float]:
@@ -51,6 +180,9 @@ def get_latest_price(ticker: str) -> Optional[float]:
     Real-time latest trade price (Alpaca SIP).
     Returns None on any failure — caller should fall back to yfinance.
     """
+    from engine import crypto_assets
+    if crypto_assets.is_crypto(ticker):
+        return _crypto_latest_prices([ticker]).get(crypto_assets.base(ticker))
     _init()
     if not _ok or _client is None:
         return None
@@ -74,22 +206,32 @@ def get_latest_prices(tickers: list[str]) -> dict[str, float]:
     Batch real-time prices for multiple tickers in ONE API call.
     Returns {ticker: price} — missing tickers are omitted (not in response).
     """
-    _init()
-    if not _ok or _client is None or not tickers:
+    if not tickers:
         return {}
+    # Split crypto out to the keyless crypto client; stocks stay on SIP.
+    from engine import crypto_assets
+    crypto_syms = [t for t in tickers if crypto_assets.is_crypto(t)]
+    stock_syms  = [t for t in tickers if not crypto_assets.is_crypto(t)]
+    out: dict[str, float] = {}
+    if crypto_syms:
+        out.update(_crypto_latest_prices(crypto_syms))
+    if not stock_syms:
+        return out
+    _init()
+    if not _ok or _client is None:
+        return out
     try:
         from alpaca.data.requests import StockLatestTradeRequest
         resp = _client.get_stock_latest_trade(
-            StockLatestTradeRequest(symbol_or_symbols=tickers, feed="sip")
+            StockLatestTradeRequest(symbol_or_symbols=stock_syms, feed="sip")
         )
-        return {
-            t: float(resp[t].price)
-            for t in tickers
-            if t in resp and resp[t].price
-        }
+        for t in stock_syms:
+            if t in resp and resp[t].price:
+                out[t] = float(resp[t].price)
+        return out
     except Exception as e:
         logger.debug(f"[alpaca] batch latest_prices failed: {e}")
-        return {}
+        return out
 
 
 def get_overnight_prices(tickers: list[str]) -> dict[str, float]:
@@ -164,6 +306,9 @@ def get_bars(
     Returns a DataFrame with lowercase columns: open, high, low, close, volume
     indexed by timestamp (UTC). Returns None on failure.
     """
+    from engine import crypto_assets
+    if crypto_assets.is_crypto(ticker):
+        return _crypto_bars([ticker], timeframe, days).get(crypto_assets.base(ticker))
     _init()
     if not _ok or _client is None:
         return None
@@ -350,9 +495,21 @@ def get_multi_bars(
     Returns {ticker: DataFrame(open,high,low,close,volume)} — missing tickers omitted.
     Returns {} on failure so callers can degrade gracefully.
     """
-    _init()
-    if not _ok or _client is None or not tickers:
+    if not tickers:
         return {}
+    # Split crypto out to the keyless crypto client; stocks stay on SIP.
+    from engine import crypto_assets
+    crypto_syms = [t for t in tickers if crypto_assets.is_crypto(t)]
+    stock_syms  = [t for t in tickers if not crypto_assets.is_crypto(t)]
+    result: dict[str, pd.DataFrame] = {}
+    if crypto_syms:
+        result.update(_crypto_bars(crypto_syms, timeframe, days))
+    if not stock_syms:
+        return result
+    tickers = stock_syms
+    _init()
+    if not _ok or _client is None:
+        return result
     try:
         from datetime import datetime, timezone, timedelta
         from alpaca.data.requests import StockBarsRequest
@@ -381,9 +538,8 @@ def get_multi_bars(
         df   = bars.df
 
         if df is None or df.empty:
-            return {}
+            return result   # keep any crypto entries already collected
 
-        result: dict[str, pd.DataFrame] = {}
         for ticker in tickers:
             try:
                 if isinstance(df.index, pd.MultiIndex):
@@ -399,7 +555,7 @@ def get_multi_bars(
 
     except Exception as e:
         logger.debug(f"[alpaca] get_multi_bars({len(tickers)} tickers, {timeframe}, {days}d) failed: {e}")
-        return {}
+        return result   # keep any crypto entries already collected
 
 
 def get_multi_news(tickers: list[str], limit: int = 10) -> list[dict]:
