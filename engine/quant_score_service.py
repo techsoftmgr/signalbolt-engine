@@ -246,6 +246,7 @@ _SNAPSHOT_KEEP = (
     "setupType", "setupReason", "watchStatus", "finalQuantScore",
     "breakoutLevel", "breakdownLevel", "distToBreakoutPct",
     "turnaroundStage", "peakStage",
+    "wk52High", "wk52Low", "wk52Pct",
 )
 
 
@@ -699,6 +700,19 @@ def _score_ticker(
     dist_to_low_pct = (current - low_20) / low_20 * 100 if low_20 else 0.0  # positive = above the low
     breakdown_score = _normalize(-dist_to_low_pct, -5, 2)  # high when at/below the 20-day low
 
+    # 52-week range (uses the long daily df already fetched for MA200; falls back
+    # to the short window). Powers the watchlist range bar + "near 52w high/low".
+    wk52_high = wk52_low = wk52_pct = None
+    try:
+        _lref = daily_long_df if (daily_long_df is not None and "high" in daily_long_df) else daily_df
+        if "high" in _lref and "low" in _lref:
+            wk52_high = round(float(np.max(_lref["high"].values[-252:])), 2)
+            wk52_low  = round(float(np.min(_lref["low"].values[-252:])), 2)
+            if wk52_high > wk52_low:
+                wk52_pct = round((current - wk52_low) / (wk52_high - wk52_low) * 100, 1)  # 0=low, 100=high
+    except Exception:
+        pass
+
     # Day change vs prior close — the DIRECTION of today's move. Critical for
     # reading High Volume (up-vol = accumulation, down-vol = distribution).
     prev_close = float(closes[-2]) if len(closes) >= 2 else current
@@ -879,6 +893,9 @@ def _score_ticker(
         "distToBreakoutPct":   round(dist_to_high_pct, 2),  # negative = below the high
         "ma20":                round(float(ma20), 2),     # 20-day avg — the rising trend support / "buy-the-dip" anchor
         "atrPct":              round(float(atr_pct), 2),   # daily range as % of price (for a dip-zone band)
+        "wk52High":            wk52_high,                  # 52-week high / low / position (watchlist range bar)
+        "wk52Low":             wk52_low,
+        "wk52Pct":             wk52_pct,                   # 0 = at 52w low, 100 = at 52w high
         "breakoutQuality":     breakout_quality,         # breakout-specific 0-100 (no vol penalty)
         "breakdownScore":      round(breakdown_score, 1),
         "breakdownLevel":      round(low_20, 2),          # 20-day low being tested
