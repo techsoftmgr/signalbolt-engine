@@ -3757,6 +3757,10 @@ async def admin_detector_stats(request: Request, days: int = 7):
         mom = {"fires": 0, "active": 0, "wins": 0, "losses": 0,
                "pnl_sum": 0.0, "pnl_n": 0, "signals": []}
         for r in rows:
+            # Cancelled signals (phantom / never-executed — e.g. split artifacts) must
+            # not count toward ANY analytics, not even the fire count.
+            if r.get("status") == "cancelled" or r.get("result") == "cancelled":
+                continue
             sb_bd = r.get("score_breakdown") or {}
             src = sb_bd.get("detector_source") or "SMC"
             relaxed = bool((sb_bd.get("entry_gate") or {}).get("momentum_relaxed"))
