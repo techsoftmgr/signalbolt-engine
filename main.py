@@ -998,6 +998,17 @@ async def markets_spac_mergers(force: bool = False):
     return await anyio.to_thread.run_sync(get_spac_mergers, force)
 
 
+@app.get("/markets/movers")
+async def markets_movers(request: Request, limit: int = 20):
+    """Market movers — biggest % gainers / losers + unusual-volume names across our
+    broad liquid universe (filtered to real common stocks; no warrant/penny junk),
+    overlaid with the quant read + any active signal. Authenticated; 60s cached."""
+    _require_jwt(request)
+    import anyio
+    from engine.movers_service import compute_movers
+    return await anyio.to_thread.run_sync(compute_movers, max(5, min(limit, 30)))
+
+
 @app.get("/market/pulse")
 async def market_pulse(tickers: str = ""):
     """
