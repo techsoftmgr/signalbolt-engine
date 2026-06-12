@@ -3067,10 +3067,11 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled market-tape cache warmer every 60s")
 
-    # ── Movers warmer — precompute the Movers tab every ~120s into the shared
-    # cache so /markets/movers returns instantly. The build does ~30 parallel
-    # market-cap lookups + a 250-name bars call (~15-25s cold) — absorbing that
-    # OFF the request path is what keeps the app from timing out (6s budget).
+    # ── Movers warmer — precompute the Movers tab every ~10s into the shared
+    # cache so /markets/movers is near-live (the app polls every 10s too). A warm
+    # rebuild is only ~2s (market caps are 24h-cached; cost = one 250-name bars
+    # call); the heavy ~20s cold build only happens once/day per new symbol.
+    # Absorbing it OFF the request path is what keeps the app from timing out.
     # Only on trading days (movers are meaningless on weekends/holidays). ──
     def _run_warm_movers():
         try:
@@ -3084,13 +3085,15 @@ def start_scheduler() -> BackgroundScheduler:
 
     scheduler.add_job(
         _run_warm_movers,
-        trigger=IntervalTrigger(seconds=120),
+        trigger=IntervalTrigger(seconds=10),
         id="warm_movers",
-        name="Movers cache warmer (120s, trading days)",
+        name="Movers cache warmer (10s, trading days)",
         replace_existing=True,
-        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=25),
+        max_instances=1,        # never overlap if a build runs long (cold day-start)
+        coalesce=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=15),
     )
-    logger.info("[runner] Scheduled movers cache warmer every 120s")
+    logger.info("[runner] Scheduled movers cache warmer every 10s")
 
     # ── Overnight (Blue Ocean) display-only price poll ───────────────────────
     # During the ~8pm-4am ET overnight session, poll Alpaca's OVERNIGHT feed for
