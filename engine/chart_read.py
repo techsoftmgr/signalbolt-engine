@@ -754,38 +754,62 @@ def build_full(symbol: str, timeframe: str = "1Day", sb=None, force: bool = Fals
     endpoint applies plainspeak per-request (admin vs not). Best-effort; never raises."""
     sym = (symbol or "").upper().strip()
     ck = f"chartread:full:v1:{sym}:{timeframe}"
+
+    r = None
     if not force:
         try:
             from engine import cache
-            cached = cache.kv.get_json(ck)
-            if cached is not None:
-                return cached
+            r = cache.kv.get_json(ck)
         except Exception:
-            pass
+            r = None
 
-    r = analyze(sym, timeframe=timeframe)
-    if r and not r.get("unavailable"):
-        try:
-            from engine import decision_support
-            hist = decision_support.historical_similar_setups(sb, sym, r.get("taBias"))
-            r["decision_support"] = decision_support.derive(r, historical=hist)
-        except Exception as e:
-            logger.debug(f"[chart_read] decision_support derive failed for {sym}: {e}")
-        try:
-            from engine import read_accuracy
-            tr = read_accuracy.stats_cached(sb)
-            if tr and tr.get("available"):
-                r["readTrackRecord"] = tr
-        except Exception as e:
-            logger.debug(f"[chart_read] read track record failed for {sym}: {e}")
+    if r is None:
+        r = analyze(sym, timeframe=timeframe)
+        if r and not r.get("unavailable"):
+            try:
+                from engine import decision_support
+                hist = decision_support.historical_similar_setups(sb, sym, r.get("taBias"))
+                r["decision_support"] = decision_support.derive(r, historical=hist)
+            except Exception as e:
+                logger.debug(f"[chart_read] decision_support derive failed for {sym}: {e}")
+            try:
+                from engine import read_accuracy
+                tr = read_accuracy.stats_cached(sb)
+                if tr and tr.get("available"):
+                    r["readTrackRecord"] = tr
+            except Exception as e:
+                logger.debug(f"[chart_read] read track record failed for {sym}: {e}")
+        if r:
+            try:
+                from engine import cache
+                cache.kv.set_json(ck, r, _FULL_TTL)   # cache the SETTLED analysis (no live price baked in)
+            except Exception:
+                pass
 
-    if r:
-        try:
-            from engine import cache
-            cache.kv.set_json(ck, r, _FULL_TTL)
-        except Exception:
-            pass
+    # Overlay a FRESH live price on EVERY call (cache hit OR miss). The analysis is
+    # anchored to the last SETTLED close (a stable plan) — but the "Current" price
+    # shown to the user must be live, not the settled close (HOOD: settled 91 vs
+    # live 94+). Plan LEVELS stay settled; only the current-price readout is live.
+    _overlay_live_price(r, sym)
     return r
+
+
+def _overlay_live_price(r: Optional[dict], sym: str) -> None:
+    """Set r['livePrice'] (and decision_support.entry_quality.current) to the live
+    trade price. Mutates in place; never raises. Done post-cache so it's never stale."""
+    if not isinstance(r, dict) or r.get("unavailable"):
+        return
+    try:
+        from engine.alpaca_client import get_latest_price
+        lp = get_latest_price(sym)
+        if lp and float(lp) > 0:
+            lp = round(float(lp), 2)
+            r["livePrice"] = lp
+            ds = r.get("decision_support")
+            if isinstance(ds, dict) and isinstance(ds.get("entry_quality"), dict):
+                ds["entry_quality"]["current"] = lp
+    except Exception:
+        pass
 
 
 # ── Agreement track record — daily snapshot logger + forward-outcome scorer ──
