@@ -1,0 +1,123 @@
+"""
+Market-wide movers for the Movers tab — the biggest % gainers / losers and the
+most unusual-volume names across a broad LIQUID universe, filtered to real common
+stocks (no warrants / units / rights / penny pumps) and overlaid with our quant
+read + any active signal.
+
+Candidate pool = our 245-name liquid universe (prescreener.EXTENDED_UNIVERSE) +
+momentum universe + Alpaca's market-wide most-actives & screener feeds for breadth.
+Everything is re-priced from one batched daily-bars call so % change / volume /
+relative-volume are consistent and a liquidity floor can be applied. 60s cached.
+"""
+from __future__ import annotations
+
+import logging
+import os
+from datetime import datetime, timezone
+
+logger = logging.getLogger("signalbolt.movers")
+
+_CACHE_KEY      = "markets:movers:v1"
+_TTL            = 60
+_MIN_PRICE      = float(os.environ.get("MOVERS_MIN_PRICE", "5"))            # drop sub-$5 penny names
+_MIN_DOLLARVOL  = float(os.environ.get("MOVERS_MIN_DOLLARVOL", "20000000")) # $20M traded today = liquid
+_UNUSUAL_RELVOL = float(os.environ.get("MOVERS_UNUSUAL_RELVOL", "2.0"))     # 2× the 20-day avg = unusual
+
+
+def _is_common(s: str) -> bool:
+    """Real common-stock ticker heuristic: pure A-Z, ≤5 chars, and not a 5-letter
+    symbol ending in W/U/R/Q (warrant / unit / right / bankruptcy). Drops the
+    GRAF.WS / IVDAW / HSPTU junk the raw screener is full of."""
+    return bool(s) and s.isalpha() and s.isupper() and len(s) <= 5 and not (len(s) == 5 and s[-1] in "WURQ")
+
+
+def _candidate_symbols() -> list[str]:
+    """Our curated broad-LIQUID universe (~250 names incl. RIVN/ROKU/ARM/INTC).
+    Deliberately NOT Alpaca's raw market-wide screener: that feed is dominated by
+    microcap pump-and-dumps (UBXG +76% on 150× volume, etc.) that pass any price/
+    dollar-volume floor, and the only reliable discriminator — market cap — is too
+    slow to fetch inline for hundreds of names. The curated universe can't contain
+    pumps, so the movers list stays clean and the real movers surface."""
+    syms: set[str] = set()
+    try:
+        from engine import prescreener as ps, momentum_detector as md
+        syms |= set(ps.EXTENDED_UNIVERSE) | set(md.UNIVERSE)
+    except Exception as e:
+        logger.debug(f"[movers] universe load failed: {e}")
+    return [s for s in syms if _is_common(s)]
+
+
+def compute_movers(limit: int = 20) -> dict:
+    """{asOf, gainers[], losers[], unusualVolume[]} — each item: symbol, price,
+    changePct, volume, relVol, rsi?, setupType?, signal?. 60s cached."""
+    from engine import cache
+    cached = cache.kv.get_json(_CACHE_KEY)
+    if cached:
+        return cached
+
+    syms = _candidate_symbols()
+    empty = {"asOf": datetime.now(timezone.utc).isoformat(), "gainers": [], "losers": [], "unusualVolume": []}
+    if not syms:
+        return empty
+
+    from engine.alpaca_client import get_multi_bars
+    bars = get_multi_bars(syms, "1Day", 40) or {}
+    if not bars:
+        return empty
+
+    # Quant overlay (RSI / setup) from the cached scan — present only for tracked names.
+    quant: dict = {}
+    try:
+        for r in (cache.kv.get_json("quant:scored:v1") or []):
+            if r.get("ticker"):
+                quant[r["ticker"]] = r
+    except Exception:
+        pass
+
+    # Active-signal overlay (so a mover we already have a trade on is flagged).
+    sig: dict = {}
+    try:
+        from engine import runner
+        sb = runner._supabase()
+        present = list(bars.keys())
+        for i in range(0, len(present), 200):
+            rows = (sb.table("signals").select("ticker,direction")
+                    .eq("status", "active").in_("ticker", present[i:i + 200]).execute().data) or []
+            for r in rows:
+                sig[r["ticker"]] = r.get("direction")
+    except Exception as e:
+        logger.debug(f"[movers] active-signal overlay failed: {e}")
+
+    built: list[dict] = []
+    for s, df in bars.items():
+        try:
+            if df is None or len(df) < 2:
+                continue
+            price = float(df["close"].iloc[-1])
+            prev  = float(df["close"].iloc[-2])
+            vol   = float(df["volume"].iloc[-1])
+            if price < _MIN_PRICE or prev <= 0 or price * vol < _MIN_DOLLARVOL:
+                continue
+            chg = round((price - prev) / prev * 100, 2)
+            avg = float(df["volume"].iloc[-21:-1].mean()) if len(df) >= 21 else float(df["volume"].iloc[:-1].mean() or 0)
+            relvol = round(vol / avg, 2) if avg > 0 else None
+            q = quant.get(s) or {}
+            built.append({
+                "symbol": s, "price": round(price, 2), "changePct": chg, "volume": int(vol),
+                "relVol": relvol, "rsi": q.get("rsi"), "setupType": q.get("setupType"), "signal": sig.get(s),
+            })
+        except Exception:
+            continue
+
+    gainers = sorted([b for b in built if b["changePct"] > 0], key=lambda x: -x["changePct"])[:limit]
+    losers  = sorted([b for b in built if b["changePct"] < 0], key=lambda x:  x["changePct"])[:limit]
+    unusual = sorted([b for b in built if (b["relVol"] or 0) >= _UNUSUAL_RELVOL],
+                     key=lambda x: -(x["relVol"] or 0))[:limit]
+
+    out = {"asOf": datetime.now(timezone.utc).isoformat(),
+           "gainers": gainers, "losers": losers, "unusualVolume": unusual}
+    try:
+        cache.kv.set_json(_CACHE_KEY, out, _TTL)
+    except Exception:
+        pass
+    return out
