@@ -4763,31 +4763,14 @@ async def ticker_chart_read(request: Request, symbol: str, tf: str = "1Day"):
     timeframe = "1Hour" if str(tf).lower() in ("1h", "1hour", "60min") else "1Day"
     try:
         from engine import chart_read
-        r = chart_read.analyze(sym, timeframe=timeframe)
-        # ── ADDITIVE: attach an optional `decision_support` layer derived purely
-        # from the read above. Never mutates existing fields; fully fail-safe so a
-        # derivation issue can never break the existing Expert Read response. ──
-        if r and not r.get("unavailable"):
-            try:
-                from engine import decision_support
-                sb = None
-                try:
-                    sb = _make_supabase()
-                except Exception:
-                    sb = None
-                hist = decision_support.historical_similar_setups(sb, sym, r.get("taBias"))
-                r["decision_support"] = decision_support.derive(r, historical=hist)
-            except Exception as e:
-                logger.debug(f"decision_support derive failed for {sym}: {e}")
-            # ── ADDITIVE: app-wide read self-grade (descriptive accuracy, not a
-            # prediction). Cached 1h; renders in-app only when data has accrued. ──
-            try:
-                from engine import read_accuracy
-                tr = read_accuracy.stats_cached(sb)
-                if tr and tr.get("available"):
-                    r["readTrackRecord"] = tr
-            except Exception as e:
-                logger.debug(f"read track record failed for {sym}: {e}")
+        sb = None
+        try:
+            sb = _make_supabase()
+        except Exception:
+            sb = None
+        # Cached, pre-warmed assembly (analyze + decision_support + track-record) —
+        # the worker keeps the core tickers warm so the hub's 1H/1D toggle is instant.
+        r = chart_read.build_full(sym, timeframe=timeframe, sb=sb)
         result = r or {"ticker": sym, "unavailable": True}
         # Scrub technical wording → friendly for non-admin callers (admins get raw).
         if not _is_admin_request(request):

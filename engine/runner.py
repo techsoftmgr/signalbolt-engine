@@ -2876,6 +2876,40 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled quant dashboard precompute every 3 min")
 
+    # ── Expert Read prewarm (core tickers, every 4 min, trading days) ────────
+    # The hub's Expert Read (chart_read.build_full) does multiple Alpaca fetches +
+    # MTF + decision_support per (ticker, timeframe). Caching it (5-min TTL) makes
+    # repeat loads instant; this keeps the CORE tickers warm so the FIRST 1H/1D
+    # toggle is instant too. 4-min interval stays just under the 300s cache TTL.
+    def _run_chartread_prewarm():
+        try:
+            from engine.session_classifier import is_market_open_today
+            if not is_market_open_today():
+                return   # skip weekends/holidays — no fresh data to warm
+            from engine import chart_read, prescreener
+            sb = _supabase()
+            n = 0
+            for tk in list(prescreener.CORE_TICKERS)[:18]:
+                for tf in ("1Day", "1Hour"):
+                    try:
+                        chart_read.build_full(tk, timeframe=tf, sb=sb, force=True)
+                        n += 1
+                    except Exception:
+                        pass
+            logger.info(f"[runner] Expert Read prewarm done ({n} reads)")
+        except Exception as _e:
+            logger.error(f"[runner] Expert Read prewarm failed: {_e}")
+
+    scheduler.add_job(
+        _run_chartread_prewarm,
+        trigger=IntervalTrigger(minutes=4),
+        id="chartread_prewarm",
+        name="Expert Read prewarm (core tickers, 4-min)",
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=45),
+    )
+    logger.info("[runner] Scheduled Expert Read prewarm every 4 min")
+
     # ── Community insights precompute (every 5 min, 24/7) ───────────────────
     # Same fix as quant: the /community/* enrichment (bars + manipulation + news
     # for ~30 names) was computed on the request path → timeouts. Precompute on

@@ -743,6 +743,51 @@ def analyze(symbol: str, timeframe: str = "1Day") -> Optional[dict]:
     }
 
 
+_FULL_TTL = 300   # 5 min — the read is a settled/swing analysis; brief staleness is fine
+
+
+def build_full(symbol: str, timeframe: str = "1Day", sb=None, force: bool = False) -> Optional[dict]:
+    """The full Expert-Read payload the hub needs (analyze + decision_support +
+    read track-record), CACHED per (ticker, timeframe) so the hub doesn't recompute
+    the multi-fetch read on every 1H/1D toggle. The worker pre-warms this for the
+    core tickers so the first open is instant too. Does NOT scrub wording — the
+    endpoint applies plainspeak per-request (admin vs not). Best-effort; never raises."""
+    sym = (symbol or "").upper().strip()
+    ck = f"chartread:full:v1:{sym}:{timeframe}"
+    if not force:
+        try:
+            from engine import cache
+            cached = cache.kv.get_json(ck)
+            if cached is not None:
+                return cached
+        except Exception:
+            pass
+
+    r = analyze(sym, timeframe=timeframe)
+    if r and not r.get("unavailable"):
+        try:
+            from engine import decision_support
+            hist = decision_support.historical_similar_setups(sb, sym, r.get("taBias"))
+            r["decision_support"] = decision_support.derive(r, historical=hist)
+        except Exception as e:
+            logger.debug(f"[chart_read] decision_support derive failed for {sym}: {e}")
+        try:
+            from engine import read_accuracy
+            tr = read_accuracy.stats_cached(sb)
+            if tr and tr.get("available"):
+                r["readTrackRecord"] = tr
+        except Exception as e:
+            logger.debug(f"[chart_read] read track record failed for {sym}: {e}")
+
+    if r:
+        try:
+            from engine import cache
+            cache.kv.set_json(ck, r, _FULL_TTL)
+        except Exception:
+            pass
+    return r
+
+
 # ── Agreement track record — daily snapshot logger + forward-outcome scorer ──
 _HORIZON_DAYS = 5   # trading-ish days to judge who was right
 
