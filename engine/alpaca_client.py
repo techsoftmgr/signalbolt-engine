@@ -188,6 +188,9 @@ def get_bars(
             timeframe=tf,
             start=start,
             feed="sip",
+            adjustment="split",   # back-adjust price AND volume for splits — else a
+                                  # split shows as a phantom -90% gap (false breakdown)
+                                  # + split-inflated volume (e.g. KLAC 10:1, 2026-06-12)
         )
         bars = _client.get_stock_bars(req)
         df   = bars.df
@@ -371,6 +374,8 @@ def get_multi_bars(
             timeframe=tf,
             start=start,
             feed="sip",
+            adjustment="split",   # split-adjust price AND volume (see get_bars note) —
+                                  # keeps levels + relativeVolume continuous across splits
         )
         bars = _client.get_stock_bars(req)
         df   = bars.df
