@@ -1048,6 +1048,27 @@ async def markets_insiders(request: Request):
     return out or {"asOf": None, "items": [], "warming": True}
 
 
+@app.get("/insiders/summary")
+async def insiders_summary(request: Request, tickers: str = ""):
+    """Compact per-ticker open-market insider summaries for the watchlist (table-only)."""
+    _require_jwt(request)
+    import anyio
+    from engine import insider_service
+    tks = [t.strip().upper() for t in tickers.split(",") if t.strip()][:60]
+    items = await anyio.to_thread.run_sync(insider_service.summary_batch, _make_supabase(), tks)
+    return {"items": items}
+
+
+@app.get("/insiders/{ticker}")
+async def insiders_ticker(ticker: str, request: Request):
+    """Open-market insider summary for ONE ticker (table-first, live EDGAR fallback for
+    names outside the scanned universe). Powers search + the ticker hub."""
+    _require_jwt(request)
+    import anyio
+    from engine import insider_service
+    return await anyio.to_thread.run_sync(insider_service.summarize_ticker, _make_supabase(), ticker)
+
+
 @app.post("/admin/run-insider-refresh")
 async def admin_run_insider_refresh(request: Request, days: int = 90):
     """Manual trigger: fetch new Form 4s for the universe → upsert open-market txns →

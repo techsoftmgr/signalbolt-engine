@@ -85,6 +85,23 @@ def test_aggregate_cluster_buy():
     assert a["cluster_buy"] is True and a["distinct_buyers"] == 2
 
 
+def test_summary_batch_compact(monkeypatch):
+    from unittest.mock import MagicMock
+    rows = [
+        {"ticker": "HOOD", "owner": "Meyer", "code": "P", "shares": 1000, "price": 80, "value_usd": 80000, "txn_date": "2026-05-28"},
+        {"ticker": "HOOD", "owner": "X", "code": "S", "shares": 100, "price": 70, "value_usd": 7000, "txn_date": "2026-05-27", "scheduled": True},
+        {"ticker": "NVDA", "owner": "Stevens", "code": "S", "shares": 1000, "price": 200, "value_usd": 200000, "txn_date": "2026-05-26"},
+    ]
+    sb = MagicMock()
+    sb.table.return_value.select.return_value.in_.return_value.gte.return_value.execute.return_value.data = rows
+    out = ins.summary_batch(sb, ["HOOD", "NVDA"])
+    assert out["HOOD"]["buy_usd"] == 80000
+    assert out["HOOD"]["discretionary_sell_usd"] == 0          # the HOOD sell was 10b5-1
+    assert out["HOOD"]["net_discretionary_usd"] == 80000
+    assert out["NVDA"]["discretionary_sell_usd"] == 200000     # discretionary sell
+    assert out["NVDA"]["net_discretionary_usd"] == -200000
+
+
 def test_txn_uid_deterministic():
     t = {"accession": "0000950103-26-008745", "owner": "Malka Meyer", "txn_date": "2026-05-28",
          "code": "P", "shares": 1000, "price": 80.0}
