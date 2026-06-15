@@ -313,3 +313,71 @@ def peek() -> dict | None:
         return cache.kv.get_json(_CACHE_KEY)
     except Exception:
         return None
+
+
+def _since_iso(window_days: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=window_days)).date().isoformat()
+
+
+def summarize_ticker(sb, ticker: str, window_days: int = _WINDOW_DAYS) -> dict:
+    """Per-ticker open-market insider summary — table-first, with a live EDGAR fetch
+    fallback for tickers OUTSIDE the scanned universe (powers search + the ticker hub).
+    Cached per ticker."""
+    tk = (ticker or "").upper().strip()
+    if not tk:
+        return {"ticker": tk, **aggregate([], window_days)}
+    from engine import cache
+    ck = f"insiders:ticker:{tk}"
+    try:
+        c = cache.kv.get_json(ck)
+        if c:
+            return c
+    except Exception:
+        pass
+    rows: list = []
+    try:
+        rows = (sb.table("insider_transactions").select("*").eq("ticker", tk)
+                .gte("txn_date", _since_iso(window_days)).execute().data) or []
+    except Exception as e:
+        logger.debug(f"[insider] summarize table {tk} failed: {e}")
+    if not rows:                                  # not in the universe table → fetch on demand
+        try:
+            from engine.fundamentals import cik_map
+            cik = cik_map().get(tk)
+            if cik:
+                rows, _ = fetch_ticker(tk, cik, window_days)
+        except Exception as e:
+            logger.debug(f"[insider] summarize on-demand {tk} failed: {e}")
+    out = {"ticker": tk, **aggregate(rows, window_days)}
+    try:
+        cache.kv.set_json(ck, out, _TTL)
+    except Exception:
+        pass
+    return out
+
+
+def summary_batch(sb, tickers: list[str], window_days: int = _WINDOW_DAYS) -> dict:
+    """Compact per-ticker summaries for the watchlist (TABLE-ONLY → fast; one query).
+    Tickers with no stored open-market activity are simply absent."""
+    tks = [(t or "").upper().strip() for t in (tickers or []) if t]
+    if not tks:
+        return {}
+    try:
+        rows = (sb.table("insider_transactions").select("*").in_("ticker", tks[:200])
+                .gte("txn_date", _since_iso(window_days)).execute().data) or []
+    except Exception as e:
+        logger.debug(f"[insider] summary_batch failed: {e}")
+        return {}
+    by: dict = {}
+    for r in rows:
+        by.setdefault(r["ticker"], []).append(r)
+    out = {}
+    for tk, txns in by.items():
+        a = aggregate(txns, window_days)
+        out[tk] = {
+            "net_discretionary_usd": a["net_discretionary_usd"],
+            "buy_usd": a["buy_usd"], "discretionary_sell_usd": a["discretionary_sell_usd"],
+            "distinct_buyers": a["distinct_buyers"],
+            "cluster_buy": a["cluster_buy"], "cluster_sell": a["cluster_sell"],
+        }
+    return out
