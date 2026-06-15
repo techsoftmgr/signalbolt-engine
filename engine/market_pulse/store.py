@@ -50,6 +50,21 @@ def recent_ad_history(sb, n: int = 260) -> list[int]:
         return []
 
 
+def recent_breadth(sb, n: int = 30, before: Optional[str] = None) -> list[tuple]:
+    """Last `n` (advancers, decliners) pairs, oldest→newest (for breadth thrust).
+    `before` (date ISO) restricts to rows strictly before it (so a re-run doesn't
+    double-count today)."""
+    try:
+        q = sb.table(_TABLE).select("ad_advancers, ad_decliners").order("date", desc=True).limit(n)
+        if before:
+            q = q.lt("date", before)
+        rows = list(reversed(q.execute().data or []))
+        return [(r.get("ad_advancers"), r.get("ad_decliners")) for r in rows]
+    except Exception as e:
+        logger.debug(f"[market_pulse] recent_breadth failed: {e}")
+        return []
+
+
 def upsert_daily(sb, row: dict) -> bool:
     """Idempotent write keyed on `date` (re-runs overwrite the same day)."""
     try:
