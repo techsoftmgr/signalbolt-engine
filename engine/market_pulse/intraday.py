@@ -231,14 +231,36 @@ def _read_summary(indices: dict) -> str:
     return f"{'; '.join(parts)} ({conf} confidence){tail}"
 
 
+_CACHE_KEY = "market_pulse:intraday:v1"
+_CACHE_TTL = 60   # recompute once/min server-side, served to all viewers (NOT the daily table)
+
+
 def read_all(now_et=None) -> dict:
-    """{asOf, provisional, summary, indices:{SPY, QQQ}} — provisional, never persisted."""
+    """{asOf, provisional, summary, indices:{SPY, QQQ}} — provisional, never persisted
+    to the EOD table. The LIVE path (now_et=None) is cached 60s in the ephemeral kv
+    so it's computed once on the server and served to every viewer (tests pass now_et
+    to bypass the cache)."""
     from datetime import datetime as _dt, timezone as _tz
+    if now_et is None:
+        try:
+            from engine import cache
+            cached = cache.kv.get_json(_CACHE_KEY)
+            if cached:
+                return cached
+        except Exception:
+            pass
     idx = {sym: intraday_read(sym, now_et) for sym in ("SPY", "QQQ")}
-    return {
+    out = {
         "provisional": True,
         "asOf": _dt.now(_tz.utc).isoformat(),
         "summary": _read_summary(idx),
         "disclaimer": "Provisional intraday estimate — the official daily read is confirmed only after the close.",
         "indices": idx,
     }
+    if now_et is None:
+        try:
+            from engine import cache
+            cache.kv.set_json(_CACHE_KEY, out, _CACHE_TTL)
+        except Exception:
+            pass
+    return out
