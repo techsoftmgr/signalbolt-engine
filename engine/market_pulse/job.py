@@ -28,13 +28,17 @@ def _band_or_none(vix: Optional[dict]) -> tuple:
     return vix.get("close"), vix.get("sma10"), vix.get("band"), vix.get("rising")
 
 
-def _build_row(date_iso: str, dd_spy: int, dd_qqq: int, nh: int, nl: int,
-               pct50: float, pct200: float, adv: int, dec: int, cum: int,
+def _build_row(date_iso: str, dd_spy: int, dd_qqq: int, st_spy: int, st_qqq: int,
+               nh: int, nl: int, pct50: float, pct200: float, adv: int, dec: int, cum: int,
                div: bool, vix: Optional[dict], reg: str) -> dict:
     vc, vs, vb, vr = _band_or_none(vix)
+    eff_spy = dd_spy + C.STALL_WEIGHT * st_spy
+    eff_qqq = dd_qqq + C.STALL_WEIGHT * st_qqq
     return {
         "date": date_iso,
         "dd_count_spy": int(dd_spy), "dd_count_qqq": int(dd_qqq),
+        "stall_count_spy": int(st_spy), "stall_count_qqq": int(st_qqq),
+        "effective_dd_spy": round(float(eff_spy), 1), "effective_dd_qqq": round(float(eff_qqq), 1),
         "new_highs": int(nh), "new_lows": int(nl), "net_nhnl": int(nh - nl),
         "pct_above_50": float(pct50), "pct_above_200": float(pct200),
         "ad_line_cumulative": int(cum), "ad_advancers": int(adv), "ad_decliners": int(dec),
@@ -42,6 +46,15 @@ def _build_row(date_iso: str, dd_spy: int, dd_qqq: int, nh: int, nl: int,
         "vix_close": vc, "vix_sma10": vs, "vix_band": vb, "vix_rising": vr,
         "regime": reg, "guidance_key": reg,
     }
+
+
+def _effective_dd_max(dd_spy: int, dd_qqq: int, st_spy: int, st_qqq: int) -> int:
+    """Floored max effective distribution (distribution + STALL_WEIGHT*stalling)
+    across SPY/QQQ — what the regime thresholds (5/6) compare against. With zero
+    stalling days this equals dd_max, so Phase-1 behavior is unchanged."""
+    import math
+    eff = max(dd_spy + C.STALL_WEIGHT * st_spy, dd_qqq + C.STALL_WEIGHT * st_qqq)
+    return int(math.floor(eff))
 
 
 def run_daily(sb) -> dict:
@@ -89,6 +102,8 @@ def run_daily(sb) -> dict:
 
     dd_spy = pillars.distribution_days(spy)
     dd_qqq = pillars.distribution_days(qqq)
+    st_spy = pillars.stalling_days(spy)
+    st_qqq = pillars.stalling_days(qqq)
     nh, nl, _net = pillars.net_new_highs_lows(ubars)
     pct50, pct200 = pillars.pct_above_mas(ubars)
     adv, dec, adnet = pillars.advance_decline(ubars)
@@ -98,14 +113,15 @@ def run_daily(sb) -> dict:
 
     vix = pillars.vix_read(data.vix_closes())   # isolated; None on failure
 
+    eff_max = _effective_dd_max(dd_spy, dd_qqq, st_spy, st_qqq)
     reg = regime.resolve(
-        dd_max=max(dd_spy, dd_qqq), net_nhnl=nh - nl,
+        dd_max=eff_max, net_nhnl=nh - nl,
         pct_above_50=pct50, pct_above_200=pct200, ad_divergence=div,
         vix_level=(vix or {}).get("close"), vix_rising=(vix or {}).get("rising"),
     )
-    row = _build_row(date_iso, dd_spy, dd_qqq, nh, nl, pct50, pct200, adv, dec, cum, div, vix, reg)
+    row = _build_row(date_iso, dd_spy, dd_qqq, st_spy, st_qqq, nh, nl, pct50, pct200, adv, dec, cum, div, vix, reg)
     store.upsert_daily(sb, row)
-    logger.info(f"[market_pulse] {date_iso} regime={reg} dd_max={max(dd_spy, dd_qqq)} "
+    logger.info(f"[market_pulse] {date_iso} regime={reg} eff_dd={eff_max} (dd {dd_spy}/{dd_qqq} stall {st_spy}/{st_qqq}) "
                 f"nh/nl={nh}/{nl} %50={pct50} %200={pct200} vix={(vix or {}).get('close')}")
     return row
 
@@ -144,6 +160,8 @@ def run_backfill(sb, days: int = 120) -> dict:
 
         dd_spy = pillars.distribution_days(spy_d)
         dd_qqq = pillars.distribution_days(qqq_d)
+        st_spy = pillars.stalling_days(spy_d)
+        st_qqq = pillars.stalling_days(qqq_d)
         nh, nl, _ = pillars.net_new_highs_lows(ubars_d)
         pct50, pct200 = pillars.pct_above_mas(ubars_d)
         adv, dec, adnet = pillars.advance_decline(ubars_d)
@@ -158,11 +176,11 @@ def run_backfill(sb, days: int = 120) -> dict:
                 vix_d = None
 
         reg = regime.resolve(
-            dd_max=max(dd_spy, dd_qqq), net_nhnl=nh - nl,
+            dd_max=_effective_dd_max(dd_spy, dd_qqq, st_spy, st_qqq), net_nhnl=nh - nl,
             pct_above_50=pct50, pct_above_200=pct200, ad_divergence=False,  # divergence needs forward A/D history; off during seed
             vix_level=(vix_d or {}).get("close"), vix_rising=(vix_d or {}).get("rising"),
         )
-        row = _build_row(d.isoformat(), dd_spy, dd_qqq, nh, nl, pct50, pct200, adv, dec, cum, False, vix_d, reg)
+        row = _build_row(d.isoformat(), dd_spy, dd_qqq, st_spy, st_qqq, nh, nl, pct50, pct200, adv, dec, cum, False, vix_d, reg)
         if store.upsert_daily(sb, row):
             written += 1
     logger.info(f"[market_pulse] backfill wrote {written} days")

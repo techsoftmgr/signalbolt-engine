@@ -42,6 +42,30 @@ def test_distribution_day_5pct_rise_expiration():
     assert pillars.distribution_days(_df(closes2, vols)) == 1
 
 
+# ── Pillar 1b: stalling days ────────────────────────────────────────────────
+def test_stalling_day_vs_healthy_up_day():
+    # day1 = stalling: tiny gain (+0.1%), HIGHER volume, weak close (lower half)
+    df = _df([100.0, 100.10], vols=[1_000_000, 1_500_000], highs=[100.0, 101.5], lows=[100.0, 99.0])
+    assert pillars.stalling_days(df) == 1
+    # healthy up day: big gain (+1.5%) → NOT stalling
+    df2 = _df([100.0, 101.5], vols=[1_000_000, 1_500_000], highs=[100.0, 101.6], lows=[100.0, 100.0])
+    assert pillars.stalling_days(df2) == 0
+    # tiny gain but CLOSED STRONG (upper half of range) → NOT stalling
+    df3 = _df([100.0, 100.10], vols=[1_000_000, 1_500_000], highs=[100.2, 100.2], lows=[99.0, 99.0])
+    assert pillars.stalling_days(df3) == 0
+    # tiny gain, weak close, but LOWER volume → NOT stalling
+    df4 = _df([100.0, 100.10], vols=[1_000_000, 800_000], highs=[100.0, 101.5], lows=[100.0, 99.0])
+    assert pillars.stalling_days(df4) == 0
+
+
+def test_effective_dd_combination():
+    from engine.market_pulse import job as mp_job
+    assert mp_job._effective_dd_max(4, 0, 2, 0) == 5    # 4 + 0.5*2 = 5 → pressure
+    assert mp_job._effective_dd_max(5, 0, 2, 0) == 6    # 5 + 1 = 6 → correction level
+    assert mp_job._effective_dd_max(3, 0, 0, 0) == 3    # no stalling → unchanged (== dd_max)
+    assert mp_job._effective_dd_max(2, 4, 0, 2) == 5    # max across SPY/QQQ: 4 + 0.5*2
+
+
 # ── Pillar 2: new highs / lows ──────────────────────────────────────────────
 def test_net_new_highs_lows():
     n = C.HL_LOOKBACK + 5

@@ -3478,6 +3478,27 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled Market Pulse daily at 4:45 PM ET (Mon-Fri)")
 
+    # ── Sector Leaders — daily RS ranking of the 11 SPDR sectors, 4:50 PM ET
+    # (just after Market Pulse, both post-close). Standalone; trading-day gated. ──
+    def _run_sector_leaders():
+        try:
+            from engine.session_classifier import is_market_open_today
+            if not is_market_open_today():
+                return
+            from engine import sector_leaders
+            sector_leaders.run_daily(_supabase())
+        except Exception as _e:
+            logger.error(f"[runner] sector leaders daily failed: {_e}")
+
+    scheduler.add_job(
+        _run_sector_leaders,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=16, minute=50, timezone="America/New_York"),
+        id="sector_leaders_daily",
+        name="Sector Leaders daily (4:50 PM ET)",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled Sector Leaders daily at 4:50 PM ET (Mon-Fri)")
+
     # ── Weekly self-learning optimization (Sunday 2 AM UTC) ──────────────
     scheduler.add_job(
         _run_weight_optimization,
