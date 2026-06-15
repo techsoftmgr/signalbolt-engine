@@ -66,6 +66,20 @@ def test_effective_dd_combination():
     assert mp_job._effective_dd_max(2, 4, 0, 2) == 5    # max across SPY/QQQ: 4 + 0.5*2
 
 
+def test_breadth_thrust():
+    # Surge from deeply oversold (~0.20) to strong (~0.80) over ~10 sessions → fires.
+    weak = [(80, 420)] * 8          # ratio ~0.16 (oversold)
+    strong = [(440, 60)] * 8        # ratio ~0.88 (thrust up)
+    ratio, fired = pillars.breadth_thrust(weak + strong)
+    assert fired is True and ratio > C.BREADTH_THRUST_HIGH
+    # Flat ~0.5 breadth → no thrust.
+    flat = [(250, 250)] * 20
+    ratio2, fired2 = pillars.breadth_thrust(flat)
+    assert fired2 is False
+    # Too little data → (None, False).
+    assert pillars.breadth_thrust([(250, 250)] * 3) == (None, False)
+
+
 # ── Pillar 2: new highs / lows ──────────────────────────────────────────────
 def test_net_new_highs_lows():
     n = C.HL_LOOKBACK + 5

@@ -146,6 +146,30 @@ def advance_decline(bars: dict[str, pd.DataFrame]) -> tuple[int, int, int]:
     return adv, dec, adv - dec
 
 
+def breadth_thrust(adv_decl_pairs: list[tuple]) -> tuple:
+    """(ratio_10d, thrust_fired) from a chronological list of (advancers, decliners)
+    pairs INCLUDING today (oldest→newest). ratio_10d = 10-day EMA of
+    advancers/(adv+decl); thrust_fired = the EMA surged from <0.40 to >0.615 within
+    the last `WINDOW` sessions (Zweig breadth thrust). (None, False) if too little
+    data."""
+    pairs = [(float(a), float(d)) for a, d in (adv_decl_pairs or []) if (a is not None and d is not None)]
+    if len(pairs) < C.BREADTH_THRUST_EMA:
+        return None, False
+    daily = [a / (a + d) if (a + d) > 0 else 0.5 for a, d in pairs]
+    # EMA of the daily breadth ratio
+    k = 2.0 / (C.BREADTH_THRUST_EMA + 1)
+    ema_series = []
+    ema = daily[0]
+    for x in daily:
+        ema = x * k + ema * (1 - k)
+        ema_series.append(ema)
+    ratio_10d = round(ema_series[-1], 4)
+    # Fired if the EMA is now > HIGH and dipped < LOW somewhere in the trailing window.
+    win = ema_series[-(C.BREADTH_THRUST_WINDOW + 1):]
+    fired = bool(ratio_10d > C.BREADTH_THRUST_HIGH and min(win) < C.BREADTH_THRUST_LOW)
+    return ratio_10d, fired
+
+
 def ad_divergence(
     spy_df: Optional[pd.DataFrame],
     ad_cumulative_today: int,

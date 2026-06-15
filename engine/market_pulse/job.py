@@ -30,11 +30,13 @@ def _band_or_none(vix: Optional[dict]) -> tuple:
 
 def _build_row(date_iso: str, dd_spy: int, dd_qqq: int, st_spy: int, st_qqq: int,
                nh: int, nl: int, pct50: float, pct200: float, adv: int, dec: int, cum: int,
-               div: bool, vix: Optional[dict], reg: str) -> dict:
+               div: bool, vix: Optional[dict], reg: str,
+               breadth_ratio: Optional[float] = None, breadth_thrust: bool = False) -> dict:
     vc, vs, vb, vr = _band_or_none(vix)
     eff_spy = dd_spy + C.STALL_WEIGHT * st_spy
     eff_qqq = dd_qqq + C.STALL_WEIGHT * st_qqq
     return {
+        "breadth_ratio": breadth_ratio, "breadth_thrust": bool(breadth_thrust),
         "date": date_iso,
         "dd_count_spy": int(dd_spy), "dd_count_qqq": int(dd_qqq),
         "stall_count_spy": int(st_spy), "stall_count_qqq": int(st_qqq),
@@ -110,6 +112,7 @@ def run_daily(sb) -> dict:
 
     cum = store.cumulative_before(sb, date_iso) + adnet
     div = pillars.ad_divergence(spy, cum, store.recent_ad_history(sb))
+    br_ratio, br_thrust = pillars.breadth_thrust(store.recent_breadth(sb, 30, before=date_iso) + [(adv, dec)])
 
     vix = pillars.vix_read(data.vix_closes())   # isolated; None on failure
 
@@ -119,7 +122,8 @@ def run_daily(sb) -> dict:
         pct_above_50=pct50, pct_above_200=pct200, ad_divergence=div,
         vix_level=(vix or {}).get("close"), vix_rising=(vix or {}).get("rising"),
     )
-    row = _build_row(date_iso, dd_spy, dd_qqq, st_spy, st_qqq, nh, nl, pct50, pct200, adv, dec, cum, div, vix, reg)
+    row = _build_row(date_iso, dd_spy, dd_qqq, st_spy, st_qqq, nh, nl, pct50, pct200, adv, dec, cum, div, vix, reg,
+                     breadth_ratio=br_ratio, breadth_thrust=br_thrust)
     store.upsert_daily(sb, row)
     logger.info(f"[market_pulse] {date_iso} regime={reg} eff_dd={eff_max} (dd {dd_spy}/{dd_qqq} stall {st_spy}/{st_qqq}) "
                 f"nh/nl={nh}/{nl} %50={pct50} %200={pct200} vix={(vix or {}).get('close')}")
@@ -158,6 +162,7 @@ def run_backfill(sb, days: int = 120) -> dict:
     start_idx = max(C.HL_LOOKBACK, len(dates) - days)   # need a full 52w window behind each replayed day
     cum = 0
     written = 0
+    bt_pairs: list[tuple] = []   # rolling (adv, decl) for the breadth-thrust EMA
     for i in range(start_idx, len(dates)):
         d = dates[i]
         # Alpaca bar indexes are tz-aware (UTC); use a tz-aware exclusive cutoff at
@@ -176,6 +181,8 @@ def run_backfill(sb, days: int = 120) -> dict:
         pct50, pct200 = pillars.pct_above_mas(ubars_d)
         adv, dec, adnet = pillars.advance_decline(ubars_d)
         cum += adnet
+        bt_pairs.append((adv, dec))
+        br_ratio, br_thrust = pillars.breadth_thrust(bt_pairs[-30:])
 
         vix_d = None
         if vix_full is not None:
@@ -190,7 +197,8 @@ def run_backfill(sb, days: int = 120) -> dict:
             pct_above_50=pct50, pct_above_200=pct200, ad_divergence=False,  # divergence needs forward A/D history; off during seed
             vix_level=(vix_d or {}).get("close"), vix_rising=(vix_d or {}).get("rising"),
         )
-        row = _build_row(d.isoformat(), dd_spy, dd_qqq, st_spy, st_qqq, nh, nl, pct50, pct200, adv, dec, cum, False, vix_d, reg)
+        row = _build_row(d.isoformat(), dd_spy, dd_qqq, st_spy, st_qqq, nh, nl, pct50, pct200, adv, dec, cum, False, vix_d, reg,
+                         breadth_ratio=br_ratio, breadth_thrust=br_thrust)
         if store.upsert_daily(sb, row):
             written += 1
     logger.info(f"[market_pulse] backfill wrote {written} days")

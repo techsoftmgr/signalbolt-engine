@@ -27,6 +27,14 @@ SMA_SLOW          = 200
 AD_NEAR_HIGH_PCT  = 0.005    # SPY within 0.5% of its 52-week high
 AD_DIVERGENCE_LOOKBACK = HL_LOOKBACK   # A/D "new high" measured over the same window
 
+# ── Pillar 4b: breadth thrust (Zweig-style — a rare "launch" tell) ──────────
+# 10-day EMA of advancers/(advancers+decliners) surges from oversold (<0.40) to
+# >0.615 within 10 trading days — historically a powerful rally-launch signal.
+BREADTH_THRUST_EMA    = 10
+BREADTH_THRUST_LOW    = 0.40
+BREADTH_THRUST_HIGH   = 0.615
+BREADTH_THRUST_WINDOW = 10   # the low→high surge must happen within this many sessions
+
 # ── Pillar 5: VIX bands ────────────────────────────────────────────────────
 VIX_CALM_MAX      = 15.0     # < 15 = calm
 VIX_NORMAL_MAX    = 20.0     # 15-20 = normal
