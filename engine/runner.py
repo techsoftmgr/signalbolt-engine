@@ -3160,6 +3160,26 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled paper-trade propose (5m) + reconcile (3m) — dormant until paper keys set")
 
+    # ── Open-market insider activity (SEC Form 4) — fetch new filings for the universe,
+    # upsert open-market (P/S) transactions, rebuild the screen. Form 4s trickle in
+    # through the day (filed within ~2 business days), so every 6h is plenty. ──
+    def _run_insider_refresh():
+        try:
+            from engine import insider_service
+            sb = _supabase()
+            insider_service.refresh_universe(sb)
+            insider_service.build_screen(sb)
+        except Exception as _e:
+            logger.error(f"[runner] insider refresh failed: {_e}")
+
+    scheduler.add_job(
+        _run_insider_refresh, trigger=IntervalTrigger(hours=6), id="insider_refresh",
+        name="Open-market insider (Form 4) refresh (6h)", replace_existing=True,
+        max_instances=1, coalesce=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=90),
+    )
+    logger.info("[runner] Scheduled insider (Form 4) refresh every 6h")
+
     # ── Overnight (Blue Ocean) display-only price poll ───────────────────────
     # During the ~8pm-4am ET overnight session, poll Alpaca's OVERNIGHT feed for
     # the watched tickers and publish to price_store so the watchlist / quote
