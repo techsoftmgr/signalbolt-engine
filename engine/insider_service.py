@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
@@ -37,6 +38,8 @@ _WINDOW_DAYS = int(os.environ.get("INSIDER_WINDOW_DAYS", "30"))   # rolling last
 _CLUSTER_MIN_BUYERS = int(os.environ.get("INSIDER_CLUSTER_MIN_BUYERS", "2"))
 _NOTABLE_BUY_USD = float(os.environ.get("INSIDER_NOTABLE_BUY_USD", "250000"))      # single open-market buy alert floor
 _NOTABLE_SELL_USD = float(os.environ.get("INSIDER_NOTABLE_SELL_USD", "1000000"))   # discretionary-sell alert floor (sells noisier → higher bar)
+_FEED_COUNT = int(os.environ.get("INSIDER_FEED_COUNT", "100"))                      # getcurrent atom page size
+_FEED_MAX_PAGES = int(os.environ.get("INSIDER_FEED_MAX_PAGES", "3"))               # max pages per feed poll (3×100 = 150 filings of headroom)
 
 
 def _ua() -> dict:
@@ -233,6 +236,29 @@ def _txn_uid(t: dict) -> str:
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]
 
 
+def _persist_txn(sb, t: dict, stats: dict) -> None:
+    """Upsert one parsed open-market transaction (idempotent on txn_uid) and record it as
+    a NOTABLE buy/sell if it clears the alert bar. Shared by the per-CIK sweep and the
+    fast-lane feed poller so both store + flag for alerting identically."""
+    row = {
+        "txn_uid": _txn_uid(t), "ticker": t["ticker"], "owner": t["owner"], "role": t["role"],
+        "txn_date": t.get("txn_date"), "code": t["code"], "side": t["side"],
+        "shares": t["shares"], "price": t["price"], "value_usd": t["value_usd"],
+        "scheduled": bool(t.get("scheduled")), "comp_related": bool(t.get("comp_related")),
+        "accession": t.get("accession"), "filing_date": t.get("filing_date"),
+    }
+    try:
+        sb.table("insider_transactions").upsert(row, on_conflict="txn_uid").execute()
+        stats["new_transactions"] += 1
+        if t["code"] == "P" and t["value_usd"] >= _NOTABLE_BUY_USD:
+            stats["notable_buys"].append(t)
+        elif (t["code"] == "S" and not t.get("scheduled") and not t.get("comp_related")
+              and t["value_usd"] >= _NOTABLE_SELL_USD):
+            stats["notable_sells"].append(t)
+    except Exception as e:
+        logger.debug(f"[insider] upsert {t.get('ticker')} failed: {e}")
+
+
 def refresh_universe(sb, window_days: int = _WINDOW_DAYS) -> dict:
     """Fetch new Form 4s for the universe, upsert open-market transactions, and return
     the freshly-seen NOTABLE buys (cluster or ≥ $threshold) for alerting. Incremental:
@@ -260,23 +286,7 @@ def refresh_universe(sb, window_days: int = _WINDOW_DAYS) -> dict:
             logger.debug(f"[insider] fetch {ticker} failed: {e}")
             continue
         for t in new_txns:
-            row = {
-                "txn_uid": _txn_uid(t), "ticker": t["ticker"], "owner": t["owner"], "role": t["role"],
-                "txn_date": t.get("txn_date"), "code": t["code"], "side": t["side"],
-                "shares": t["shares"], "price": t["price"], "value_usd": t["value_usd"],
-                "scheduled": bool(t.get("scheduled")), "comp_related": bool(t.get("comp_related")),
-                "accession": t.get("accession"), "filing_date": t.get("filing_date"),
-            }
-            try:
-                sb.table("insider_transactions").upsert(row, on_conflict="txn_uid").execute()
-                stats["new_transactions"] += 1
-                if t["code"] == "P" and t["value_usd"] >= _NOTABLE_BUY_USD:
-                    stats["notable_buys"].append(t)
-                elif (t["code"] == "S" and not t.get("scheduled") and not t.get("comp_related")
-                      and t["value_usd"] >= _NOTABLE_SELL_USD):
-                    stats["notable_sells"].append(t)
-            except Exception as e:
-                logger.debug(f"[insider] upsert {ticker} failed: {e}")
+            _persist_txn(sb, t, stats)
     # Keep only the last `window_days` — prune everything older (no historical kept).
     try:
         deleted = sb.table("insider_transactions").delete().lt("txn_date", _since_iso(window_days)).execute()
@@ -285,6 +295,96 @@ def refresh_universe(sb, window_days: int = _WINDOW_DAYS) -> dict:
         logger.debug(f"[insider] prune failed: {e}")
     logger.info(f"[insider] refresh: scanned={stats['scanned']} new_txns={stats['new_transactions']} "
                 f"notable_buys={len(stats['notable_buys'])} pruned={stats.get('pruned', 0)}")
+    return stats
+
+
+# ── Fast lane: EDGAR "latest filings" feed → near-real-time detection ────────
+_FEED_NS = {"a": "http://www.w3.org/2005/Atom"}
+
+
+def _issuer_ciks_from_feed(xml_bytes: bytes) -> tuple:
+    """Pure: one getcurrent Atom page → (set of ISSUER CIKs int-form, entry_count). EDGAR
+    emits TWO entries per Form 4 — one '(Reporting)' (the insider) and one '(Issuer)'. We
+    keep only the '(Issuer)' entries; the issuer CIK lives in that entry's link path
+    (/Archives/edgar/data/<issuerCik>/...), which is what we key the universe on."""
+    out: set = set()
+    try:
+        root = ET.fromstring(xml_bytes)
+    except Exception:
+        return out, 0
+    entries = root.findall(".//a:entry", _FEED_NS)
+    for e in entries:
+        title = e.findtext("a:title", default="", namespaces=_FEED_NS) or ""
+        if "(Issuer)" not in title:              # skip the paired (Reporting) entry
+            continue
+        link = e.find("a:link", _FEED_NS)
+        href = link.get("href", "") if link is not None else ""
+        m = re.search(r"/data/(\d+)/", href)
+        if m:
+            out.add(str(int(m.group(1))))        # normalize (drop zero-padding)
+    return out, len(entries)
+
+
+def _current_form4_issuer_ciks() -> set:
+    """Poll EDGAR's 'getcurrent' latest-filings Atom feed for Form 4s and return the set of
+    ISSUER CIKs (int-form strings) that just filed. ONE feed request per page covers the
+    whole market — we never iterate per-company here. Capped at `_FEED_MAX_PAGES`."""
+    ciks: set = set()
+    for page in range(_FEED_MAX_PAGES):
+        url = ("https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4"
+               f"&company=&dateb=&owner=include&count={_FEED_COUNT}&start={page * _FEED_COUNT}"
+               "&output=atom")
+        try:
+            r = requests.get(url, headers=_ua(), timeout=20)
+            if not r.ok:
+                break
+        except Exception as e:
+            logger.debug(f"[insider] getcurrent page {page} failed: {e}")
+            break
+        page_ciks, n = _issuer_ciks_from_feed(r.content)
+        if n == 0:
+            break                                # past the end of the feed
+        ciks |= page_ciks
+    return ciks
+
+
+def refresh_from_feed(sb, window_days: int = _WINDOW_DAYS) -> dict:
+    """FAST LANE (near-real-time). Poll EDGAR's latest-filings feed; for any universe issuer
+    that just filed a Form 4, fetch + parse ONLY that issuer (reusing fetch_ticker). Cheap
+    (one feed request + only matched-issuer fetches) so it can run every few minutes. The
+    per-CIK `refresh_universe` remains as a less-frequent completeness backstop."""
+    stats = {"feed_ciks": 0, "matched": 0, "new_transactions": 0, "notable_buys": [], "notable_sells": []}
+    feed_ciks = _current_form4_issuer_ciks()
+    stats["feed_ciks"] = len(feed_ciks)
+    if not feed_ciks:
+        return stats
+    matched = [(t, c) for (t, c) in _universe_ciks() if str(int(c)) in feed_ciks]
+    stats["matched"] = len(matched)
+    if not matched:
+        return stats
+    # accessions already stored for the matched tickers → skip re-parse (and re-alert)
+    seen_by_ticker: dict = {}
+    try:
+        since_iso = (datetime.now(timezone.utc) - timedelta(days=window_days)).date().isoformat()
+        rows = (sb.table("insider_transactions").select("ticker,accession")
+                .in_("ticker", [t for (t, _) in matched]).gte("txn_date", since_iso)
+                .execute().data) or []
+        for r in rows:
+            seen_by_ticker.setdefault(r["ticker"], set()).add(r["accession"])
+    except Exception as e:
+        logger.debug(f"[insider] feed seen-load failed: {e}")
+    for ticker, cik in matched:
+        try:
+            new_txns, _ = fetch_ticker(ticker, cik, window_days, seen=seen_by_ticker.get(ticker))
+        except Exception as e:
+            logger.debug(f"[insider] feed fetch {ticker} failed: {e}")
+            continue
+        for t in new_txns:
+            _persist_txn(sb, t, stats)
+    if stats["new_transactions"]:
+        build_screen(sb, window_days)            # refresh cached screen so the UI reflects it now
+    logger.info(f"[insider] feed refresh: feed_ciks={stats['feed_ciks']} matched={stats['matched']} "
+                f"new_txns={stats['new_transactions']} notable_buys={len(stats['notable_buys'])}")
     return stats
 
 

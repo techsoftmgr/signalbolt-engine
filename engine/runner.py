@@ -3160,31 +3160,54 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled paper-trade propose (5m) + reconcile (3m) — dormant until paper keys set")
 
-    # ── Open-market insider activity (SEC Form 4) — fetch new filings for the universe,
-    # upsert open-market (P/S) transactions, rebuild the screen. Form 4s trickle in
-    # through the day (filed within ~2 business days), so every 6h is plenty. ──
+    # ── Open-market insider activity (SEC Form 4) — two-tier ─────────────────
+    # FAST LANE: poll EDGAR's "latest filings" feed every 5 min; for any universe issuer
+    # that just filed, fetch+parse only that issuer → near-real-time alerts (Form 4s cluster
+    # heavily right after the 4 PM ET close). BACKSTOP: a full per-CIK universe sweep 3×/day
+    # catches anything the feed paged past during the post-close cluster or missed across a
+    # restart. Form 4s must be filed within ~2 business days of the trade. ──
+    def _dispatch_insider_alerts(push, stats):
+        """Push the strongest NEW open-market buys/sells (capped). Dedup is implicit — a
+        refresh only processes filings not already stored, so each fires at most once."""
+        for t in sorted(stats.get("notable_buys", []), key=lambda x: -x["value_usd"])[:5]:
+            push.send_insider_alert(t["ticker"], "BUY", t["value_usd"], t.get("owner", ""), t.get("role", ""))
+        for t in sorted(stats.get("notable_sells", []), key=lambda x: -x["value_usd"])[:3]:
+            push.send_insider_alert(t["ticker"], "SELL", t["value_usd"], t.get("owner", ""), t.get("role", ""))
+
+    def _run_insider_feed():
+        try:
+            from engine import insider_service, push
+            stats = insider_service.refresh_from_feed(_supabase())
+            if stats.get("new_transactions"):
+                _dispatch_insider_alerts(push, stats)
+        except Exception as _e:
+            logger.error(f"[runner] insider feed poll failed: {_e}")
+
     def _run_insider_refresh():
         try:
             from engine import insider_service, push
             sb = _supabase()
             stats = insider_service.refresh_universe(sb)
             insider_service.build_screen(sb)
-            # Push the strongest NEW open-market buys/sells (capped). Dedup is implicit —
-            # refresh only processes filings not already stored, so each fires once.
-            for t in sorted(stats.get("notable_buys", []), key=lambda x: -x["value_usd"])[:5]:
-                push.send_insider_alert(t["ticker"], "BUY", t["value_usd"], t.get("owner", ""), t.get("role", ""))
-            for t in sorted(stats.get("notable_sells", []), key=lambda x: -x["value_usd"])[:3]:
-                push.send_insider_alert(t["ticker"], "SELL", t["value_usd"], t.get("owner", ""), t.get("role", ""))
+            _dispatch_insider_alerts(push, stats)
         except Exception as _e:
             logger.error(f"[runner] insider refresh failed: {_e}")
 
+    from apscheduler.triggers.cron import CronTrigger
     scheduler.add_job(
-        _run_insider_refresh, trigger=IntervalTrigger(hours=6), id="insider_refresh",
-        name="Open-market insider (Form 4) refresh (6h)", replace_existing=True,
+        _run_insider_feed, trigger=IntervalTrigger(minutes=5), id="insider_feed",
+        name="Insider (Form 4) feed poll (5m, near-real-time)", replace_existing=True,
         max_instances=1, coalesce=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=120),
+    )
+    scheduler.add_job(
+        _run_insider_refresh,
+        trigger=CronTrigger(hour="8,13,20", minute=15, timezone="America/New_York"),
+        id="insider_refresh", name="Insider (Form 4) full sweep (3×/day backstop)",
+        replace_existing=True, max_instances=1, coalesce=True,
         next_run_time=datetime.now(timezone.utc) + timedelta(seconds=90),
     )
-    logger.info("[runner] Scheduled insider (Form 4) refresh every 6h")
+    logger.info("[runner] Scheduled insider Form-4: feed poll 5m + full sweep 3×/day (8:15/13:15/20:15 ET)")
 
     # ── Overnight (Blue Ocean) display-only price poll ───────────────────────
     # During the ~8pm-4am ET overnight session, poll Alpaca's OVERNIGHT feed for

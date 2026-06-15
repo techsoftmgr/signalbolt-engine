@@ -106,3 +106,42 @@ def test_txn_uid_deterministic():
     t = {"accession": "0000950103-26-008745", "owner": "Malka Meyer", "txn_date": "2026-05-28",
          "code": "P", "shares": 1000, "price": 80.0}
     assert ins._txn_uid(t) == ins._txn_uid(dict(t)) and len(ins._txn_uid(t)) == 20
+
+
+# ── Fast-lane: getcurrent feed parsing ──────────────────────────────────────
+_FEED_SAMPLE = b"""<?xml version="1.0" encoding="ISO-8859-1" ?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+<title>Latest Filings</title>
+<entry>
+<title>4 - Angelo Michael F (0001404851) (Reporting)</title>
+<link rel="alternate" type="text/html" href="https://www.sec.gov/Archives/edgar/data/1404851/000140485126000002/0001404851-26-000002-index.htm"/>
+<category scheme="https://www.sec.gov/" label="form type" term="4"/>
+</entry>
+<entry>
+<title>4 - VirnetX Holding Corp (0001082324) (Issuer)</title>
+<link rel="alternate" type="text/html" href="https://www.sec.gov/Archives/edgar/data/1082324/000140485126000002/0001404851-26-000002-index.htm"/>
+<category scheme="https://www.sec.gov/" label="form type" term="4"/>
+</entry>
+<entry>
+<title>4 - Doe Jane (0009999999) (Reporting)</title>
+<link rel="alternate" type="text/html" href="https://www.sec.gov/Archives/edgar/data/9999999/000999999926000001/0009999999-26-000001-index.htm"/>
+<category scheme="https://www.sec.gov/" label="form type" term="4"/>
+</entry>
+<entry>
+<title>4 - Microsoft Corp (0000789019) (Issuer)</title>
+<link rel="alternate" type="text/html" href="https://www.sec.gov/Archives/edgar/data/789019/000999999926000001/0009999999-26-000001-index.htm"/>
+<category scheme="https://www.sec.gov/" label="form type" term="4"/>
+</entry>
+</feed>"""
+
+
+def test_feed_extracts_issuer_ciks_only():
+    ciks, n = ins._issuer_ciks_from_feed(_FEED_SAMPLE)
+    assert n == 4                                  # all entries counted (for pagination)
+    # only the (Issuer) entries' CIKs, normalized to int-form (no zero-padding):
+    assert ciks == {"1082324", "789019"}
+    assert "1404851" not in ciks and "9999999" not in ciks   # the (Reporting) insiders excluded
+
+
+def test_feed_handles_garbage():
+    assert ins._issuer_ciks_from_feed(b"not xml") == (set(), 0)
