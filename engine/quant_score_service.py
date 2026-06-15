@@ -35,6 +35,11 @@ _CACHE_TTL: int    = int(os.environ.get("QUANT_CACHE_TTL", "60"))
 _REDIS_KEY         = "quant:dashboard:v1"   # cross-process precomputed result (worker → web)
 _SCORED_KEY        = "quant:scored:v1"      # FULL scored universe (for universe-wide alerts)
 _SCORED_TS_KEY     = "quant:scored:v1:asOf" # ISO timestamp of the last universe scan (hub "updated" label)
+# The full scan refreshes every ~3 min when healthy. Keep the LAST good scan for
+# hours so the watchlist's vol/RSI never blanks if a refresh stalls (e.g. a slow
+# data source after hours) — slightly-stale chips beat empty ones. Healthy refreshes
+# overwrite it well within this window.
+_SCORED_TTL: int   = int(os.environ.get("QUANT_SCORED_TTL", "28800"))   # 8h
 
 # ~1y daily bars barely change intraday — cache them so we don't refetch
 # ~150×250 bars on every dashboard build.
@@ -558,10 +563,10 @@ def _build_dashboard(tickers: list[str]) -> dict:
         # instead of re-fetching ~90 names every 15 min.
         try:
             from datetime import datetime as _dt, timezone as _tz
-            cache.kv.set_json(_SCORED_KEY, scored, _CACHE_TTL * 10)
+            cache.kv.set_json(_SCORED_KEY, scored, _SCORED_TTL)
             # Stamp when this scan ran so the hub + watchlist can show "updated HH:MM"
             # and prove they're reading the same snapshot.
-            cache.kv.set_json(_SCORED_TS_KEY, _dt.now(_tz.utc).isoformat(), _CACHE_TTL * 10)
+            cache.kv.set_json(_SCORED_TS_KEY, _dt.now(_tz.utc).isoformat(), _SCORED_TTL)
         except Exception:
             pass
 
