@@ -33,7 +33,7 @@ _CACHE_KEY = "markets:insiders:v1"
 _TTL = 6 * 3600
 _inflight = threading.Lock()
 
-_WINDOW_DAYS = int(os.environ.get("INSIDER_WINDOW_DAYS", "10"))   # keep only the last 10 days — recent/actionable only
+_WINDOW_DAYS = int(os.environ.get("INSIDER_WINDOW_DAYS", "30"))   # rolling last ~30 days (1 month); older auto-pruned
 _CLUSTER_MIN_BUYERS = int(os.environ.get("INSIDER_CLUSTER_MIN_BUYERS", "2"))
 _NOTABLE_BUY_USD = float(os.environ.get("INSIDER_NOTABLE_BUY_USD", "250000"))   # single-buy alert floor
 
