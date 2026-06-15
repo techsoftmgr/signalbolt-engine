@@ -302,6 +302,10 @@ def build_screen(sb, window_days: int = _WINDOW_DAYS, limit: int = 60) -> dict:
     items = []
     for tk, txns in by_ticker.items():
         agg = aggregate(txns, window_days)
+        # Skip names whose only activity is scheduled 10b5-1 / comp selling (no buys,
+        # no discretionary sells) — pure noise, would just show as $0 net.
+        if agg["buy_usd"] <= 0 and agg["discretionary_sell_usd"] <= 0:
+            continue
         items.append({"ticker": tk, **agg})
     items.sort(key=lambda x: -x["net_discretionary_usd"])
     out = {"asOf": datetime.now(timezone.utc).isoformat(),
