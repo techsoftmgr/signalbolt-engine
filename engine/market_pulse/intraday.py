@@ -148,19 +148,21 @@ def _volume_profile(symbol: str, half: bool) -> list:
 
 def intraday_read(symbol: str, now_et=None) -> dict:
     """Provisional per-index read. now_et injectable for tests. Never writes anything."""
-    from datetime import datetime as _dt
+    from datetime import datetime as _dt, timezone as _tz
     if now_et is None:
         try:
             from zoneinfo import ZoneInfo
             now_et = _dt.now(ZoneInfo("America/New_York"))
-        except Exception:
-            now_et = _dt.utcnow()
+        except Exception as _e:
+            logger.warning(f"[intraday] ZoneInfo(America/New_York) failed ({_e}) — falling back to tz-aware UTC")
+            now_et = _dt.now(_tz.utc)   # tz-aware so session comparisons never raise on naive-vs-aware
 
     base = {"symbol": symbol, "provisional": True, "confidence": None,
             "projected_full_volume": None, "prior_day_volume": None, "curve_fraction_used": None}
 
     sess = _session_et(now_et)
     if sess is None or now_et < sess[0] or now_et > sess[1]:
+        logger.warning(f"[intraday] {symbol} MARKET_CLOSED bail — now_et={now_et} sess={sess}")
         return {**base, "status": "MARKET_CLOSED", "label": _label("MARKET_CLOSED", "")}
 
     open_et, close_et = sess
@@ -175,10 +177,14 @@ def intraday_read(symbol: str, now_et=None) -> dict:
         intr = get_bars(symbol, "30Min", days=2)
         daily = get_bars(symbol, "1Day", 6)
         if intr is None or intr.empty or daily is None or len(daily) < 2:
+            logger.warning(f"[intraday] {symbol} bars unavailable — intr={None if intr is None else len(intr)} "
+                           f"daily={None if daily is None else len(daily)} (open session; check feed/entitlement)")
             return {**base, "status": "MARKET_CLOSED", "label": _label("MARKET_CLOSED", "")}
         et = intr.index.tz_convert("America/New_York")
         today = intr[[t.date() == now_et.date() and (t.hour * 60 + t.minute) >= 9 * 60 + 30 for t in et]]
         if today.empty:
+            logger.warning(f"[intraday] {symbol} no today bars — last 30Min bar={intr.index[-1]} "
+                           f"now_date={now_et.date()} total_bars={len(intr)}")
             return {**base, "status": "MARKET_CLOSED", "label": _label("MARKET_CLOSED", "")}
         vol_so_far = float(today["volume"].sum())
         price = float(today["close"].iloc[-1])
@@ -203,7 +209,7 @@ def intraday_read(symbol: str, now_et=None) -> dict:
             "label": _label(status, conf),
         }
     except Exception as e:
-        logger.debug(f"[intraday] read {symbol} failed: {e}")
+        logger.warning(f"[intraday] {symbol} read failed: {type(e).__name__}: {e}")
         return {**base, "status": "NEUTRAL", "confidence": conf, "label": _label("NEUTRAL", conf)}
 
 
