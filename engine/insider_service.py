@@ -33,7 +33,7 @@ _CACHE_KEY = "markets:insiders:v1"
 _TTL = 6 * 3600
 _inflight = threading.Lock()
 
-_WINDOW_DAYS = int(os.environ.get("INSIDER_WINDOW_DAYS", "10"))   # keep only the last 10 days — recent/actionable only
+_WINDOW_DAYS = int(os.environ.get("INSIDER_WINDOW_DAYS", "30"))   # rolling last ~30 days (1 month); older auto-pruned
 _CLUSTER_MIN_BUYERS = int(os.environ.get("INSIDER_CLUSTER_MIN_BUYERS", "2"))
 _NOTABLE_BUY_USD = float(os.environ.get("INSIDER_NOTABLE_BUY_USD", "250000"))   # single-buy alert floor
 
@@ -302,6 +302,10 @@ def build_screen(sb, window_days: int = _WINDOW_DAYS, limit: int = 60) -> dict:
     items = []
     for tk, txns in by_ticker.items():
         agg = aggregate(txns, window_days)
+        # Skip names whose only activity is scheduled 10b5-1 / comp selling (no buys,
+        # no discretionary sells) — pure noise, would just show as $0 net.
+        if agg["buy_usd"] <= 0 and agg["discretionary_sell_usd"] <= 0:
+            continue
         items.append({"ticker": tk, **agg})
     items.sort(key=lambda x: -x["net_discretionary_usd"])
     out = {"asOf": datetime.now(timezone.utc).isoformat(),
