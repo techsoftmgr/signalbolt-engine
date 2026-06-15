@@ -1017,6 +1017,61 @@ async def markets_movers(request: Request, limit: int = 20):
     return {"asOf": None, "gainers": [], "losers": [], "unusualVolume": [], "warming": True}
 
 
+@app.get("/market-pulse/today")
+async def market_pulse_today():
+    """Market Pulse — today's market-wide regime verdict + full guidance text +
+    VIX fear-gauge line + disclaimer. Public/free; one row/day. (Distinct from the
+    sector-ETF /market/pulse.)"""
+    import anyio
+    from engine.market_pulse import guidance, store
+    sb = _make_supabase()
+    row = await anyio.to_thread.run_sync(store.get_today, sb)
+    if not row:
+        return {"available": False, "disclaimer": guidance.DISCLAIMER,
+                "note": "Market Pulse has not been computed yet — first run is after today's close."}
+    g = guidance.build(row.get("regime"), row.get("vix_band"), row.get("vix_rising"))
+    return {"available": True, **row, "guidance": g}
+
+
+@app.get("/market-pulse/history")
+async def market_pulse_history(days: int = 90):
+    """Market Pulse history — arrays for charting the breadth/distribution/VIX trend."""
+    import anyio
+    from engine.market_pulse import store
+    sb = _make_supabase()
+    rows = await anyio.to_thread.run_sync(store.get_history, sb, max(1, min(days, 400)))
+    return {
+        "available": bool(rows),
+        "dates":              [r.get("date") for r in rows],
+        "net_nhnl":           [r.get("net_nhnl") for r in rows],
+        "new_highs":          [r.get("new_highs") for r in rows],
+        "new_lows":           [r.get("new_lows") for r in rows],
+        "pct_above_50":       [r.get("pct_above_50") for r in rows],
+        "pct_above_200":      [r.get("pct_above_200") for r in rows],
+        "ad_line_cumulative": [r.get("ad_line_cumulative") for r in rows],
+        "dd_count_spy":       [r.get("dd_count_spy") for r in rows],
+        "dd_count_qqq":       [r.get("dd_count_qqq") for r in rows],
+        "vix_close":          [r.get("vix_close") for r in rows],
+        "regime":             [r.get("regime") for r in rows],
+    }
+
+
+@app.post("/admin/run-market-pulse")
+async def admin_run_market_pulse(request: Request, backfill_days: int = 0):
+    """Compute today's Market Pulse now, OR backfill N prior trading days (seeds the
+    cumulative A/D line + history). Admin only — used for the first run / on demand
+    since the scheduled job only fires at 4:45 PM ET."""
+    _require_admin_jwt(request)
+    import anyio
+    from engine import market_pulse
+    sb = _make_supabase()
+    if backfill_days and int(backfill_days) > 0:
+        res = await anyio.to_thread.run_sync(market_pulse.run_backfill, sb, min(int(backfill_days), 250))
+        return {"backfill": res}
+    row = await anyio.to_thread.run_sync(market_pulse.run_daily, sb)
+    return {"ran": True, "row": row}
+
+
 @app.get("/market/pulse")
 async def market_pulse(tickers: str = ""):
     """

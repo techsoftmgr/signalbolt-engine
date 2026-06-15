@@ -3456,6 +3456,28 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled daily analytics report (5:30 PM ET, Mon-Fri)")
 
+    # ── Market Pulse — daily market-wide regime read, ~45 min after the close
+    # (4:45 PM ET) so consolidated volume is final. Trading-day gated. Standalone;
+    # does not touch the signal engine. DST-aware via the ET timezone. ──
+    def _run_market_pulse():
+        try:
+            from engine.session_classifier import is_market_open_today
+            if not is_market_open_today():
+                return
+            from engine import market_pulse
+            market_pulse.run_daily(_supabase())
+        except Exception as _e:
+            logger.error(f"[runner] market pulse daily failed: {_e}")
+
+    scheduler.add_job(
+        _run_market_pulse,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=16, minute=45, timezone="America/New_York"),
+        id="market_pulse_daily",
+        name="Market Pulse daily (4:45 PM ET)",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled Market Pulse daily at 4:45 PM ET (Mon-Fri)")
+
     # ── Weekly self-learning optimization (Sunday 2 AM UTC) ──────────────
     scheduler.add_job(
         _run_weight_optimization,
