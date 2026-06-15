@@ -1033,6 +1033,69 @@ async def markets_churn(request: Request, limit: int = 25):
     return {"asOf": None, "items": [], "warming": True}
 
 
+# ── Paper trading (admin-only) — approve-to-execute paper orders on Alpaca paper ──
+@app.get("/admin/paper/portfolio")
+async def admin_paper_portfolio(request: Request):
+    _require_admin_jwt(request)
+    import anyio
+    from engine import paper_trading
+    return await anyio.to_thread.run_sync(paper_trading.portfolio, _make_supabase())
+
+
+@app.get("/admin/paper/proposals")
+async def admin_paper_proposals(request: Request, status: str | None = None, limit: int = 50):
+    _require_admin_jwt(request)
+    import anyio
+    sb = _make_supabase()
+
+    def _q():
+        q = sb.table("paper_trades").select("*").order("created_at", desc=True).limit(max(1, min(limit, 200)))
+        if status:
+            q = q.eq("status", status)
+        return q.execute().data or []
+    return {"items": await anyio.to_thread.run_sync(_q)}
+
+
+@app.post("/admin/paper/scan")
+async def admin_paper_scan(request: Request):
+    _require_admin_jwt(request)
+    import anyio
+    from engine import paper_trading
+    return await anyio.to_thread.run_sync(paper_trading.propose_from_active_signals, _make_supabase())
+
+
+@app.post("/admin/paper/reconcile")
+async def admin_paper_reconcile(request: Request):
+    _require_admin_jwt(request)
+    import anyio
+    from engine import paper_trading
+    return await anyio.to_thread.run_sync(paper_trading.reconcile, _make_supabase())
+
+
+@app.post("/admin/paper/approve/{paper_id}")
+async def admin_paper_approve(paper_id: str, request: Request):
+    _require_admin_jwt(request)
+    import anyio
+    from engine import paper_trading
+    return await anyio.to_thread.run_sync(paper_trading.approve, _make_supabase(), paper_id)
+
+
+@app.post("/admin/paper/reject/{paper_id}")
+async def admin_paper_reject(paper_id: str, request: Request):
+    _require_admin_jwt(request)
+    import anyio
+    from engine import paper_trading
+    return await anyio.to_thread.run_sync(paper_trading.reject, _make_supabase(), paper_id)
+
+
+@app.post("/admin/paper/close/{paper_id}")
+async def admin_paper_close(paper_id: str, request: Request):
+    _require_admin_jwt(request)
+    import anyio
+    from engine import paper_trading
+    return await anyio.to_thread.run_sync(paper_trading.close_trade, _make_supabase(), paper_id)
+
+
 @app.get("/market-pulse/today")
 async def market_pulse_today():
     """Market Pulse — today's market-wide regime verdict + full guidance text +
