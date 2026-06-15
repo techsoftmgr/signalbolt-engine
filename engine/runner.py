@@ -3165,10 +3165,16 @@ def start_scheduler() -> BackgroundScheduler:
     # through the day (filed within ~2 business days), so every 6h is plenty. ──
     def _run_insider_refresh():
         try:
-            from engine import insider_service
+            from engine import insider_service, push
             sb = _supabase()
-            insider_service.refresh_universe(sb)
+            stats = insider_service.refresh_universe(sb)
             insider_service.build_screen(sb)
+            # Push the strongest NEW open-market buys/sells (capped). Dedup is implicit —
+            # refresh only processes filings not already stored, so each fires once.
+            for t in sorted(stats.get("notable_buys", []), key=lambda x: -x["value_usd"])[:5]:
+                push.send_insider_alert(t["ticker"], "BUY", t["value_usd"], t.get("owner", ""), t.get("role", ""))
+            for t in sorted(stats.get("notable_sells", []), key=lambda x: -x["value_usd"])[:3]:
+                push.send_insider_alert(t["ticker"], "SELL", t["value_usd"], t.get("owner", ""), t.get("role", ""))
         except Exception as _e:
             logger.error(f"[runner] insider refresh failed: {_e}")
 

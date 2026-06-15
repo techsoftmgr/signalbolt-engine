@@ -35,7 +35,8 @@ _inflight = threading.Lock()
 
 _WINDOW_DAYS = int(os.environ.get("INSIDER_WINDOW_DAYS", "30"))   # rolling last ~30 days (1 month); older auto-pruned
 _CLUSTER_MIN_BUYERS = int(os.environ.get("INSIDER_CLUSTER_MIN_BUYERS", "2"))
-_NOTABLE_BUY_USD = float(os.environ.get("INSIDER_NOTABLE_BUY_USD", "250000"))   # single-buy alert floor
+_NOTABLE_BUY_USD = float(os.environ.get("INSIDER_NOTABLE_BUY_USD", "250000"))      # single open-market buy alert floor
+_NOTABLE_SELL_USD = float(os.environ.get("INSIDER_NOTABLE_SELL_USD", "1000000"))   # discretionary-sell alert floor (sells noisier → higher bar)
 
 
 def _ua() -> dict:
@@ -237,7 +238,7 @@ def refresh_universe(sb, window_days: int = _WINDOW_DAYS) -> dict:
     the freshly-seen NOTABLE buys (cluster or ≥ $threshold) for alerting. Incremental:
     skips filings (accessions) already stored."""
     uni = _universe_ciks()
-    stats = {"scanned": 0, "new_transactions": 0, "notable_buys": []}
+    stats = {"scanned": 0, "new_transactions": 0, "notable_buys": [], "notable_sells": []}
     if not uni:
         return stats
     # accessions already stored (skip re-parsing)
@@ -271,6 +272,9 @@ def refresh_universe(sb, window_days: int = _WINDOW_DAYS) -> dict:
                 stats["new_transactions"] += 1
                 if t["code"] == "P" and t["value_usd"] >= _NOTABLE_BUY_USD:
                     stats["notable_buys"].append(t)
+                elif (t["code"] == "S" and not t.get("scheduled") and not t.get("comp_related")
+                      and t["value_usd"] >= _NOTABLE_SELL_USD):
+                    stats["notable_sells"].append(t)
             except Exception as e:
                 logger.debug(f"[insider] upsert {ticker} failed: {e}")
     # Keep only the last `window_days` — prune everything older (no historical kept).
