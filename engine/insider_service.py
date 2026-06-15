@@ -79,6 +79,15 @@ def parse_form4(xml_bytes: bytes, ticker: str, filing_date: str | None = None) -
         return out
     owner = _txt(root, ".//reportingOwner/reportingOwnerId/rptOwnerName") or "?"
     role = _role(root.find(".//reportingOwner/reportingOwnerRelationship"))
+    # Filing-level context for classifying SELLS as scheduled / comp-driven vs discretionary:
+    #  • 10b5-1 plan → the sale was pre-scheduled (footnote/structured flag mentions "10b5-1")
+    #  • a same-filing exercise (M) / grant (A) / conversion (C) → the sale is liquidating
+    #    comp shares (exercise-and-sell), not a discretionary open-market decision.
+    raw = (xml_bytes.decode("utf-8", "ignore").lower())
+    is_plan = ("10b5-1" in raw) or ("10b5–1" in raw)
+    all_codes = [_txt(tx, "transactionCoding/transactionCode")
+                 for tx in (root.findall(".//nonDerivativeTransaction") + root.findall(".//derivativeTransaction"))]
+    has_comp = any(c in ("M", "A", "C") for c in all_codes if c)
     for tx in root.findall(".//nonDerivativeTransaction"):
         code = _txt(tx, "transactionCoding/transactionCode")
         if code not in ("P", "S"):
@@ -100,6 +109,8 @@ def parse_form4(xml_bytes: bytes, ticker: str, filing_date: str | None = None) -
             "shares": round(shares, 2),
             "price": round(price, 4),
             "value_usd": round(shares * price, 2),
+            "scheduled": is_plan,                          # 10b5-1 pre-scheduled
+            "comp_related": has_comp,                      # exercise/grant/conversion in same filing
             "filing_date": filing_date,
         })
     return out
@@ -108,23 +119,35 @@ def parse_form4(xml_bytes: bytes, ticker: str, filing_date: str | None = None) -
 def aggregate(txns: list[dict], window_days: int = _WINDOW_DAYS) -> dict:
     """Pure: a ticker's open-market transactions → summary (buy/sell $, net, avg price,
     distinct insiders, cluster flag)."""
+    def _disc_sell(t):   # a sell that the insider CHOSE to make on the open market now
+        return t["code"] == "S" and not t.get("scheduled") and not t.get("comp_related")
+
     buys = [t for t in txns if t["code"] == "P"]
     sells = [t for t in txns if t["code"] == "S"]
+    disc_sells = [t for t in sells if _disc_sell(t)]
+    sched_sells = [t for t in sells if not _disc_sell(t)]   # 10b5-1 or exercise/grant liquidation
     buy_usd = round(sum(t["value_usd"] for t in buys), 2)
     sell_usd = round(sum(t["value_usd"] for t in sells), 2)
+    disc_sell_usd = round(sum(t["value_usd"] for t in disc_sells), 2)
+    sched_sell_usd = round(sum(t["value_usd"] for t in sched_sells), 2)
     buy_sh = sum(t["shares"] for t in buys)
-    sell_sh = sum(t["shares"] for t in sells)
+    disc_sell_sh = sum(t["shares"] for t in disc_sells)
     n_buyers = len({t["owner"] for t in buys})
-    n_sellers = len({t["owner"] for t in sells})
     return {
-        "buy_usd": buy_usd, "sell_usd": sell_usd, "net_usd": round(buy_usd - sell_usd, 2),
-        "buy_count": len(buys), "sell_count": len(sells),
-        "distinct_buyers": n_buyers, "distinct_sellers": n_sellers,
+        "buy_usd": buy_usd, "sell_usd": sell_usd,
+        "discretionary_sell_usd": disc_sell_usd,           # the SELL signal (chosen, open-market)
+        "scheduled_sell_usd": sched_sell_usd,              # 10b5-1 / comp — noise
+        "net_usd": round(buy_usd - sell_usd, 2),
+        "net_discretionary_usd": round(buy_usd - disc_sell_usd, 2),   # buys minus only the chosen sells
+        "buy_count": len(buys), "sell_count": len(sells), "discretionary_sell_count": len(disc_sells),
+        "distinct_buyers": n_buyers,
+        "distinct_sellers": len({t["owner"] for t in sells}),
+        "distinct_discretionary_sellers": len({t["owner"] for t in disc_sells}),
         "avg_buy_price": round(buy_usd / buy_sh, 2) if buy_sh else None,
-        "avg_sell_price": round(sell_usd / sell_sh, 2) if sell_sh else None,
+        "avg_discretionary_sell_price": round(disc_sell_usd / disc_sell_sh, 2) if disc_sell_sh else None,
         "cluster_buy": n_buyers >= _CLUSTER_MIN_BUYERS,
+        "cluster_sell": len({t["owner"] for t in disc_sells}) >= _CLUSTER_MIN_BUYERS,
         "window_days": window_days,
-        # most recent transactions first, for the detail view
         "transactions": sorted(txns, key=lambda t: (t.get("txn_date") or ""), reverse=True)[:25],
     }
 
@@ -240,6 +263,7 @@ def refresh_universe(sb, window_days: int = _WINDOW_DAYS) -> dict:
                 "txn_uid": _txn_uid(t), "ticker": t["ticker"], "owner": t["owner"], "role": t["role"],
                 "txn_date": t.get("txn_date"), "code": t["code"], "side": t["side"],
                 "shares": t["shares"], "price": t["price"], "value_usd": t["value_usd"],
+                "scheduled": bool(t.get("scheduled")), "comp_related": bool(t.get("comp_related")),
                 "accession": t.get("accession"), "filing_date": t.get("filing_date"),
             }
             try:
@@ -273,7 +297,7 @@ def build_screen(sb, window_days: int = _WINDOW_DAYS, limit: int = 60) -> dict:
     for tk, txns in by_ticker.items():
         agg = aggregate(txns, window_days)
         items.append({"ticker": tk, **agg})
-    items.sort(key=lambda x: -x["net_usd"])
+    items.sort(key=lambda x: -x["net_discretionary_usd"])
     out = {"asOf": datetime.now(timezone.utc).isoformat(),
            "windowDays": window_days, "items": items[:limit]}
     try:
