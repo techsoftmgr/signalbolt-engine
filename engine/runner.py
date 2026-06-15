@@ -3120,6 +3120,46 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled churn cache warmer every 60s")
 
+    # ── Paper trading (admin-only) — propose from active signals + reconcile fills.
+    # Both no-op unless ALPACA_PAPER_API_KEY/SECRET are set, so this is dormant until
+    # the paper account is wired up. Approve-first: proposing never places an order. ──
+    def _run_paper_propose():
+        try:
+            from engine import paper_broker
+            if not paper_broker.is_configured():
+                return
+            from engine.session_classifier import is_market_open_today
+            if not is_market_open_today():
+                return
+            from engine import paper_trading
+            paper_trading.propose_from_active_signals(_supabase())
+        except Exception as _e:
+            logger.error(f"[runner] paper propose failed: {_e}")
+
+    def _run_paper_reconcile():
+        try:
+            from engine import paper_broker
+            if not paper_broker.is_configured():
+                return
+            from engine import paper_trading
+            paper_trading.reconcile(_supabase())
+        except Exception as _e:
+            logger.error(f"[runner] paper reconcile failed: {_e}")
+
+    scheduler.add_job(
+        _run_paper_propose, trigger=IntervalTrigger(minutes=5), id="paper_propose",
+        name="Paper-trade proposals from active signals (5m)", replace_existing=True,
+        max_instances=1, coalesce=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=40),
+    )
+    scheduler.add_job(
+        _run_paper_reconcile, trigger=IntervalTrigger(minutes=3), id="paper_reconcile",
+        name="Paper-trade fill/exit reconcile (3m)", replace_existing=True,
+        max_instances=1, coalesce=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=50),
+    )
+    logger.info("[runner] Scheduled paper-trade propose (5m) + reconcile (3m) — dormant until paper keys set")
+
     # ── Overnight (Blue Ocean) display-only price poll ───────────────────────
     # During the ~8pm-4am ET overnight session, poll Alpaca's OVERNIGHT feed for
     # the watched tickers and publish to price_store so the watchlist / quote
