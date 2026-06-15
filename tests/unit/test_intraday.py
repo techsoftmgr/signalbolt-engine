@@ -49,6 +49,20 @@ def test_market_closed(monkeypatch):
     assert r["status"] == "MARKET_CLOSED"
 
 
+def test_read_summary():
+    # both too early
+    assert "too early" in intraday._read_summary(
+        {"SPY": {"status": "TOO_EARLY"}, "QQQ": {"status": "TOO_EARLY"}}).lower()
+    # one on-pace distribution → building + not-confirmed
+    line = intraday._read_summary({
+        "SPY": {"status": "ON_PACE_DISTRIBUTION", "confidence": "MEDIUM"},
+        "QQQ": {"status": "NEUTRAL", "confidence": "MEDIUM"},
+    }).lower()
+    assert "distribution day" in line and "not confirmed until the close" in line and "spy" in line
+    # all closed
+    assert "closed" in intraday._read_summary({"SPY": {"status": "MARKET_CLOSED"}}).lower()
+
+
 def test_intraday_has_no_daily_write_path():
     """Integrity firewall: the intraday module has no DB-WRITE code path — it never
     imports the daily store, never upserts, never touches a Supabase table."""
