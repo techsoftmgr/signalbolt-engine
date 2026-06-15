@@ -45,19 +45,47 @@ def _build_row(date_iso: str, dd_spy: int, dd_qqq: int, nh: int, nl: int,
 
 
 def run_daily(sb) -> dict:
-    """Compute + upsert today's Market Pulse row. Returns the row (or {} on no data)."""
+    """Compute + upsert the Market Pulse row for the last SETTLED session. Returns
+    the row (or {} on no data).
+
+    A daily bar is only final after that day's close. If the latest bar is TODAY
+    and the regular session hasn't closed yet (before 4pm ET), it's a FORMING bar —
+    we drop it and read the prior completed session, so an early/manual run reflects
+    the last close, not 12 minutes of today. The 4:45pm ET cron runs after the
+    close, so it naturally keeps the (now settled) same-day bar."""
     spy = data.index_bars("SPY", days=60)
     qqq = data.index_bars("QQQ", days=60)
     if spy is None or len(spy) < 2:
         logger.error("[market_pulse] no SPY bars — aborting daily run")
         return {}
+
+    from datetime import datetime as _dt, timezone as _tz
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        now_et = _dt.now(_ZI("America/New_York"))
+    except Exception:
+        now_et = _dt.now(_tz.utc)
+    last_date = pd.Timestamp(spy.index[-1]).date()
+    forming = last_date == now_et.date() and now_et.hour < 16
+    if forming:
+        cutoff = pd.Timestamp(now_et.date()).tz_localize("UTC")              # exclude today's forming bar
+    else:
+        cutoff = pd.Timestamp(last_date).tz_localize("UTC") + pd.Timedelta(days=1)   # keep the latest (settled) bar
+
+    spy = spy[spy.index < cutoff]
+    if qqq is not None:
+        qqq = qqq[qqq.index < cutoff]
+    if spy is None or len(spy) < 2:
+        logger.error("[market_pulse] no settled SPY bar — aborting daily run")
+        return {}
     date_iso = pd.Timestamp(spy.index[-1]).date().isoformat()
 
     tickers = constituents.sp500_tickers()
-    ubars = data.universe_bars(tickers, days=400)
-    if not ubars:
+    ubars_raw = data.universe_bars(tickers, days=400)
+    if not ubars_raw:
         logger.error("[market_pulse] no constituent bars — aborting daily run")
         return {}
+    ubars = {t: df[df.index < cutoff] for t, df in ubars_raw.items() if df is not None}
 
     dd_spy = pillars.distribution_days(spy)
     dd_qqq = pillars.distribution_days(qqq)
