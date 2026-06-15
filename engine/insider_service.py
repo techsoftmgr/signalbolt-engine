@@ -33,7 +33,7 @@ _CACHE_KEY = "markets:insiders:v1"
 _TTL = 6 * 3600
 _inflight = threading.Lock()
 
-_WINDOW_DAYS = int(os.environ.get("INSIDER_WINDOW_DAYS", "90"))
+_WINDOW_DAYS = int(os.environ.get("INSIDER_WINDOW_DAYS", "10"))   # keep only the last 10 days — recent/actionable only
 _CLUSTER_MIN_BUYERS = int(os.environ.get("INSIDER_CLUSTER_MIN_BUYERS", "2"))
 _NOTABLE_BUY_USD = float(os.environ.get("INSIDER_NOTABLE_BUY_USD", "250000"))   # single-buy alert floor
 
@@ -273,8 +273,14 @@ def refresh_universe(sb, window_days: int = _WINDOW_DAYS) -> dict:
                     stats["notable_buys"].append(t)
             except Exception as e:
                 logger.debug(f"[insider] upsert {ticker} failed: {e}")
+    # Keep only the last `window_days` — prune everything older (no historical kept).
+    try:
+        deleted = sb.table("insider_transactions").delete().lt("txn_date", _since_iso(window_days)).execute()
+        stats["pruned"] = len(deleted.data or [])
+    except Exception as e:
+        logger.debug(f"[insider] prune failed: {e}")
     logger.info(f"[insider] refresh: scanned={stats['scanned']} new_txns={stats['new_transactions']} "
-                f"notable_buys={len(stats['notable_buys'])}")
+                f"notable_buys={len(stats['notable_buys'])} pruned={stats.get('pruned', 0)}")
     return stats
 
 
