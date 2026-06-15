@@ -40,6 +40,7 @@ _DEFAULT_PREFS = {
     "breakdown_alerts": True, # universe-wide heavy-selling / breakdown-risk alerts
     "breakout_alerts":  True, # universe-wide breakout alerts (broke 20-day high on vol)
     "accumulation_alerts": True, # universe-wide unusual-buying (heavy up-volume) alerts
+    "insider_alerts": True,   # universe-wide open-market insider BUY/SELL (SEC Form 4) alerts
     "premarket_gap_alerts": True, # premarket disaster-gap heads-up for open overnight positions (notification only)
     "commentary_alerts": True,    # live intraday events on a watched ticker (MACD cross, breakout, VWAP, gap, sharp move)
     "market_alerts":   True,      # market-wide tape events (VIX spike, index key-level break, sector flip)
@@ -459,6 +460,47 @@ def send_breakdown_alert(
         return len(messages)
     except Exception as e:
         logger.debug(f"[push] breakdown alert failed for {ticker}: {e}")
+        return 0
+
+
+def send_insider_alert(
+    ticker: str,
+    side: str,                       # "BUY" | "SELL"
+    value_usd: float,
+    owner: str = "",
+    role: str = "",
+    cluster: bool = False,
+) -> int:
+    """Broadcast an OPEN-MARKET insider buy/sell (SEC Form 4) to all users with the
+    'insider_alerts' pref on (default on). NOT watchlist-scoped — surfaces conviction
+    insider activity across the universe. Sells here are already filtered to
+    DISCRETIONARY (10b5-1/comp excluded) upstream. Educational, not advice."""
+    try:
+        amt = (f"${value_usd/1e6:.1f}M" if value_usd >= 1e6 else f"${value_usd/1e3:.0f}K")
+        who = f"{owner}" + (f" ({role})" if role else "")
+        if side == "BUY":
+            title = f"{'🔥 ' if cluster else '🟢 '}{ticker} — Insider buying"
+            body = f"{who} bought {amt} of {ticker} on the open market{' · cluster buy' if cluster else ''}. Tap for the read."
+        else:
+            title = f"🔴 {ticker} — Insider selling"
+            body = f"{who} sold {amt} of {ticker} on the open market (discretionary). Tap for the read."
+
+        _record_alert("insider", ticker, title, body, stage=side,
+                      data={"ticker": ticker, "side": side})
+
+        tokens = _tokens_for("insider_alerts", default=True)
+        if not tokens:
+            return 0
+        messages = [
+            {"to": t, "title": title, "body": body,
+             "data": {"type": "insider_alert", "ticker": ticker, "side": side},
+             "sound": "default", "badge": 1}
+            for t in tokens
+        ]
+        _dispatch(messages, f"INSIDER {side} {ticker}")
+        return len(messages)
+    except Exception as e:
+        logger.debug(f"[push] insider alert failed for {ticker}: {e}")
         return 0
 
 
