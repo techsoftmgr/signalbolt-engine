@@ -250,6 +250,7 @@ def _persist_txn(sb, t: dict, stats: dict) -> None:
     try:
         sb.table("insider_transactions").upsert(row, on_conflict="txn_uid").execute()
         stats["new_transactions"] += 1
+        stats.setdefault("updated_tickers", set()).add(t["ticker"])
         if t["code"] == "P" and t["value_usd"] >= _NOTABLE_BUY_USD:
             stats["notable_buys"].append(t)
         elif (t["code"] == "S" and not t.get("scheduled") and not t.get("comp_related")
@@ -257,6 +258,22 @@ def _persist_txn(sb, t: dict, stats: dict) -> None:
             stats["notable_sells"].append(t)
     except Exception as e:
         logger.debug(f"[insider] upsert {t.get('ticker')} failed: {e}")
+
+
+def _bust_ticker_caches(tickers) -> None:
+    """Invalidate the per-ticker `summarize_ticker` cache for names whose stored activity
+    just changed, so the ticker hub / search recompute live instead of serving a stale
+    snapshot. The shared list cache (`build_screen`) is rebuilt separately by the caller.
+    Without this, the cached Insider screen could lag the (uncached) watchlist by up to the
+    cache TTL when new Form 4s land."""
+    if not tickers:
+        return
+    try:
+        from engine import cache
+        for tk in tickers:
+            cache.kv.delete(f"insiders:ticker:{tk}")
+    except Exception as e:
+        logger.debug(f"[insider] cache bust failed: {e}")
 
 
 def refresh_universe(sb, window_days: int = _WINDOW_DAYS) -> dict:
@@ -287,6 +304,7 @@ def refresh_universe(sb, window_days: int = _WINDOW_DAYS) -> dict:
             continue
         for t in new_txns:
             _persist_txn(sb, t, stats)
+    _bust_ticker_caches(stats.get("updated_tickers"))   # keep per-ticker hub/search fresh
     # Keep only the last `window_days` — prune everything older (no historical kept).
     try:
         deleted = sb.table("insider_transactions").delete().lt("txn_date", _since_iso(window_days)).execute()
@@ -382,7 +400,8 @@ def refresh_from_feed(sb, window_days: int = _WINDOW_DAYS) -> dict:
         for t in new_txns:
             _persist_txn(sb, t, stats)
     if stats["new_transactions"]:
-        build_screen(sb, window_days)            # refresh cached screen so the UI reflects it now
+        _bust_ticker_caches(stats.get("updated_tickers"))   # per-ticker hub/search fresh
+        build_screen(sb, window_days)            # rebuild the shared list cache so the UI reflects it now
     logger.info(f"[insider] feed refresh: feed_ciks={stats['feed_ciks']} matched={stats['matched']} "
                 f"new_txns={stats['new_transactions']} notable_buys={len(stats['notable_buys'])}")
     return stats
