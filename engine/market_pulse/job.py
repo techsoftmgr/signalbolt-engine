@@ -145,6 +145,16 @@ def run_backfill(sb, days: int = 120) -> dict:
     vix_full = data.vix_closes(lookback=900)   # may be None
 
     dates = [pd.Timestamp(d).date() for d in spy.index]
+    # Drop a still-forming final bar (today before the close) — only replay SETTLED
+    # sessions, else the backfill writes a partial intraday row for today.
+    from datetime import datetime as _dt
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        _now_et = _dt.now(_ZI("America/New_York"))
+    except Exception:
+        _now_et = None
+    if dates and _now_et is not None and dates[-1] == _now_et.date() and _now_et.hour < 16:
+        dates = dates[:-1]
     start_idx = max(C.HL_LOOKBACK, len(dates) - days)   # need a full 52w window behind each replayed day
     cum = 0
     written = 0
