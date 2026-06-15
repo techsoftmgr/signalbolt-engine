@@ -1033,6 +1033,37 @@ async def markets_churn(request: Request, limit: int = 25):
     return {"asOf": None, "items": [], "warming": True}
 
 
+@app.get("/markets/insiders")
+async def markets_insiders(request: Request):
+    """Open-market insider activity (SEC Form 4, codes P/S only) — per ticker: $ bought,
+    $ sold, net, avg price, distinct insiders, cluster-buy flag, recent transactions.
+    Serves the refresh-built cache; builds in the background if cold."""
+    _require_jwt(request)
+    from engine.insider_service import peek, build_screen
+    cached = peek()
+    if cached:
+        return cached
+    import anyio
+    out = await anyio.to_thread.run_sync(build_screen, _make_supabase())
+    return out or {"asOf": None, "items": [], "warming": True}
+
+
+@app.post("/admin/run-insider-refresh")
+async def admin_run_insider_refresh(request: Request, days: int = 90):
+    """Manual trigger: fetch new Form 4s for the universe → upsert open-market txns →
+    rebuild the screen. (The daily job does this automatically.)"""
+    _require_admin_jwt(request)
+    import anyio
+    from engine import insider_service
+
+    def _run():
+        sb = _make_supabase()
+        stats = insider_service.refresh_universe(sb, window_days=max(7, min(days, 365)))
+        insider_service.build_screen(sb)
+        return stats
+    return await anyio.to_thread.run_sync(_run)
+
+
 # ── Paper trading (admin-only) — approve-to-execute paper orders on Alpaca paper ──
 @app.get("/admin/paper/portfolio")
 async def admin_paper_portfolio(request: Request):
