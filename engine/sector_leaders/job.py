@@ -60,6 +60,15 @@ def run_backfill(sb, days: int = 130) -> dict:
         logger.error("[sector_leaders] backfill: insufficient SPY history")
         return {"written": 0}
     dates = [pd.Timestamp(d).date() for d in spy.index]
+    # Drop a still-forming final bar (today before the close) — settled sessions only.
+    from datetime import datetime as _dt
+    try:
+        from zoneinfo import ZoneInfo as _ZI
+        _now_et = _dt.now(_ZI("America/New_York"))
+    except Exception:
+        _now_et = None
+    if dates and _now_et is not None and dates[-1] == _now_et.date() and _now_et.hour < 16:
+        dates = dates[:-1]
     start_idx = max(C.L_6M + C.RANK_MOM_LOOKBACK, len(dates) - days)
     written = 0
     for i in range(start_idx, len(dates)):
