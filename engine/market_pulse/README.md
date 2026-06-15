@@ -71,11 +71,41 @@ cumulative so it never double-counts).
    (one-time; replays the last ~120 trading days from one bulk fetch).
 3. After that the daily cron keeps it current.
 
+## Phase 2 additions
+
+### A — Stalling days (Pillar 1 extension)
+A *stalling* day is softer distribution: close **UP** but a tiny gain
+(≤ `STALL_MAX_GAIN_PCT`, 0.2%), on **higher** volume, closing in the **lower half**
+of the range (`(close-low)/(high-low) ≤ STALL_CLOSE_RANGE_FRAC`) — institutions
+selling into strength. Same 25-day window + 5%-rise expiry as distribution days.
+Combined pressure: `effective_dd = dd_count + STALL_WEIGHT*stall_count` (0.5 → two
+stalls ≈ one distribution). The regime resolver compares against
+`floor(effective_dd_max)` instead of `dd_max` (thresholds 5/6 unchanged) — with
+zero stalling days, identical to Phase 1. Stored/served separately
+(`stall_count_*`, `effective_dd_*`) so the UI shows "Distribution: X · Stalling: Y".
+Migration: `supabase-market-pulse-stalling-migration.sql`.
+
+### B — Intraday provisional read (`intraday.py`)
+`GET /market-pulse/intraday` — is today *on pace* for a distribution/stalling day,
+**before** the close. **INTEGRITY FIREWALL:** the module has no DB-write path (no
+`store` import, no `upsert`, no `.table()`) — it can never reach `market_pulse_daily`.
+Volume is projected with an **empirical U-curve** (trailing ~60 sessions of 30-min
+buckets, cached; hardcoded U-curve fallback) — NOT linear off the clock, which
+understates midday. **Confidence gating:** `TOO_EARLY` before 11:00 ET, then
+MEDIUM → HIGH; status only flips when projected volume clears prior-day volume by
+`INTRADAY_MARGIN`. Half-days use the real NYSE session length + a separate curve.
+Every field is flagged provisional; out-of-hours → `MARKET_CLOSED`.
+
 ## TODOs
 
 - **Quarterly:** constituents come from `fundamentals.get_universe()` (a maintained
   CSV, cached). If S&P 500 coverage drifts, force a refresh there.
 - A/D **divergence** needs accrued A/D history; it stays `false` during the initial
   backfill window and becomes meaningful as days accumulate.
-- Phase 2: stalling-day detection, provisional intraday "forming" read, sector
-  leadership rotation.
+- Intraday: swap the hardcoded U-curve for the empirical one (already wired — it's
+  built lazily + cached 24h); a separate **empirical half-day curve** is a TODO
+  (currently a hardcoded half-day fallback).
+- Sector Leaders (Part C) lives in its own package `engine/sector_leaders/` — see
+  `GET /sector-leaders/today` + `/history`; backfill via
+  `POST /admin/run-sector-leaders?backfill_days=130`. Migration:
+  `supabase-sector-leaders-migration.sql`.

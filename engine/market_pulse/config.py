@@ -12,6 +12,12 @@ DD_WINDOW         = 25       # rolling trading-day window
 DD_DOWN_PCT       = 0.002    # index closes down >= 0.2%
 DD_EXPIRE_RISE    = 0.05     # a DD expires once the index closes 5%+ above its close
 
+# ── Pillar 1b: stalling days (softer distribution — selling into strength) ──
+# Close UP but tiny gain, on higher volume, closing in the lower half of range.
+STALL_MAX_GAIN_PCT     = 0.002   # gain <= 0.20% (barely advanced)
+STALL_CLOSE_RANGE_FRAC = 0.5     # (close-low)/(high-low) <= 0.5 (closed weak)
+STALL_WEIGHT           = 0.5     # 2 stalling days ≈ 1 distribution day in the pressure metric
+
 # ── Pillar 2/3: 52-week + moving averages ──────────────────────────────────
 HL_LOOKBACK       = 252      # trading days for the 52-week high/low
 SMA_FAST          = 50
@@ -39,6 +45,14 @@ PCT50_PRESSURE    = 50.0     # % above 50d < 50
 VIX_PRESSURE_LEVEL = 30.0    # vix > 30 AND rising -> contributes to UNDER_PRESSURE
 DD_BOUNDARY        = 4        # dd_max == 4 ...
 VIX_BOUNDARY_LEVEL = 25.0    # ... AND vix > 25 AND rising -> soft-downgrade to UNDER_PRESSURE
+
+# ── Intraday provisional read (Part B) ─────────────────────────────────────
+INTRADAY_MARGIN        = 0.03    # projected vol must clear prior-day vol by 3% to flip status
+INTRADAY_BUCKET_MIN    = 30      # 30-min volume-profile buckets
+INTRADAY_CONF_FLOOR_ET = 11.0    # before 11:00 AM ET → TOO_EARLY (too little elapsed to project)
+INTRADAY_HIGH_CONF_ET  = 14.0    # from 2:00 PM ET → HIGH confidence (else MEDIUM)
+INTRADAY_PROFILE_DAYS  = 120     # calendar days of 30-min bars to build the ~60-session curve
+
 
 # ── Regime labels (match the Supabase CHECK constraint) ────────────────────
 CONFIRMED_UPTREND = "CONFIRMED_UPTREND"

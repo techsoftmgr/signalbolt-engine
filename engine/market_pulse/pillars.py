@@ -49,6 +49,43 @@ def distribution_days(
     return count
 
 
+def stalling_days(
+    df: Optional[pd.DataFrame],
+    window: int = C.DD_WINDOW,
+    max_gain: float = C.STALL_MAX_GAIN_PCT,
+    close_frac: float = C.STALL_CLOSE_RANGE_FRAC,
+    expire_rise: float = C.DD_EXPIRE_RISE,
+) -> int:
+    """Count STALLING days in the trailing `window` — a softer form of distribution:
+    close UP vs prior but a tiny gain (<= max_gain), on HIGHER volume, and closing
+    in the lower half of the day's range (institutions selling into strength).
+    Same 25-day window + 5%-rise expiration as distribution days."""
+    if df is None or len(df) < 2:
+        return 0
+    sub = df.tail(window + 1)
+    c = sub["close"].to_numpy(dtype=float)
+    v = sub["volume"].to_numpy(dtype=float)
+    hi = sub["high"].to_numpy(dtype=float)
+    lo = sub["low"].to_numpy(dtype=float)
+    n = len(sub)
+    count = 0
+    start = max(1, n - window)
+    for i in range(start, n):
+        if c[i - 1] <= 0:
+            continue
+        gain = c[i] / c[i - 1] - 1.0
+        rng = hi[i] - lo[i]
+        close_pos = (c[i] - lo[i]) / rng if rng > 0 else 0.0
+        is_stall = (0 < gain <= max_gain) and (v[i] > v[i - 1]) and (close_pos <= close_frac)
+        if not is_stall:
+            continue
+        ceiling = c[i] * (1 + expire_rise)
+        if any(c[j] >= ceiling for j in range(i + 1, n)):
+            continue
+        count += 1
+    return count
+
+
 # ── Pillar 2: net new highs vs new lows (S&P 500) ───────────────────────────
 def net_new_highs_lows(bars: dict[str, pd.DataFrame], lookback: int = C.HL_LOOKBACK) -> tuple[int, int, int]:
     """(new_highs, new_lows, net). A name makes a 52-week high when today's HIGH

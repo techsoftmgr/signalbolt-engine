@@ -1072,6 +1072,67 @@ async def admin_run_market_pulse(request: Request, backfill_days: int = 0):
     return {"ran": True, "row": row}
 
 
+@app.get("/market-pulse/intraday")
+async def market_pulse_intraday():
+    """PROVISIONAL intraday read — is today on pace for a distribution/stalling day,
+    before the close confirms it. Every field flagged provisional; NEVER touches the
+    daily table. Public/free."""
+    import anyio
+    from engine.market_pulse import intraday
+    return await anyio.to_thread.run_sync(intraday.read_all)
+
+
+@app.get("/sector-leaders/today")
+async def sector_leaders_today():
+    """Sector Leaders — the 11 SPDR sectors ranked by relative strength vs SPY +
+    the offense/defense tape-character verdict. Public/free."""
+    import anyio
+    from engine.sector_leaders import store as sl_store, config as sl_cfg
+    sb = _make_supabase()
+    data = await anyio.to_thread.run_sync(sl_store.get_today, sb)
+    if not data:
+        return {"available": False, "disclaimer": sl_cfg.DISCLAIMER,
+                "note": "Sector Leaders has not been computed yet — first run is after the close."}
+    summary = data.get("summary") or {}
+    tc = summary.get("tape_character")
+    return {
+        "available": True, "date": data.get("date"),
+        "tape_character": tc, "top3": summary.get("top3"),
+        "verdict": sl_cfg.GUIDANCE.get(tc, ""),
+        "sectors": [{**r, "name": sl_cfg.SECTOR_NAMES.get(r.get("sector_etf"), r.get("sector_etf"))}
+                    for r in (data.get("sectors") or [])],
+        "disclaimer": sl_cfg.DISCLAIMER,
+    }
+
+
+@app.get("/sector-leaders/history")
+async def sector_leaders_history(sector: str = "XLK", days: int = 90):
+    """RS-blended + RS-rank over time for one sector ETF (charting)."""
+    import anyio
+    from engine.sector_leaders import store as sl_store
+    sb = _make_supabase()
+    rows = await anyio.to_thread.run_sync(sl_store.get_history, sb, sector, max(1, min(days, 400)))
+    return {
+        "available": bool(rows), "sector": sector.upper(),
+        "dates":      [r.get("date") for r in rows],
+        "rs_blended": [r.get("rs_blended") for r in rows],
+        "rs_rank":    [r.get("rs_rank") for r in rows],
+    }
+
+
+@app.post("/admin/run-sector-leaders")
+async def admin_run_sector_leaders(request: Request, backfill_days: int = 0):
+    """Compute Sector Leaders now, or backfill N prior sessions. Admin only."""
+    _require_admin_jwt(request)
+    import anyio
+    from engine import sector_leaders
+    sb = _make_supabase()
+    if backfill_days and int(backfill_days) > 0:
+        res = await anyio.to_thread.run_sync(sector_leaders.run_backfill, sb, min(int(backfill_days), 250))
+        return {"backfill": res}
+    return {"ran": True, "summary": await anyio.to_thread.run_sync(sector_leaders.run_daily, sb)}
+
+
 @app.get("/market/pulse")
 async def market_pulse(tickers: str = ""):
     """
