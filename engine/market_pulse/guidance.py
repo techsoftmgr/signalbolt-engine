@@ -107,6 +107,8 @@ def summary_line(row: dict) -> str:
             parts.append("breadth diverging from price")
         if thrust:
             parts.append("a breadth thrust just fired")
+        if bool(row.get("breadth_breakdown")):
+            parts.append("a breadth breakdown just fired")
 
         stance = {
             "CONFIRMED_UPTREND": "favors offense — breakouts tend to follow through",

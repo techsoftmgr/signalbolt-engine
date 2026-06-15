@@ -67,17 +67,19 @@ def test_effective_dd_combination():
 
 
 def test_breadth_thrust():
-    # Surge from deeply oversold (~0.20) to strong (~0.80) over ~10 sessions → fires.
     weak = [(80, 420)] * 8          # ratio ~0.16 (oversold)
-    strong = [(440, 60)] * 8        # ratio ~0.88 (thrust up)
-    ratio, fired = pillars.breadth_thrust(weak + strong)
-    assert fired is True and ratio > C.BREADTH_THRUST_HIGH
-    # Flat ~0.5 breadth → no thrust.
-    flat = [(250, 250)] * 20
-    ratio2, fired2 = pillars.breadth_thrust(flat)
-    assert fired2 is False
-    # Too little data → (None, False).
-    assert pillars.breadth_thrust([(250, 250)] * 3) == (None, False)
+    strong = [(440, 60)] * 8        # ratio ~0.88 (broad strength)
+    # oversold → strong = bullish thrust (up); not a breakdown.
+    ratio, up, down = pillars.breadth_thrust(weak + strong)
+    assert up is True and down is False and ratio > C.BREADTH_THRUST_HIGH
+    # MIRROR: strong → weak = bearish breakdown (down); not a thrust.
+    ratio_b, up_b, down_b = pillars.breadth_thrust(strong + weak)
+    assert down_b is True and up_b is False and ratio_b < C.BREADTH_THRUST_LOW
+    # Flat ~0.5 → neither.
+    ratio2, up2, down2 = pillars.breadth_thrust([(250, 250)] * 20)
+    assert up2 is False and down2 is False
+    # Too little data → (None, False, False).
+    assert pillars.breadth_thrust([(250, 250)] * 3) == (None, False, False)
 
 
 # ── Pillar 2: new highs / lows ──────────────────────────────────────────────
