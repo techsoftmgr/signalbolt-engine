@@ -3095,6 +3095,31 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled movers cache warmer every 10s")
 
+    # ── Churn/Absorption warmer — high pace-adjusted volume + small price move,
+    # tagged accum/distrib by range position. Slower-moving than movers (price is
+    # by definition stalling), so 60s is plenty. Trading days only. ──
+    def _run_warm_churn():
+        try:
+            from engine.session_classifier import is_market_open_today
+            if not is_market_open_today():
+                return
+            from engine import churn_service
+            churn_service.compute_churn(force=True)
+        except Exception as _e:
+            logger.error(f"[runner] churn warm failed: {_e}")
+
+    scheduler.add_job(
+        _run_warm_churn,
+        trigger=IntervalTrigger(seconds=60),
+        id="warm_churn",
+        name="Churn/Absorption cache warmer (60s, trading days)",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=25),
+    )
+    logger.info("[runner] Scheduled churn cache warmer every 60s")
+
     # ── Overnight (Blue Ocean) display-only price poll ───────────────────────
     # During the ~8pm-4am ET overnight session, poll Alpaca's OVERNIGHT feed for
     # the watched tickers and publish to price_store so the watchlist / quote

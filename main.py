@@ -1017,6 +1017,22 @@ async def markets_movers(request: Request, limit: int = 20):
     return {"asOf": None, "gainers": [], "losers": [], "unusualVolume": [], "warming": True}
 
 
+@app.get("/markets/churn")
+async def markets_churn(request: Request, limit: int = 25):
+    """Churn / Absorption — names on HIGH (pace-adjusted) relative volume but a tiny
+    price move, tagged accumulation / distribution / churn by 20-day range position,
+    and flagged when a recent news gap suggests an event-driven (M&A) pin. Same
+    warmer-served cache as /markets/movers — never runs the heavy build inline."""
+    _require_jwt(request)
+    from engine.churn_service import peek_churn, compute_churn
+    cached = peek_churn()
+    if cached:
+        return cached
+    import threading
+    threading.Thread(target=compute_churn, kwargs={"limit": max(5, min(limit, 40))}, daemon=True).start()
+    return {"asOf": None, "items": [], "warming": True}
+
+
 @app.get("/market-pulse/today")
 async def market_pulse_today():
     """Market Pulse — today's market-wide regime verdict + full guidance text +
