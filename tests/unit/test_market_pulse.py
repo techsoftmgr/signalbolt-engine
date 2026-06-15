@@ -189,6 +189,21 @@ def test_vix_null_fallback_still_resolves_from_pillars():
 
 
 # ── Guidance ────────────────────────────────────────────────────────────────
+def test_summary_line():
+    row = {"regime": C.UNDER_PRESSURE, "dd_count_spy": 5, "dd_count_qqq": 4,
+           "stall_count_spy": 0, "stall_count_qqq": 0, "pct_above_50": 60.0,
+           "net_nhnl": 22, "vix_band": "NORMAL", "vix_rising": False,
+           "ad_divergence": False, "breadth_thrust": False}
+    line = guidance.summary_line(row).lower()
+    assert "distribution days" in line and "institutions selling" in line
+    assert "healthy breadth" in line and "be selective" in line and line.endswith(".")
+    # correction + poor breadth → defense stance
+    row2 = {"regime": C.CORRECTION, "dd_count_spy": 7, "dd_count_qqq": 6,
+            "pct_above_50": 30.0, "net_nhnl": -50, "vix_band": "HIGH", "vix_rising": True}
+    line2 = guidance.summary_line(row2).lower()
+    assert "poor breadth" in line2 and "defense" in line2
+
+
 def test_guidance_build_has_disclaimer_and_vix_line():
     g = guidance.build(C.CORRECTION, "HIGH", True)
     assert "not financial advice" in g["disclaimer"]

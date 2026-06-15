@@ -1030,6 +1030,7 @@ async def market_pulse_today():
         return {"available": False, "disclaimer": guidance.DISCLAIMER,
                 "note": "Market Pulse has not been computed yet — first run is after today's close."}
     g = guidance.build(row.get("regime"), row.get("vix_band"), row.get("vix_rising"))
+    g["summary"] = guidance.summary_line(row)
     return {"available": True, **row, "guidance": g}
 
 

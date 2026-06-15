@@ -61,6 +61,65 @@ def vix_line(band: str | None, rising: bool | None) -> str:
     return "Volatility data unavailable."
 
 
+def summary_line(row: dict) -> str:
+    """One plain-English sentence synthesizing the pillars into a quick read, e.g.
+    'Healthy breadth, calm volatility, but 5 distribution days = institutions
+    selling → be selective and tighten risk.' Derived from the row, so it updates
+    daily. Never raises."""
+    try:
+        dd = max(int(row.get("dd_count_spy") or 0), int(row.get("dd_count_qqq") or 0))
+        stall = max(int(row.get("stall_count_spy") or 0), int(row.get("stall_count_qqq") or 0))
+        p50 = float(row.get("pct_above_50") or 0)
+        nh_nl = int(row.get("net_nhnl") or 0)
+        vb = row.get("vix_band")
+        vr = bool(row.get("vix_rising"))
+        div = bool(row.get("ad_divergence"))
+        thrust = bool(row.get("breadth_thrust"))
+        regime = row.get("regime")
+
+        parts = []
+        # Breadth participation
+        if p50 >= 60:
+            parts.append("healthy breadth")
+        elif p50 >= 50:
+            parts.append("breadth holding up")
+        elif p50 >= 40:
+            parts.append("weakening breadth")
+        else:
+            parts.append("poor breadth")
+        # Volatility
+        vol = {"CALM": "calm volatility", "NORMAL": "normal volatility",
+               "ELEVATED": "elevated volatility", "HIGH": "high volatility"}.get(vb)
+        if vol:
+            if vb in ("ELEVATED", "HIGH") and vr:
+                vol += " and rising"
+            parts.append(vol)
+        # Selling pressure (the distribution story)
+        if dd >= 5:
+            parts.append(f"but {dd} distribution days = institutions selling")
+        elif dd >= 3:
+            parts.append(f"with {dd} distribution days (some selling)")
+        if stall >= 2:
+            parts.append(f"plus {stall} stalling days")
+        if nh_nl < 0:
+            parts.append("more new lows than highs")
+        if div:
+            parts.append("breadth diverging from price")
+        if thrust:
+            parts.append("a breadth thrust just fired")
+
+        stance = {
+            "CONFIRMED_UPTREND": "favors offense — breakouts tend to follow through",
+            "UNDER_PRESSURE": "be selective and tighten risk",
+            "CORRECTION": "defense first — capital preservation",
+        }.get(regime, "")
+        sentence = ", ".join(parts)
+        sentence = sentence[:1].upper() + sentence[1:]
+        return f"{sentence} → {stance}." if stance else f"{sentence}."
+    except Exception:
+        return ""
+
+
 def build(regime: str, vix_band: str | None, vix_rising: bool | None) -> dict:
     """Full guidance payload for an API response."""
     g = GUIDANCE.get(regime) or GUIDANCE[C.UNDER_PRESSURE]
