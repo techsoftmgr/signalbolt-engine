@@ -106,11 +106,13 @@ def run_backfill(sb, days: int = 120) -> dict:
     written = 0
     for i in range(start_idx, len(dates)):
         d = dates[i]
-        d_ts = pd.Timestamp(d)
-        # Slice every series to "as of day d" so each pillar sees only past data.
-        spy_d = spy[spy.index <= d_ts]
-        qqq_d = qqq[qqq.index <= d_ts]
-        ubars_d = {t: df[df.index <= d_ts] for t, df in ubars.items() if df is not None}
+        # Alpaca bar indexes are tz-aware (UTC); use a tz-aware exclusive cutoff at
+        # the NEXT UTC midnight so all of day d's bar is included regardless of its
+        # intraday timestamp (a naive cutoff raises a tz-comparison TypeError).
+        cutoff = pd.Timestamp(d).tz_localize("UTC") + pd.Timedelta(days=1)
+        spy_d = spy[spy.index < cutoff]
+        qqq_d = qqq[qqq.index < cutoff]
+        ubars_d = {t: df[df.index < cutoff] for t, df in ubars.items() if df is not None}
 
         dd_spy = pillars.distribution_days(spy_d)
         dd_qqq = pillars.distribution_days(qqq_d)
