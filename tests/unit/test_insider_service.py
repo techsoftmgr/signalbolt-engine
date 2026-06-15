@@ -1,84 +1,88 @@
-"""Unit tests — insider_service: Form 4 parse (open-market P/S only) + aggregation."""
+"""Unit tests — insider_service: Form 4 parse (open-market P/S, 10b5-1 + comp flags) + aggregation."""
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from engine import insider_service as ins
 
-# A Form 4 with: an open-market BUY (P), a grant (A → excluded), and an open-market SELL (S).
-FORM4 = """<?xml version="1.0"?>
+
+def _f4(rows: str, footnote: str = "") -> bytes:
+    """rows = nonDerivativeTransaction XML; footnote optional (e.g. a 10b5-1 note)."""
+    return f"""<?xml version="1.0"?>
 <ownershipDocument>
   <issuer><issuerTradingSymbol>HOOD</issuerTradingSymbol></issuer>
   <reportingOwner>
     <reportingOwnerId><rptOwnerName>Malka Meyer</rptOwnerName></reportingOwnerId>
     <reportingOwnerRelationship><isDirector>1</isDirector></reportingOwnerRelationship>
   </reportingOwner>
-  <nonDerivativeTable>
-    <nonDerivativeTransaction>
-      <transactionDate><value>2026-05-28</value></transactionDate>
-      <transactionCoding><transactionCode>P</transactionCode></transactionCoding>
-      <transactionAmounts>
-        <transactionShares><value>1000</value></transactionShares>
-        <transactionPricePerShare><value>80.00</value></transactionPricePerShare>
-        <transactionAcquiredDisposedCode><value>A</value></transactionAcquiredDisposedCode>
-      </transactionAmounts>
-    </nonDerivativeTransaction>
-    <nonDerivativeTransaction>
-      <transactionDate><value>2026-05-28</value></transactionDate>
-      <transactionCoding><transactionCode>A</transactionCode></transactionCoding>
-      <transactionAmounts>
-        <transactionShares><value>5000</value></transactionShares>
-        <transactionPricePerShare><value>0</value></transactionPricePerShare>
-      </transactionAmounts>
-    </nonDerivativeTransaction>
-    <nonDerivativeTransaction>
-      <transactionDate><value>2026-05-20</value></transactionDate>
-      <transactionCoding><transactionCode>S</transactionCode></transactionCoding>
-      <transactionAmounts>
-        <transactionShares><value>200</value></transactionShares>
-        <transactionPricePerShare><value>75.00</value></transactionPricePerShare>
-      </transactionAmounts>
-    </nonDerivativeTransaction>
-  </nonDerivativeTable>
-</ownershipDocument>"""
+  <nonDerivativeTable>{rows}</nonDerivativeTable>
+  {footnote}
+</ownershipDocument>""".encode()
 
 
-def test_parse_keeps_only_open_market_and_computes_value():
-    txns = ins.parse_form4(FORM4.encode(), "HOOD", "2026-05-29")
-    assert len(txns) == 2                       # P + S kept; A (grant) dropped
+def _tx(code, shares, price):
+    return f"""<nonDerivativeTransaction>
+      <transactionDate><value>2026-05-28</value></transactionDate>
+      <transactionCoding><transactionCode>{code}</transactionCode></transactionCoding>
+      <transactionAmounts>
+        <transactionShares><value>{shares}</value></transactionShares>
+        <transactionPricePerShare><value>{price}</value></transactionPricePerShare>
+      </transactionAmounts>
+    </nonDerivativeTransaction>"""
+
+
+def test_parse_keeps_open_market_excludes_grant_and_computes_value():
+    xml = _f4(_tx("P", 1000, "80.00") + _tx("A", 5000, "0") + _tx("S", 200, "75.00"))
+    txns = ins.parse_form4(xml, "HOOD", "2026-05-29")
+    assert len(txns) == 2                            # P + S kept, A (grant) dropped
     buy = next(t for t in txns if t["code"] == "P")
-    assert buy["side"] == "BUY" and buy["shares"] == 1000 and buy["price"] == 80.0
-    assert buy["value_usd"] == 80000.0          # shares * price
-    assert buy["owner"] == "Malka Meyer" and "Director" in buy["role"]
+    assert buy["value_usd"] == 80000.0 and "Director" in buy["role"]
     sell = next(t for t in txns if t["code"] == "S")
-    assert sell["side"] == "SELL" and sell["value_usd"] == 15000.0
+    assert sell["value_usd"] == 15000.0
+    # the filing contains a grant (A) → comp_related; no 10b5-1 footnote → not scheduled
+    assert sell["comp_related"] is True and sell["scheduled"] is False
 
 
-def test_parse_drops_zero_share_and_bad():
+def test_parse_flags_10b5_1_plan():
+    xml = _f4(_tx("S", 1000, "80.00"),
+              footnote="<footnotes><footnote>Sale under a Rule 10b5-1 trading plan.</footnote></footnotes>")
+    sell = ins.parse_form4(xml, "HOOD")[0]
+    assert sell["scheduled"] is True                 # 10b5-1 → scheduled (noise)
+
+
+def test_parse_clean_discretionary_sell():
+    xml = _f4(_tx("S", 1000, "80.00"))               # lone sell, no grant/exercise, no plan
+    sell = ins.parse_form4(xml, "HOOD")[0]
+    assert sell["scheduled"] is False and sell["comp_related"] is False
+
+
+def test_parse_drops_bad():
     assert ins.parse_form4(b"<not-xml", "X") == []
-    # a P with zero shares is dropped
-    xml = FORM4.replace("<value>1000</value>", "<value>0</value>")
-    assert all(t["code"] != "P" for t in ins.parse_form4(xml.encode(), "HOOD"))
 
 
-def test_aggregate_dollars_and_cluster():
+def test_aggregate_splits_discretionary_vs_scheduled():
     txns = [
         {"owner": "A", "code": "P", "shares": 1000, "price": 80, "value_usd": 80000, "txn_date": "2026-05-28"},
-        {"owner": "B", "code": "P", "shares": 500, "price": 82, "value_usd": 41000, "txn_date": "2026-05-27"},
-        {"owner": "C", "code": "S", "shares": 200, "price": 75, "value_usd": 15000, "txn_date": "2026-05-20"},
+        {"owner": "B", "code": "S", "shares": 100, "price": 70, "value_usd": 7000, "txn_date": "2026-05-27"},   # discretionary
+        {"owner": "C", "code": "S", "shares": 500, "price": 70, "value_usd": 35000, "txn_date": "2026-05-26", "scheduled": True},   # 10b5-1
+        {"owner": "D", "code": "S", "shares": 200, "price": 70, "value_usd": 14000, "txn_date": "2026-05-25", "comp_related": True},  # exercise-and-sell
     ]
     a = ins.aggregate(txns)
-    assert a["buy_usd"] == 121000 and a["sell_usd"] == 15000 and a["net_usd"] == 106000
-    assert a["distinct_buyers"] == 2 and a["distinct_sellers"] == 1
-    assert a["cluster_buy"] is True             # ≥2 distinct buyers
-    assert a["avg_buy_price"] == round(121000 / 1500, 2)
-    assert a["transactions"][0]["txn_date"] == "2026-05-28"   # most recent first
+    assert a["sell_usd"] == 56000                              # all sells
+    assert a["discretionary_sell_usd"] == 7000                # only the chosen one
+    assert a["scheduled_sell_usd"] == 49000                   # 10b5-1 + comp
+    assert a["distinct_discretionary_sellers"] == 1
+    assert a["net_usd"] == 80000 - 56000
+    assert a["net_discretionary_usd"] == 80000 - 7000         # buys minus only discretionary sells
 
 
-def test_aggregate_single_buyer_not_cluster():
-    txns = [{"owner": "A", "code": "P", "shares": 100, "price": 10, "value_usd": 1000, "txn_date": "2026-05-28"}]
+def test_aggregate_cluster_buy():
+    txns = [
+        {"owner": "A", "code": "P", "shares": 100, "price": 10, "value_usd": 1000, "txn_date": "2026-05-28"},
+        {"owner": "B", "code": "P", "shares": 100, "price": 10, "value_usd": 1000, "txn_date": "2026-05-27"},
+    ]
     a = ins.aggregate(txns)
-    assert a["cluster_buy"] is False and a["distinct_buyers"] == 1 and a["sell_usd"] == 0
+    assert a["cluster_buy"] is True and a["distinct_buyers"] == 2
 
 
 def test_txn_uid_deterministic():

@@ -7,9 +7,11 @@ create table if not exists insider_transactions (
   txn_date    date,
   code        text,                              -- P (open-market buy) | S (open-market sell)
   side        text,                              -- BUY | SELL
-  shares      numeric,
-  price       numeric,                           -- price/share transacted
-  value_usd   numeric,                           -- shares * price
+  shares       numeric,
+  price        numeric,                          -- price/share transacted
+  value_usd    numeric,                          -- shares * price
+  scheduled    boolean default false,            -- 10b5-1 pre-scheduled plan (sell = noise)
+  comp_related boolean default false,            -- exercise/grant/conversion in same filing
   accession   text,
   filing_date date,
   created_at  timestamptz not null default now()
