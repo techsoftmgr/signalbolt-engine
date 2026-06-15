@@ -1031,6 +1031,17 @@ async def market_pulse_today():
                 "note": "Market Pulse has not been computed yet — first run is after today's close."}
     g = guidance.build(row.get("regime"), row.get("vix_band"), row.get("vix_rising"))
     g["summary"] = guidance.summary_line(row)
+    # Rare thrust/breakdown → attach the concrete playbook (SPY/QQQ 9/20 levels +
+    # how-to + not-advice). Only computed on the rare days it fires; fails open.
+    try:
+        if row.get("breadth_thrust") or row.get("breadth_breakdown"):
+            from engine.market_pulse import playbook
+            direction = "thrust" if row.get("breadth_thrust") else "breakdown"
+            pb = await anyio.to_thread.run_sync(playbook.build, direction)
+            if pb:
+                g["playbook"] = pb
+    except Exception:
+        pass
     return {"available": True, **row, "guidance": g}
 
 

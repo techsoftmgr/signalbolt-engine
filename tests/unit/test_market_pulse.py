@@ -213,3 +213,57 @@ def test_guidance_build_has_disclaimer_and_vix_line():
     assert "high" in g["vix_line"].lower()
     # VIX null → unavailable line
     assert "unavailable" in guidance.build(C.CONFIRMED_UPTREND, None, None)["vix_line"].lower()
+
+# ── Thrust / breakdown playbook (SPY/QQQ 9/20 levels) ───────────────────────
+from engine.market_pulse import playbook
+
+
+def test_playbook_classify_thrust_status_and_trigger():
+    # ema9=591, ema20=588 → zone 588..591, reclaim trigger = the higher EMA (591)
+    above = playbook.classify("thrust", last=594.0, ema9=591.0, ema20=588.0)
+    assert above["status"] == "above" and above["trigger"] == 591.0
+    assert above["zlow"] == 588.0 and above["zhigh"] == 591.0
+    inzone = playbook.classify("thrust", last=589.5, ema9=591.0, ema20=588.0)
+    assert inzone["status"] == "in_zone" and inzone["trigger"] == 591.0
+    below = playbook.classify("thrust", last=585.0, ema9=591.0, ema20=588.0)
+    assert below["status"] == "below" and below["trigger"] == 591.0
+
+
+def test_playbook_classify_breakdown_status_and_trigger():
+    # loss trigger for a breakdown = the LOWER EMA (588)
+    below = playbook.classify("breakdown", last=585.0, ema9=591.0, ema20=588.0)
+    assert below["status"] == "below" and below["trigger"] == 588.0
+    inzone = playbook.classify("breakdown", last=589.5, ema9=591.0, ema20=588.0)
+    assert inzone["status"] == "in_zone" and inzone["trigger"] == 588.0
+    above = playbook.classify("breakdown", last=594.0, ema9=591.0, ema20=588.0)
+    assert above["status"] == "above" and above["trigger"] == 588.0
+
+
+def test_playbook_classify_handles_inverted_emas():
+    # ema9 below ema20 (price recently dipped) — zone bounds still order correctly
+    c = playbook.classify("thrust", last=600.0, ema9=588.0, ema20=591.0)
+    assert c["zlow"] == 588.0 and c["zhigh"] == 591.0 and c["trigger"] == 591.0
+
+
+def test_playbook_build_attaches_spy_qqq_levels(monkeypatch):
+    # Steady uptrend → last close above both EMAs → a thrust playbook with concrete levels.
+    closes = [100.0 + i * 0.5 for i in range(40)]
+    monkeypatch.setattr(playbook.data, "index_bars", lambda sym, days=80: _df(closes))
+    pb = playbook.build("thrust")
+    assert pb is not None
+    assert pb["direction"] == "thrust"
+    assert [lv["symbol"] for lv in pb["levels"]] == ["SPY", "QQQ"]
+    spy = pb["levels"][0]
+    # uptrend → fast EMA above slow EMA, last above both → reclaim already done
+    assert spy["ema9"] > spy["ema20"]
+    assert spy["status"] == "above"
+    assert spy["trigger"] == spy["zone_high"]
+    assert str(spy["last"]) in spy["note"]          # the actual number is in the copy
+    assert "how_to" in pb and len(pb["how_to"]) == 3
+    assert "Not a prompt to buy" in pb["not_advice"]
+
+
+def test_playbook_build_none_on_no_data(monkeypatch):
+    monkeypatch.setattr(playbook.data, "index_bars", lambda sym, days=80: None)
+    assert playbook.build("thrust") is None
+    assert playbook.build("sideways") is None       # invalid direction
