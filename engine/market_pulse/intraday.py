@@ -207,12 +207,38 @@ def intraday_read(symbol: str, now_et=None) -> dict:
         return {**base, "status": "NEUTRAL", "confidence": conf, "label": _label("NEUTRAL", conf)}
 
 
+_PHRASE = {
+    "ON_PACE_DISTRIBUTION": "on pace for a distribution day",
+    "ON_PACE_STALLING": "on pace for a stalling day",
+    "NEUTRAL": "tracking a normal session",
+    "TOO_EARLY": "too early to call",
+}
+
+
+def _read_summary(indices: dict) -> str:
+    """One plain-English sentence across SPY + QQQ — the intraday equivalent of the
+    EOD 'quick read'. Always flagged provisional."""
+    live = {s: v for s, v in indices.items() if v.get("status") and v["status"] != "MARKET_CLOSED"}
+    if not live:
+        return "Market closed — no intraday read."
+    if all(v["status"] == "TOO_EARLY" for v in live.values()):
+        return "Too early in the session to call — a provisional read appears midday."
+    parts = [f"{s} {_PHRASE.get(v['status'], '')}".strip() for s, v in live.items()]
+    conf = "high" if any(v.get("confidence") == "HIGH" for v in live.values()) else "medium"
+    building = any(v["status"] in ("ON_PACE_DISTRIBUTION", "ON_PACE_STALLING") for v in live.values())
+    tail = " — selling pressure building, not confirmed until the close." if building \
+        else " — provisional, not confirmed until the close."
+    return f"{'; '.join(parts)} ({conf} confidence){tail}"
+
+
 def read_all(now_et=None) -> dict:
-    """{asOf, provisional, indices:{SPY, QQQ}} — provisional, never persisted."""
+    """{asOf, provisional, summary, indices:{SPY, QQQ}} — provisional, never persisted."""
     from datetime import datetime as _dt, timezone as _tz
+    idx = {sym: intraday_read(sym, now_et) for sym in ("SPY", "QQQ")}
     return {
         "provisional": True,
         "asOf": _dt.now(_tz.utc).isoformat(),
+        "summary": _read_summary(idx),
         "disclaimer": "Provisional intraday estimate — the official daily read is confirmed only after the close.",
-        "indices": {sym: intraday_read(sym, now_et) for sym in ("SPY", "QQQ")},
+        "indices": idx,
     }
