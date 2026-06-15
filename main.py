@@ -1096,6 +1096,14 @@ async def admin_paper_close(paper_id: str, request: Request):
     return await anyio.to_thread.run_sync(paper_trading.close_trade, _make_supabase(), paper_id)
 
 
+@app.get("/admin/paper/scorecard")
+async def admin_paper_scorecard(request: Request):
+    _require_admin_jwt(request)
+    import anyio
+    from engine import paper_trading
+    return await anyio.to_thread.run_sync(paper_trading.scorecard_db, _make_supabase())
+
+
 @app.get("/market-pulse/today")
 async def market_pulse_today():
     """Market Pulse — today's market-wide regime verdict + full guidance text +

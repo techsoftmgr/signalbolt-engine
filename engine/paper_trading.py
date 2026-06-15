@@ -219,3 +219,48 @@ def portfolio(sb) -> dict:
         "account": acct, "positions": pos, "counts": counts,
         "realized_pnl_total": round(realized_total, 2), "wins": wins, "losses": losses,
     }
+
+
+def scorecard(rows: list, group_key: str = "detector_source") -> dict:
+    """Pure: closed paper_trades → win-rate + expectancy by detector source. The read
+    that says which detectors are worth trading live. Expectancy = avg realized % per
+    trade (the win-rate × avg-win + loss-rate × avg-loss blend, in one number)."""
+    from collections import defaultdict
+    groups: dict = defaultdict(list)
+    for r in rows:
+        if r.get("status") != "closed":
+            continue
+        key = r.get(group_key) or r.get("strategy_type") or "unknown"
+        groups[key].append(r)
+
+    def _stat(items: list) -> dict:
+        pcts = [float(x["realized_pct"]) for x in items if x.get("realized_pct") is not None]
+        pnls = [float(x.get("realized_pnl") or 0) for x in items]
+        wins = [p for p in pcts if p > 0]
+        losses = [p for p in pcts if p <= 0]
+        n = len(pcts)
+        return {
+            "trades": len(items),
+            "wins": len(wins), "losses": len(losses),
+            "win_rate": round(len(wins) / n * 100, 1) if n else None,
+            "avg_win_pct": round(sum(wins) / len(wins), 2) if wins else None,
+            "avg_loss_pct": round(sum(losses) / len(losses), 2) if losses else None,
+            "expectancy_pct": round(sum(pcts) / n, 2) if n else None,
+            "total_pnl": round(sum(pnls), 2),
+        }
+
+    by = sorted(({"group": k, **_stat(v)} for k, v in groups.items()),
+                key=lambda x: -x["trades"])
+    overall = _stat([r for v in groups.values() for r in v])
+    return {"by_detector": by, "overall": overall}
+
+
+def scorecard_db(sb) -> dict:
+    try:
+        rows = (sb.table("paper_trades")
+                .select("status,realized_pct,realized_pnl,detector_source,strategy_type")
+                .eq("status", "closed").execute().data) or []
+    except Exception as e:
+        logger.error(f"[paper] scorecard query failed: {e}")
+        rows = []
+    return scorecard(rows)
