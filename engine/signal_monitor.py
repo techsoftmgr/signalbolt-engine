@@ -523,6 +523,98 @@ def _update_sl(sb: Client, sig_id: str, new_sl: float, sig: dict | None = None) 
         logger.debug(f"[monitor] stop-protected push check failed for {sig_id}: {e}")
 
 
+# ── Corporate-action (split) guard ──────────────────────────────────────────
+# Alpaca bars are split-ADJUSTED (alpaca_client get_bars/get_latest), but a stored
+# signal's price levels are the NOMINAL values captured at entry. After a split the
+# live price jumps scale (e.g. KLAC 10:1, 2026-06-12: entry ~$2,000 → price ~$200)
+# and every downstream check would book a phantom -90% stop. We detect a CONFIRMED
+# split and rescale the levels instead — never recording a phantom close.
+_SPLIT_RATIOS = (2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 20, 25, 30)
+
+
+def detect_split_factor(old_px, new_px, tol: float = 0.06):
+    """If old_px and new_px look like the same security on two different split
+    scales, return the split factor F such that new ≈ old / F — forward split F>1
+    (price fell ~F×), reverse split 0<F<1 (price rose ~1/F×). Else None. Pure; F is
+    drawn from a curated set of clean ratios matched within `tol`. NOTE: a price that
+    merely halved/tripled also matches here — callers must CONFIRM against split-
+    adjusted history (see _confirm_split_factor) so a real crash never qualifies."""
+    try:
+        old_px = float(old_px); new_px = float(new_px)
+    except (TypeError, ValueError):
+        return None
+    if old_px <= 0 or new_px <= 0:
+        return None
+    ratio = old_px / new_px                       # ≈ F for a forward split
+    for n in _SPLIT_RATIOS:
+        if abs(ratio - n) <= n * tol:             # forward split n:1
+            return float(n)
+        if abs(ratio - 1.0 / n) <= (1.0 / n) * tol:   # reverse split 1:n
+            return 1.0 / n
+    return None
+
+
+def _confirm_split_factor(sig: dict, current_price: float | None):
+    """Return the split factor ONLY if confirmed by split-adjusted history: the
+    stored (nominal) entry must be a clean split-multiple of the split-ADJUSTED close
+    on the signal's own entry date. A real price crash leaves that comparison ≈1, so
+    this fires on an actual split/reverse-split and never on a collapse. The current-
+    price gap is just a cheap pre-filter to avoid fetching bars every cycle."""
+    try:
+        entry = float(sig.get("entry_price") or 0)
+    except (TypeError, ValueError):
+        return None
+    if entry <= 0 or not current_price:
+        return None
+    if detect_split_factor(entry, current_price) is None:   # cheap pre-filter
+        return None
+    try:
+        created = datetime.fromisoformat(sig["created_at"].replace("Z", "+00:00"))
+        age_days = (datetime.now(timezone.utc) - created).days
+        df = _alpaca.get_bars(sig["ticker"], "1Day", days=min(age_days + 6, 400))
+        if df is None or len(df) == 0:
+            return None
+        d0 = created.date()
+        adj_entry_close = None
+        for ts, close in zip(df.index, df["close"]):
+            if ts.date() <= d0:
+                adj_entry_close = float(close)
+            else:
+                break
+        if adj_entry_close is None:
+            return None
+        return detect_split_factor(entry, adj_entry_close)
+    except Exception as e:
+        logger.debug(f"[monitor] split-confirm failed for {sig.get('ticker')}: {e}")
+        return None
+
+
+def _apply_split_adjustment(sb: Client, sig: dict, factor: float) -> None:
+    """Rescale an open signal's price levels by a confirmed split factor so it keeps
+    tracking correctly (forward F>1 divides; reverse F<1 multiplies)."""
+    def _adj(v):
+        try:
+            return round(float(v) / factor, 4) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+    payload = {}
+    for col in ("entry_price", "stop_loss", "target_one", "target_two"):
+        nv = _adj(sig.get(col))
+        if nv is not None:
+            payload[col] = nv
+    if not payload:
+        return
+    try:
+        sb.table("signals").update(payload).eq("id", sig["id"]).execute()
+        logger.warning(
+            f"[monitor] {sig.get('ticker')} SPLIT detected (factor {factor:g}) — rescaled "
+            f"levels (entry {sig.get('entry_price')} -> {payload.get('entry_price')}); "
+            f"no phantom close"
+        )
+    except Exception as e:
+        logger.error(f"[monitor] split adjust failed for {sig.get('id')}: {e}")
+
+
 def _log_event(
     sb: Client,
     signal_id: str,
@@ -760,6 +852,18 @@ def _monitor_stocks(sb: Client) -> None:
         age_mins  = (now_utc - created).total_seconds() / 60
 
         sig_id_str = str(sig["id"])   # convenient alias for push signal_id
+
+        # ── 0. Corporate-action (split) guard ────────────────────────────────
+        # Before ANY price-vs-level check: if a confirmed split moved this name to a
+        # new scale, rescale the stored levels and skip this cycle — never let the
+        # scale jump book a phantom stop (the KLAC 10:1 phantom -90% class of bug).
+        try:
+            _split_factor = _confirm_split_factor(sig, _current_price(ticker))
+            if _split_factor and abs(_split_factor - 1.0) > 1e-9:
+                _apply_split_adjustment(sb, sig, _split_factor)
+                continue
+        except Exception:
+            pass
 
         # ── 1. Scalp time limit (30 min, any time) ───────────────────────────
         if strategy == "scalping" and age_mins >= SCALP_MAX_HOLD_MINS:
