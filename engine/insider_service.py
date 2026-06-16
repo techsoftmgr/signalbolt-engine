@@ -31,7 +31,10 @@ import requests
 logger = logging.getLogger("signalbolt.insider")
 
 _CACHE_KEY = "markets:insiders:v1"
-_TTL = 6 * 3600
+# Short TTL: data now refreshes via the 5-min feed fast-lane, so the cached Insider screen
+# must not lag the (uncached, live) watchlist. build_screen also warms per-ticker caches.
+_TTL = int(os.environ.get("INSIDER_CACHE_TTL", "600"))
+_RECENT_DAYS = int(os.environ.get("INSIDER_RECENT_DAYS", "10"))   # watchlist chip: only surface filings this fresh
 _inflight = threading.Lock()
 
 _WINDOW_DAYS = int(os.environ.get("INSIDER_WINDOW_DAYS", "30"))   # rolling last ~30 days (1 month); older auto-pruned
@@ -425,6 +428,13 @@ def build_screen(sb, window_days: int = _WINDOW_DAYS, limit: int = 60) -> dict:
     items = []
     for tk, txns in by_ticker.items():
         agg = aggregate(txns, window_days)
+        # Warm the per-ticker cache with the SAME shape summarize_ticker returns, so the
+        # ticker hub / search and the (uncached, live) watchlist stay consistent with this
+        # screen and never serve a stale 6h snapshot when fresh filings land.
+        try:
+            cache.kv.set_json(f"insiders:ticker:{tk}", {"ticker": tk, **agg}, _TTL)
+        except Exception:
+            pass
         # Skip names whose only activity is scheduled 10b5-1 / comp selling (no buys,
         # no discretionary sells) — pure noise, would just show as $0 net.
         if agg["buy_usd"] <= 0 and agg["discretionary_sell_usd"] <= 0:
@@ -489,6 +499,26 @@ def summarize_ticker(sb, ticker: str, window_days: int = _WINDOW_DAYS) -> dict:
     return out
 
 
+def _recent_discretionary(txns: list[dict], days: int = _RECENT_DAYS) -> dict:
+    """Pure: open-market DISCRETIONARY (non-10b5-1, non-comp) buys/sells whose EDGAR filing
+    is within the last `days`. Powers the watchlist chip — recent, high-conviction activity
+    only, with the public (filing) date, dropping anything older. P/S; scheduled excluded."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+    def _pub(t):                                   # EDGAR-public date preferred, txn date fallback
+        return t.get("filing_date") or t.get("txn_date") or ""
+    recent = [t for t in txns if _pub(t) >= cutoff and not t.get("scheduled") and not t.get("comp_related")]
+    buys = [t for t in recent if t["code"] == "P"]
+    sells = [t for t in recent if t["code"] == "S"]
+    dates = [_pub(t) for t in (buys + sells) if _pub(t)]
+    return {
+        "buy_usd": round(sum(t["value_usd"] for t in buys), 2),
+        "sell_usd": round(sum(t["value_usd"] for t in sells), 2),
+        "buy_count": len(buys), "sell_count": len(sells),
+        "latest_date": max(dates) if dates else None,   # ISO yyyy-mm-dd of the freshest filing
+        "window_days": days,
+    }
+
+
 def summary_batch(sb, tickers: list[str], window_days: int = _WINDOW_DAYS) -> dict:
     """Compact per-ticker summaries for the watchlist (TABLE-ONLY → fast; one query).
     Tickers with no stored open-market activity are simply absent."""
@@ -512,5 +542,6 @@ def summary_batch(sb, tickers: list[str], window_days: int = _WINDOW_DAYS) -> di
             "buy_usd": a["buy_usd"], "discretionary_sell_usd": a["discretionary_sell_usd"],
             "distinct_buyers": a["distinct_buyers"],
             "cluster_buy": a["cluster_buy"], "cluster_sell": a["cluster_sell"],
+            "recent": _recent_discretionary(txns),   # last-10d discretionary buys/sells + date (watchlist chip)
         }
     return out

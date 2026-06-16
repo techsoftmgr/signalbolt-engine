@@ -145,3 +145,22 @@ def test_feed_extracts_issuer_ciks_only():
 
 def test_feed_handles_garbage():
     assert ins._issuer_ciks_from_feed(b"not xml") == (set(), 0)
+
+
+# ── Watchlist chip: recent (10d) discretionary only ─────────────────────────
+def test_recent_discretionary_window_and_filters():
+    from datetime import datetime, timezone, timedelta
+    today = datetime.now(timezone.utc).date()
+    def d(n): return (today - timedelta(days=n)).isoformat()
+    txns = [
+        {"code": "P", "value_usd": 2_000_000, "scheduled": False, "comp_related": False, "filing_date": d(2)},
+        {"code": "S", "value_usd": 1_500_000, "scheduled": False, "comp_related": False, "filing_date": d(5)},
+        {"code": "S", "value_usd": 9_000_000, "scheduled": True,  "comp_related": False, "filing_date": d(1)},  # 10b5-1 → out
+        {"code": "S", "value_usd": 8_000_000, "scheduled": False, "comp_related": True,  "filing_date": d(1)},  # comp → out
+        {"code": "P", "value_usd": 5_000_000, "scheduled": False, "comp_related": False, "filing_date": d(40)}, # too old → out
+    ]
+    r = ins._recent_discretionary(txns, days=10)
+    assert r["buy_usd"] == 2_000_000 and r["sell_usd"] == 1_500_000
+    assert r["buy_count"] == 1 and r["sell_count"] == 1
+    assert r["latest_date"] == d(2)         # freshest kept filing
+    assert r["window_days"] == 10
