@@ -54,23 +54,30 @@ def follow_through_day(
     min_gain: float = C.FTD_MIN_GAIN,
     min_day: int = C.FTD_MIN_DAY,
     recent_window: int = C.FTD_RECENT,
+    attempt_window: int = C.FTD_ATTEMPT,
     lookback: int = C.FTD_LOOKBACK,
 ) -> bool:
-    """IBD follow-through day: on day `min_day`+ of a rally attempt off a recent low, the
+    """IBD follow-through day: on day `min_day`+ of a rally attempt off a RECENT low, the
     index closes UP >= `min_gain`% on HIGHER volume than the prior day. Returns True if such
     a day occurred within the last `recent_window` sessions AND the rally low has held since.
-    A fresh FTD off a low is IBD's classic 'the uptrend has resumed' confirmation."""
+
+    The rally-attempt low is the lowest close within the last `attempt_window` sessions — a
+    FRESH pullback low — NOT a months-old low; otherwise any strong up day would be trivially
+    'day 4+' and confirm prematurely (e.g. on the first bounce off a recent pullback)."""
     if df is None or len(df) < min_day + 2:
         return False
-    sub = df.tail(lookback)
+    sub = df.tail(lookback).dropna(subset=["close", "volume"])
+    if len(sub) < min_day + 2:
+        return False
     closes = sub["close"].to_numpy(dtype=float)
     vols = sub["volume"].to_numpy(dtype=float)
     n = len(closes)
-    low_i = int(closes.argmin())                  # rally-attempt low = lowest close in the window
-    if low_i >= n - min_day:                       # too few sessions since the low to form a FTD yet
+    start = max(0, n - attempt_window)             # anchor the low to the RECENT attempt only
+    low_i = start + int(closes[start:].argmin())
+    if low_i >= n - min_day:                        # too few sessions since the recent low → too early
         return False
-    for i in range(low_i + min_day, n):            # candidate FTD = day `min_day`+ off the low
-        if (n - 1 - i) > recent_window:            # must be a RECENT (fresh) follow-through
+    for i in range(low_i + min_day, n):             # candidate FTD = day `min_day`+ off the recent low
+        if (n - 1 - i) > recent_window:             # must be a RECENT (fresh) follow-through
             continue
         gain = (closes[i] / closes[i - 1] - 1.0) * 100.0
         if gain >= min_gain and vols[i] > vols[i - 1]:

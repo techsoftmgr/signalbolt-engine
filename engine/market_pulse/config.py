@@ -44,7 +44,10 @@ BREADTH_THRUST_WINDOW = 10   # the low→high surge must happen within this many
 FTD_MIN_GAIN  = 1.25     # index closes up >= 1.25% ...
 FTD_MIN_DAY   = 4        # ... on day 4+ of the rally attempt off the low ...
 FTD_RECENT    = 5        # ... and the FTD is within the last 5 sessions (a FRESH confirmation)
-FTD_LOOKBACK  = 35       # window to locate the rally-attempt low
+FTD_ATTEMPT   = 12       # the rally-attempt low must be a RECENT low (within this many sessions),
+                         # so a FTD fires off the CURRENT pullback — not a months-old low (which
+                         # would make any strong day trivially "day 4+" and confirm prematurely)
+FTD_LOOKBACK  = 35       # bars to slice for the computation
 
 # ── Pillar 5: VIX bands ────────────────────────────────────────────────────
 VIX_CALM_MAX      = 15.0     # < 15 = calm
