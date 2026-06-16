@@ -89,6 +89,16 @@ def get(sym: str) -> dict:
         eps = _polygon_eps(sym)
         if eps is not None:
             data["eps"] = eps
+        # Actual NEXT earnings date (Finnhub, itself 12h-cached) so the watchlist can show
+        # "10 Mar 2026" instead of just the reporting quarter. Best-effort; rides along in
+        # this 24h-cached payload so the snapshot path makes no extra per-ticker calls.
+        try:
+            from engine import earnings_service
+            ne = earnings_service.get_next_earnings(sym)
+            if ne and ne.get("date"):
+                data["earnings_date"] = ne["date"]   # ISO yyyy-mm-dd
+        except Exception:
+            pass
     else:
         data.pop("earnings_period", None)
     try:

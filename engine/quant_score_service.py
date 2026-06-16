@@ -324,6 +324,8 @@ def snapshot(tickers: list[str]) -> dict:
                     row["marketCap"] = f["market_cap"]
                 if f.get("earnings_period"):
                     row["earningsPeriod"] = f["earnings_period"]
+                if f.get("earnings_date"):
+                    row["earningsDate"] = f["earnings_date"]   # actual ISO date for "10 Mar 2026"
                 eps, px = f.get("eps"), row.get("price")
                 if eps and px and eps > 0:
                     row["peRatio"] = round(float(px) / float(eps), 1)
