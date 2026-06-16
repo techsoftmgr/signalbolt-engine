@@ -3592,6 +3592,44 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled Market Pulse daily at 4:45 PM ET (Mon-Fri)")
 
+    # ── Market Pulse CATCH-UP — self-heal a missed/failed daily run ──────────
+    # The 4:45 PM run fires once/day; if the market-data feed is down at that moment
+    # (e.g. the 2026-06-15 dead-key window) run_daily aborts with {} and the day gets
+    # NO row, silently. This hourly check re-runs run_daily whenever the latest stored
+    # row is behind the most recent SETTLED session — so a failed run recovers as soon
+    # as data is back, and a deploy backfills any gap on boot. Idempotent (upsert on date);
+    # run_daily only fires on an actual gap, so steady-state this is just a cheap read.
+    def _run_market_pulse_catchup():
+        try:
+            from datetime import datetime as _dt, timedelta as _td
+            from zoneinfo import ZoneInfo as _ZI
+            from engine import market_pulse
+            now_et = _dt.now(_ZI("America/New_York"))
+            d = now_et.date()
+            if now_et.hour < 17:          # before ~5pm the same-day daily owns today → target the prior session
+                d = d - _td(days=1)
+            while d.weekday() >= 5:        # skip Sat/Sun back to Friday
+                d = d - _td(days=1)
+            target = d.isoformat()
+            sb = _supabase()
+            latest = (market_pulse.store.get_today(sb) or {}).get("date")
+            if latest and latest >= target:
+                return                      # already current — nothing to catch up
+            logger.info(f"[runner] Market Pulse CATCH-UP: stored={latest} < target={target} — running run_daily")
+            market_pulse.run_daily(sb)
+        except Exception as _e:
+            logger.error(f"[runner] market pulse catch-up failed: {_e}")
+
+    scheduler.add_job(
+        _run_market_pulse_catchup,
+        trigger=IntervalTrigger(minutes=60),
+        id="market_pulse_catchup",
+        name="Market Pulse catch-up (hourly; fills a missed daily run)",
+        replace_existing=True, max_instances=1, coalesce=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=120),
+    )
+    logger.info("[runner] Scheduled Market Pulse catch-up (hourly + on boot)")
+
     # ── Sector Leaders — daily RS ranking of the 11 SPDR sectors, 4:50 PM ET
     # (just after Market Pulse, both post-close). Standalone; trading-day gated. ──
     def _run_sector_leaders():

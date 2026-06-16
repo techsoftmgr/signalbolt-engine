@@ -327,6 +327,18 @@ def _episode_metrics(ep: dict, bars, spy_bars, cfg: dict) -> dict:
 
 
 # ── aggregate scorecard ──────────────────────────────────────────────────────
+def _regime_by_date(sb, since_iso: str) -> dict:
+    """{date: market-pulse regime} for the window, so each episode can be correlated to the
+    EOD market regime it fired in — joined by session date, no per-episode stamp needed."""
+    try:
+        rows = (sb.table("market_pulse_daily").select("date,regime")
+                .gte("date", since_iso).execute().data) or []
+        return {r["date"]: r.get("regime") for r in rows if r.get("date")}
+    except Exception as e:
+        logger.debug(f"[breakout_history] regime map failed: {e}")
+        return {}
+
+
 def _scorecard(eps: list[dict], days: int, cfg: dict) -> dict:
     total     = len(eps)
     triggered = [e for e in eps if e.get("triggeredAt")]
@@ -358,8 +370,16 @@ def _scorecard(eps: list[dict], days: int, cfg: dict) -> dict:
             "edgeVsSpyPct": round(ar - ab, 2) if (ar is not None and ab is not None) else None,
         }
 
+    # Per-market-regime segmentation — episodes correlated to the EOD market regime they
+    # fired in (joined by session date → market_pulse_daily). Surfaces edge PER regime, so
+    # a bucket's regime-dependence (mean-reversion vs momentum tape) is visible, not blended.
+    _reg: dict = {}
+    for e in eps:
+        _reg.setdefault(e.get("regime") or "UNKNOWN", []).append(e)
+
     return {
         "windowDays":      days,
+        "byRegime":        {rg: _seg(sub) for rg, sub in _reg.items()},
         "goodDirection":   cfg["direction"],
         "volStrong":       _seg([e for e in eps if e.get("volConfirmed") is True]),
         "volWeak":         _seg([e for e in eps if e.get("volConfirmed") is False]),
@@ -414,6 +434,7 @@ def build_history(sb, days: int = 30, limit: int = 120, bucket: str = "breakouts
         except Exception as e:
             logger.debug(f"[breakout_history] bars fetch failed: {e}")
 
+    regime_map = _regime_by_date(sb, since)
     enriched = []
     for ep in eps:
         triggered = bool(ep.get("triggered_at"))
@@ -450,6 +471,7 @@ def build_history(sb, days: int = 30, limit: int = 120, bucket: str = "breakouts
             "formingCurve":     m.get("formingCurve") or [],   # % from the forming/flag day (incl. day 1)
             "formingResultPct": m.get("formingResultPct"),
             "formingDays":      m.get("formingDays") or 0,
+            "regime":           regime_map.get(ep.get("session_date")),
         })
 
     return {"episodes": enriched, "scorecard": _scorecard(enriched, days, cfg),
@@ -491,6 +513,7 @@ def build_all_scorecards(sb, days: int = 30) -> dict:
         except Exception as e:
             logger.debug(f"[breakout_history] all-scorecards bars failed: {e}")
 
+    regime_map = _regime_by_date(sb, since)
     out = []
     for bucket, cfg in _BUCKET_CFG.items():
         rows = []
@@ -501,6 +524,7 @@ def build_all_scorecards(sb, days: int = 30) -> dict:
                 "grade": m["grade"], "resultPct": m["resultPct"],
                 "mfePct": m["mfePct"], "maePct": m["maePct"], "benchmarkPct": m["benchmark_pct"],
                 "volConfirmed": m.get("volConfirmed"),
+                "regime": regime_map.get(ep.get("session_date")),
             })
         out.append({"bucket": bucket, "label": cfg["label"], "scorecard": _scorecard(rows, days, cfg)})
 
