@@ -461,19 +461,26 @@ def build_all_scorecards(sb, days: int = 30) -> dict:
     + one bars fetch, then a per-bucket scorecard. Used to watch edge-vs-SPY
     accumulate across all sections at a glance."""
     since = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
-    try:
-        eps = (
-            sb.table(_TABLE).select("*")
-              .gte("session_date", since)
-              .order("entered_at", desc=True)
-              .limit(3000)
-              .execute()
-        ).data or []
-    except Exception as e:
-        logger.error(f"[breakout_history] all-scorecards fetch failed: {e}")
-        eps = []
+    # Fetch PER BUCKET so a high-volume bucket (vwapReclaim/pullbacks) can't crowd the
+    # low-volume ones (turnaround/peak) out of a single server-row-capped query — the
+    # old global `.limit(3000)` + newest-first ordering hit the ~1000-row PostgREST cap
+    # and silently dropped the older cycle episodes, showing them as 0.
+    by_bucket: dict = {}
+    for bucket in _BUCKET_CFG:
+        try:
+            by_bucket[bucket] = (
+                sb.table(_TABLE).select("*")
+                  .eq("bucket", bucket)
+                  .gte("session_date", since)
+                  .order("entered_at", desc=True)
+                  .limit(1000)
+                  .execute()
+            ).data or []
+        except Exception as e:
+            logger.debug(f"[breakout_history] all-scorecards fetch {bucket} failed: {e}")
+            by_bucket[bucket] = []
 
-    tickers  = sorted({e["ticker"] for e in eps if e.get("ticker")})
+    tickers  = sorted({e["ticker"] for rows in by_bucket.values() for e in rows if e.get("ticker")})
     bars_by  = {}
     spy_bars = None
     if tickers:
@@ -483,10 +490,6 @@ def build_all_scorecards(sb, days: int = 30) -> dict:
             spy_bars = bars_by.get("SPY")
         except Exception as e:
             logger.debug(f"[breakout_history] all-scorecards bars failed: {e}")
-
-    by_bucket: dict = {}
-    for ep in eps:
-        by_bucket.setdefault(ep.get("bucket") or "breakouts", []).append(ep)
 
     out = []
     for bucket, cfg in _BUCKET_CFG.items():
