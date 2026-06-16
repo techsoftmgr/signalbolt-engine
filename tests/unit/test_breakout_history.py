@@ -53,3 +53,19 @@ def test_all_scorecards_fetches_per_bucket_no_truncation(monkeypatch):
     assert totals.get("vwapReclaim") == 900
     assert {"breakouts", "breakdowns", "topMomentum", "pullbacks", "highVolumeUp",
             "highVolumeDown", "vwapReclaim", "oversoldBounce", "turnaround", "peak"} <= set(totals)
+
+
+def test_scorecard_segments_by_regime():
+    cfg = bh.bucket_cfg("breakouts")   # up bucket
+    eps = [
+        {"regime": "CONFIRMED_UPTREND", "outcome": "win",  "resultPct": 5.0,  "benchmarkPct": 1.0,  "mfePct": 6, "maePct": -1},
+        {"regime": "CONFIRMED_UPTREND", "outcome": "loss", "resultPct": -2.0, "benchmarkPct": 1.0,  "mfePct": 1, "maePct": -3},
+        {"regime": "UNDER_PRESSURE",    "outcome": "loss", "resultPct": -4.0, "benchmarkPct": -1.0, "mfePct": 0, "maePct": -5},
+    ]
+    sc = bh._scorecard(eps, 90, cfg)
+    assert set(sc["byRegime"].keys()) == {"CONFIRMED_UPTREND", "UNDER_PRESSURE"}
+    up = sc["byRegime"]["CONFIRMED_UPTREND"]
+    assert up["n"] == 2 and up["judged"] == 2 and up["wins"] == 1 and up["winRatePct"] == 50
+    assert up["avgResultPct"] == 1.5 and up["edgeVsSpyPct"] == 0.5    # (5-2)/2=1.5 vs bench 1.0
+    dn = sc["byRegime"]["UNDER_PRESSURE"]
+    assert dn["n"] == 1 and dn["avgResultPct"] == -4.0 and dn["edgeVsSpyPct"] == -3.0
