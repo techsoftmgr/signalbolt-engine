@@ -35,6 +35,17 @@ BREADTH_THRUST_LOW    = 0.40
 BREADTH_THRUST_HIGH   = 0.615
 BREADTH_THRUST_WINDOW = 10   # the low→high surge must happen within this many sessions
 
+# ── Pillar 4c: follow-through day (IBD — a rally off a low CONFIRMS the turn) ─
+# On day FTD_MIN_DAY+ of a rally attempt off a recent low, a major index closes up
+# >= FTD_MIN_GAIN% on HIGHER volume than the prior day. A fresh FTD (within the last
+# FTD_RECENT sessions, low still held) historically signals the uptrend has resumed —
+# it soft-UPGRADES the regime so a strong rally off a low flips the read without waiting
+# for the distribution-day count to age out.
+FTD_MIN_GAIN  = 1.25     # index closes up >= 1.25% ...
+FTD_MIN_DAY   = 4        # ... on day 4+ of the rally attempt off the low ...
+FTD_RECENT    = 5        # ... and the FTD is within the last 5 sessions (a FRESH confirmation)
+FTD_LOOKBACK  = 35       # window to locate the rally-attempt low
+
 # ── Pillar 5: VIX bands ────────────────────────────────────────────────────
 VIX_CALM_MAX      = 15.0     # < 15 = calm
 VIX_NORMAL_MAX    = 20.0     # 15-20 = normal

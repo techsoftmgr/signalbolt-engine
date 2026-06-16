@@ -190,6 +190,33 @@ def test_vix_null_fallback_still_resolves_from_pillars():
     assert regime.resolve(**{**_confirmed_inputs(), "dd_max": 6}, vix_level=None, vix_rising=None) == C.CORRECTION
 
 
+# ── Follow-through day (pillar 4c) ──────────────────────────────────────────
+def test_follow_through_day():
+    # decline to a low (idx 4), then a rally; a strong up day on day-4+ off the low,
+    # on HIGHER volume = a follow-through day.
+    closes = [100, 98, 96, 95, 94, 95, 96, 97, 99]
+    vols   = [1e6] * 8 + [2e6]                       # FTD bar (idx 8) trades heavier
+    assert pillars.follow_through_day(_df(closes, vols)) is True
+    # up day too weak (<1.25%) → not a FTD
+    weak = [100, 98, 96, 95, 94, 95, 96, 97, 97.4]
+    assert pillars.follow_through_day(_df(weak, vols)) is False
+    # strong up day but NOT on higher volume → not a FTD
+    assert pillars.follow_through_day(_df(closes, [1e6] * 9)) is False
+    # still falling (low is the latest bar) → no rally attempt yet → too early
+    assert pillars.follow_through_day(_df([100, 99, 98, 97, 96, 95, 94])) is False
+
+
+def test_regime_ftd_soft_upgrade():
+    up = {**_confirmed_inputs(), "dd_max": 5}        # would be UNDER_PRESSURE on the dd count
+    assert regime.resolve(**up) == C.UNDER_PRESSURE
+    assert regime.resolve(**up, follow_through=True) == C.CONFIRMED_UPTREND
+    corr = {**_confirmed_inputs(), "dd_max": 6}      # would be CORRECTION
+    assert regime.resolve(**corr) == C.CORRECTION
+    assert regime.resolve(**corr, follow_through=True) == C.UNDER_PRESSURE   # one tier only, not all the way
+    # a FTD never downgrades an already-confirmed read
+    assert regime.resolve(**_confirmed_inputs(), follow_through=True) == C.CONFIRMED_UPTREND
+
+
 # ── Guidance ────────────────────────────────────────────────────────────────
 def test_summary_line():
     row = {"regime": C.UNDER_PRESSURE, "dd_count_spy": 5, "dd_count_qqq": 4,
