@@ -119,15 +119,17 @@ def run_daily(sb) -> dict:
     vix = pillars.vix_read(data.vix_closes())   # isolated; None on failure
 
     eff_max = _effective_dd_max(dd_spy, dd_qqq, st_spy, st_qqq)
+    ftd = pillars.follow_through_day(spy) or pillars.follow_through_day(qqq)   # FTD on EITHER major index
     reg = regime.resolve(
         dd_max=eff_max, net_nhnl=nh - nl,
         pct_above_50=pct50, pct_above_200=pct200, ad_divergence=div,
         vix_level=(vix or {}).get("close"), vix_rising=(vix or {}).get("rising"),
+        follow_through=ftd,
     )
     row = _build_row(date_iso, dd_spy, dd_qqq, st_spy, st_qqq, nh, nl, pct50, pct200, adv, dec, cum, div, vix, reg,
                      breadth_ratio=br_ratio, breadth_thrust=br_thrust, breadth_breakdown=br_break)
     store.upsert_daily(sb, row)
-    logger.info(f"[market_pulse] {date_iso} regime={reg} eff_dd={eff_max} (dd {dd_spy}/{dd_qqq} stall {st_spy}/{st_qqq}) "
+    logger.info(f"[market_pulse] {date_iso} regime={reg} eff_dd={eff_max} ftd={ftd} (dd {dd_spy}/{dd_qqq} stall {st_spy}/{st_qqq}) "
                 f"nh/nl={nh}/{nl} %50={pct50} %200={pct200} vix={(vix or {}).get('close')}")
     return row
 
