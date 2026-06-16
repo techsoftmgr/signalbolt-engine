@@ -206,6 +206,15 @@ def test_follow_through_day():
     assert pillars.follow_through_day(_df([100, 99, 98, 97, 96, 95, 94])) is False
 
 
+def test_ftd_anchors_to_recent_low_not_old_low():
+    # An old, deeper low (idx 0) sits > attempt_window sessions back; then a flat stretch, a
+    # recent shallow pullback low, and a bounce only 1 day later. Anchored to the OLD low it'd
+    # be "day 19" and fire; anchored to the RECENT low it's day 1 → too early → NOT a FTD.
+    closes = [80] + [100] * 15 + [98, 96, 95, 97]
+    vols   = [1e6] * 19 + [3e6]
+    assert pillars.follow_through_day(_df(closes, vols)) is False
+
+
 def test_regime_ftd_soft_upgrade():
     up = {**_confirmed_inputs(), "dd_max": 5}        # would be UNDER_PRESSURE on the dd count
     assert regime.resolve(**up) == C.UNDER_PRESSURE
