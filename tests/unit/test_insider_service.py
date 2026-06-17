@@ -76,6 +76,26 @@ def test_aggregate_splits_discretionary_vs_scheduled():
     assert a["net_discretionary_usd"] == 80000 - 7000         # buys minus only discretionary sells
 
 
+def test_aggregate_surfaces_discretionary_when_scheduled_noise_exceeds_cap():
+    """Heavily-traded name: the per-ticker list must STILL show the discretionary SIGNAL even
+    when 10b5-1/comp noise from a few insiders exceeds the display cap. This is the DDOG/Pomel
+    bug — a notable sale alerted but was buried past the date-sorted most-recent cut and never
+    shown. The fix always keeps discretionary lines, then fills with recent scheduled."""
+    txns = []
+    # noise: more scheduled (10b5-1) sells than the cap, ALL dated more recently than the signal
+    for i in range(ins._TXN_DISPLAY_CAP + 20):
+        txns.append({"owner": "Noise Insider", "code": "S", "shares": 100, "price": 70,
+                     "value_usd": 7000, "txn_date": f"2026-06-{(i % 28) + 1:02d}", "scheduled": True})
+    # the SIGNAL: one big discretionary sell dated EARLIER (a date-only cut would bury it)
+    txns.append({"owner": "Pomel Olivier", "code": "S", "shares": 26012, "price": 267.15,
+                 "value_usd": 6_949_220, "txn_date": "2026-05-20"})
+    shown = ins.aggregate(txns)["transactions"]
+    assert len(shown) <= ins._TXN_DISPLAY_CAP
+    assert any(t["owner"] == "Pomel Olivier" for t in shown), "discretionary signal must be shown"
+    dates = [t.get("txn_date") for t in shown]
+    assert dates == sorted(dates, reverse=True), "display list stays date-sorted (newest first)"
+
+
 def test_aggregate_cluster_buy():
     txns = [
         {"owner": "A", "code": "P", "shares": 100, "price": 10, "value_usd": 1000, "txn_date": "2026-05-28"},
@@ -100,6 +120,20 @@ def test_summary_batch_compact(monkeypatch):
     assert out["HOOD"]["net_discretionary_usd"] == 80000
     assert out["NVDA"]["discretionary_sell_usd"] == 200000     # discretionary sell
     assert out["NVDA"]["net_discretionary_usd"] == -200000
+
+
+def test_send_insider_alert_stamps_txn_uid(monkeypatch):
+    """The alert row must carry the transaction's txn_uid so the dispatcher can dedup and a
+    given Form-4 transaction alerts at most once (the re-fire bug)."""
+    from engine import push
+    captured = {}
+    def _fake_record(atype, ticker, title, body, stage=None, data=None, **kw):
+        captured.update(type=atype, data=data)
+    monkeypatch.setattr(push, "_record_alert", _fake_record)
+    monkeypatch.setattr(push, "_tokens_for", lambda *a, **k: [])   # no real dispatch
+    push.send_insider_alert("DDOG", "SELL", 6_949_220, "Pomel Olivier", "CEO", txn_uid="abc123")
+    assert captured["type"] == "insider"
+    assert captured["data"]["txn_uid"] == "abc123" and captured["data"]["side"] == "SELL"
 
 
 def test_txn_uid_deterministic():

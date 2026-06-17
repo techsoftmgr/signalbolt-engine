@@ -41,6 +41,7 @@ _WINDOW_DAYS = int(os.environ.get("INSIDER_WINDOW_DAYS", "30"))   # rolling last
 _CLUSTER_MIN_BUYERS = int(os.environ.get("INSIDER_CLUSTER_MIN_BUYERS", "2"))
 _NOTABLE_BUY_USD = float(os.environ.get("INSIDER_NOTABLE_BUY_USD", "250000"))      # single open-market buy alert floor
 _NOTABLE_SELL_USD = float(os.environ.get("INSIDER_NOTABLE_SELL_USD", "1000000"))   # discretionary-sell alert floor (sells noisier → higher bar)
+_TXN_DISPLAY_CAP = int(os.environ.get("INSIDER_TXN_DISPLAY_CAP", "60"))            # per-ticker screen: max transactions shown
 _FEED_COUNT = int(os.environ.get("INSIDER_FEED_COUNT", "100"))                      # getcurrent atom page size
 _FEED_MAX_PAGES = int(os.environ.get("INSIDER_FEED_MAX_PAGES", "3"))               # max pages per feed poll (3×100 = 150 filings of headroom)
 
@@ -140,6 +141,18 @@ def aggregate(txns: list[dict], window_days: int = _WINDOW_DAYS) -> dict:
     buy_sh = sum(t["shares"] for t in buys)
     disc_sell_sh = sum(t["shares"] for t in disc_sells)
     n_buyers = len({t["owner"] for t in buys})
+
+    # Transactions shown on the per-ticker screen. A heavily-traded name can have 100+ Form-4
+    # lines in the window, mostly 10b5-1/comp NOISE from a few insiders — a plain most-recent
+    # cut then buries the SIGNAL lines (discretionary buys + chosen sells — the ones that fire
+    # alerts), so a notable sale can alert yet never appear here (the DDOG/Pomel case). Fix:
+    # always keep every discretionary line, fill the rest with the most-recent scheduled/comp,
+    # then sort by date for display.
+    _by_date = lambda t: (t.get("txn_date") or "")
+    _disc_txns = buys + disc_sells
+    _disc_keep = sorted(_disc_txns, key=lambda t: t.get("value_usd") or 0, reverse=True)[:_TXN_DISPLAY_CAP]
+    _fill = sorted(sched_sells, key=_by_date, reverse=True)[:max(0, _TXN_DISPLAY_CAP - len(_disc_keep))]
+    _display_txns = sorted(_disc_keep + _fill, key=_by_date, reverse=True)
     return {
         "buy_usd": buy_usd, "sell_usd": sell_usd,
         "discretionary_sell_usd": disc_sell_usd,           # the SELL signal (chosen, open-market)
@@ -155,7 +168,7 @@ def aggregate(txns: list[dict], window_days: int = _WINDOW_DAYS) -> dict:
         "cluster_buy": n_buyers >= _CLUSTER_MIN_BUYERS,
         "cluster_sell": len({t["owner"] for t in disc_sells}) >= _CLUSTER_MIN_BUYERS,
         "window_days": window_days,
-        "transactions": sorted(txns, key=lambda t: (t.get("txn_date") or ""), reverse=True)[:25],
+        "transactions": _display_txns,
     }
 
 
