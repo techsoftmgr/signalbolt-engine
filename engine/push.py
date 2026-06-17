@@ -470,6 +470,7 @@ def send_insider_alert(
     owner: str = "",
     role: str = "",
     cluster: bool = False,
+    txn_uid: str = "",
 ) -> int:
     """Broadcast an OPEN-MARKET insider buy/sell (SEC Form 4) to all users with the
     'insider_alerts' pref on (default on). NOT watchlist-scoped — surfaces conviction
@@ -485,8 +486,10 @@ def send_insider_alert(
             title = f"🔴 {ticker} — Insider selling"
             body = f"{who} sold {amt} of {ticker} on the open market (discretionary). Tap for the read."
 
+        # txn_uid stamped into the alert row so the dispatcher can dedup: a given Form-4
+        # transaction must alert AT MOST ONCE, even if a later refresh re-parses the filing.
         _record_alert("insider", ticker, title, body, stage=side,
-                      data={"ticker": ticker, "side": side})
+                      data={"ticker": ticker, "side": side, "txn_uid": txn_uid})
 
         tokens = _tokens_for("insider_alerts", default=True)
         if not tokens:

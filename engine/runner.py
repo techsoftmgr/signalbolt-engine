@@ -3166,20 +3166,36 @@ def start_scheduler() -> BackgroundScheduler:
     # heavily right after the 4 PM ET close). BACKSTOP: a full per-CIK universe sweep 3×/day
     # catches anything the feed paged past during the post-close cluster or missed across a
     # restart. Form 4s must be filed within ~2 business days of the trade. ──
-    def _dispatch_insider_alerts(push, stats):
-        """Push the strongest NEW open-market buys/sells (capped). Dedup is implicit — a
-        refresh only processes filings not already stored, so each fires at most once."""
-        for t in sorted(stats.get("notable_buys", []), key=lambda x: -x["value_usd"])[:5]:
-            push.send_insider_alert(t["ticker"], "BUY", t["value_usd"], t.get("owner", ""), t.get("role", ""))
-        for t in sorted(stats.get("notable_sells", []), key=lambda x: -x["value_usd"])[:3]:
-            push.send_insider_alert(t["ticker"], "SELL", t["value_usd"], t.get("owner", ""), t.get("role", ""))
+    def _dispatch_insider_alerts(push, stats, sb):
+        """Push the strongest NEW open-market buys/sells (capped), with a DURABLE per-transaction
+        guard so each Form-4 transaction alerts AT MOST ONCE, ever. The parse/seen filter is only
+        best-effort dedup — it silently degrades to "re-parse everything" if its load query errors
+        (e.g. on a cold worker start right after a redeploy), which otherwise re-fires weeks-old
+        filings as if fresh (the DDOG/Pomel case). The global, never-pruned alerts table is the
+        ledger: we skip any transaction whose txn_uid was already alerted."""
+        from engine.insider_service import _txn_uid
+        cands = ([("BUY", t) for t in sorted(stats.get("notable_buys", []), key=lambda x: -x["value_usd"])[:5]]
+                 + [("SELL", t) for t in sorted(stats.get("notable_sells", []), key=lambda x: -x["value_usd"])[:3]])
+        for side, t in cands:
+            uid = _txn_uid(t)
+            if uid:
+                try:
+                    seen = (sb.table("alerts").select("id").eq("type", "insider")
+                            .eq("data->>txn_uid", uid).limit(1).execute().data)
+                    if seen:
+                        continue   # already alerted this exact transaction → don't re-fire
+                except Exception as _de:
+                    logger.debug(f"[runner] insider dedup check failed for {t.get('ticker')}: {_de}")
+            push.send_insider_alert(t["ticker"], side, t["value_usd"],
+                                    t.get("owner", ""), t.get("role", ""), txn_uid=uid)
 
     def _run_insider_feed():
         try:
             from engine import insider_service, push
-            stats = insider_service.refresh_from_feed(_supabase())
+            sb = _supabase()
+            stats = insider_service.refresh_from_feed(sb)
             if stats.get("new_transactions"):
-                _dispatch_insider_alerts(push, stats)
+                _dispatch_insider_alerts(push, stats, sb)
         except Exception as _e:
             logger.error(f"[runner] insider feed poll failed: {_e}")
 
@@ -3189,7 +3205,7 @@ def start_scheduler() -> BackgroundScheduler:
             sb = _supabase()
             stats = insider_service.refresh_universe(sb)
             insider_service.build_screen(sb)
-            _dispatch_insider_alerts(push, stats)
+            _dispatch_insider_alerts(push, stats, sb)
         except Exception as _e:
             logger.error(f"[runner] insider refresh failed: {_e}")
 
