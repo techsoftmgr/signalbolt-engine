@@ -1030,6 +1030,13 @@ def _dispatch(messages: list[dict], label: str) -> None:
     if not messages:
         logger.info(f"[push] No messages to dispatch for: {label}")
         return
+    # Route every Android notification to the app's MAX-importance 'signals' channel
+    # (created in lib/notifications.ts) so it shows as a heads-up alert; WITHOUT an explicit
+    # channelId Android drops it onto a low-importance default channel (silent / easily
+    # missed). iOS ignores channelId. high priority = prompt delivery out of Doze.
+    for _m in messages:
+        _m.setdefault("channelId", "signals")
+        _m.setdefault("priority", "high")
     try:
         resp = requests.post(
             EXPO_PUSH_URL,
