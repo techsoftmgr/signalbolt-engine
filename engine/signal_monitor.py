@@ -39,6 +39,7 @@ from supabase import create_client, Client
 from engine import smc, push
 from engine import alpaca_client as _alpaca
 from engine import exit_intelligence
+from engine import trend_ride
 
 logger = logging.getLogger("signalbolt.monitor")
 
@@ -523,6 +524,22 @@ def _update_sl(sb: Client, sig_id: str, new_sl: float, sig: dict | None = None) 
         logger.debug(f"[monitor] stop-protected push check failed for {sig_id}: {e}")
 
 
+def _set_trend_ride_flag(sb: Client, sig: dict, on: bool) -> None:
+    """Persist the trend_ride state inside score_breakdown so (a) the expiry/early-exit
+    paths can tell a riding swing apart and (b) the feature's effect is measurable.
+    Idempotent — only writes when the flag actually changes. Mutates `sig` in place so
+    the rest of this pass sees the new state."""
+    bd = dict(sig.get("score_breakdown") or {})
+    if bool(bd.get("trend_ride")) == bool(on):
+        return
+    bd["trend_ride"] = bool(on)
+    sig["score_breakdown"] = bd
+    try:
+        sb.table("signals").update({"score_breakdown": bd}).eq("id", sig["id"]).execute()
+    except Exception as e:
+        logger.debug(f"[monitor] trend_ride flag update failed for {sig.get('id')}: {e}")
+
+
 # ── Corporate-action (split) guard ──────────────────────────────────────────
 # Alpaca bars are split-ADJUSTED (alpaca_client get_bars/get_latest), but a stored
 # signal's price levels are the NOMINAL values captured at entry. After a split the
@@ -908,7 +925,11 @@ def _monitor_stocks(sb: Client) -> None:
         #
         # This replaces the old dumb 3:30 PM blanket close that killed
         # winning trades mid-power-hour.
-        if near_close and strategy in INTRADAY_STRATEGIES:
+        # A DAILY-timeframe signal is a multi-day swing by definition — never force it
+        # flat at the bell even if its strategy label looks intraday (HOOD post-mortem:
+        # swings must carry overnight; the May 28–29 +14% gap happened overnight).
+        _is_daily_tf = str(sig.get("timeframe") or "").strip().lower() in ("1day", "1d", "d", "daily")
+        if near_close and strategy in INTRADAY_STRATEGIES and not _is_daily_tf:
             price   = _current_price(ticker)
             entry   = float(sig.get("entry_price") or 0)
             is_long = direction == "LONG"
@@ -1076,6 +1097,52 @@ def _monitor_stocks(sb: Client) -> None:
                 )
         except Exception as e:
             logger.debug(f"[monitor] Status tracking error for {ticker}: {e}")
+
+        # ── 3b. Trend-ride: let a confirmed-green SWING run (HOOD post-mortem) ──
+        # When a swing is green AND holding above a RISING 20-day MA, stop managing it
+        # like a day-trade: trail the hard stop UNDER the recent daily swing low (ratchet
+        # up only) and SKIP the early exits below (T1→BE tighten, peak-trail, intelligent
+        # exit, near-expiry book, structure_reversal). Exit the ride only on a DECISIVE
+        # daily CLOSE back through the 20-MA — intraday wicks never exit (HOOD 06-10 wicked
+        # to $84 but CLOSED $86, then ran to $110). The hard stop + T1/T2 BACKSTOP above
+        # still fire. Gated by TREND_RIDE_ENABLED; tagged (score_breakdown.trend_ride).
+        _det_src = (sig.get("score_breakdown") or {}).get("detector_source")
+        if (trend_ride.enabled() and trend_ride.is_swing(sig)
+                and _det_src != "EMA_RECLAIM"):   # EMA_RECLAIM has its own 15m ride logic below
+            try:
+                _ctx = trend_ride.daily_context(ticker)
+                _tr  = trend_ride.evaluate(sig, price, _ctx) if _ctx else None
+                if _tr and _tr["break_exit"]:
+                    logger.info(f"[monitor] {ticker} trend-ride EXIT — daily close {_tr['last_close']:.2f} "
+                                f"{'<' if is_long else '>'} 20-MA {_tr['ma20']:.2f}")
+                    _close_signal(sb, sig["id"], "trend_break",
+                                  current_price=price, entry_price=entry, direction=direction, ticker=ticker)
+                    _log_event(sb, sig["id"], "trend_break", price=price,
+                               note=(f"📉 Daily close {_tr['last_close']:.2f} crossed back through the 20-MA "
+                                     f"{_tr['ma20']:.2f} — trend-ride exit @ ${price:.2f} "
+                                     f"({'+' if pnl_pct >= 0 else ''}{pnl_pct:.1f}%)"))
+                    _set_trend_ride_flag(sb, sig, False)
+                    _STATUS_CACHE.pop(sig["id"], None)
+                    _SWING_PEAK.pop(sig["id"], None)
+                    continue
+                if _tr and _tr["active"]:
+                    _set_trend_ride_flag(sb, sig, True)
+                    _new_sl  = _tr["trail_sl"]
+                    _ratchet = (_new_sl > sl + 0.01) if is_long else (_new_sl < sl - 0.01)
+                    if _ratchet:
+                        _update_sl(sb, sig["id"], _new_sl, sig=sig)
+                        _log_event(sb, sig["id"], "be_move", price=price,
+                                   note=(f"🏄 Trend-ride: stop → ${_new_sl:.2f} under the daily swing low "
+                                         f"(riding the rising 20-MA ${_tr['ma20']:.2f})"))
+                        logger.info(f"[monitor] {ticker} trend-ride trail → {_new_sl:.2f} "
+                                    f"(20-MA {_tr['ma20']:.2f}, pnl {pnl_pct:+.1f}%)")
+                    continue   # ride on — skip the early-exit machinery below
+                # No longer riding (lost green, or never cleared the MA) — clear any stale
+                # flag and fall through to normal management.
+                if _tr and _tr["was_riding"]:
+                    _set_trend_ride_flag(sb, sig, False)
+            except Exception as _e:
+                logger.debug(f"[monitor] trend_ride error for {ticker}: {_e}")
 
         # ── 4. T1 hit → move SL to breakeven ─────────────────────────────────
         try:
