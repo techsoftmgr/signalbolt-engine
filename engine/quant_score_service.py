@@ -40,6 +40,13 @@ _SCORED_TS_KEY     = "quant:scored:v1:asOf" # ISO timestamp of the last universe
 # data source after hours) — slightly-stale chips beat empty ones. Healthy refreshes
 # overwrite it well within this window.
 _SCORED_TTL: int   = int(os.environ.get("QUANT_SCORED_TTL", "28800"))   # 8h
+# Per-ticker cache for CUSTOM watchlist tickers scored ON DEMAND (names NOT in the universe scan).
+# Without this, snapshot() re-fetched 60d daily + 2d 5-min bars and re-scored every such ticker on
+# EVERY watchlist load — the "vol/RSI/signal takes a while to show" lag. Cache each freshly-scored
+# row so the next load (any user, within the TTL) serves it warm. Short TTL keeps intraday relVol/
+# RSI reasonably fresh; universe names stay on the 3-min worker refresh.
+_SNAP_KEY          = "quant:snap:"   # + TICKER → one freshly-scored row
+_SNAP_TTL: int     = int(os.environ.get("QUANT_SNAP_TTL", "180"))   # 3 min
 
 # ~1y daily bars barely change intraday — cache them so we don't refetch
 # ~150×250 bars on every dashboard build.
@@ -277,8 +284,22 @@ def snapshot(tickers: list[str]) -> dict:
     except Exception:
         cached = {}
 
-    # 2) Score the ones not in the universe (custom watchlist tickers), batched.
-    missing = [t for t in syms if t not in cached]
+    # 1b) Per-ticker on-demand cache: custom (non-universe) tickers scored on a PRIOR load.
+    #     This is what stops the watchlist re-fetching + re-scoring them every time.
+    pt_cached: dict = {}
+    for tk in syms:
+        if tk in cached:
+            continue
+        try:
+            r = cache.kv.get_json(_SNAP_KEY + tk)
+            if r:
+                pt_cached[tk] = r
+        except Exception:
+            pass
+
+    # 2) Score the ones we have NEITHER in the universe NOR the per-ticker cache, batched —
+    #    and write each result to the per-ticker cache so the next load serves it warm.
+    missing = [t for t in syms if t not in cached and t not in pt_cached]
     scored_missing: dict = {}
     if missing:
         try:
@@ -302,13 +323,17 @@ def snapshot(tickers: list[str]) -> dict:
                     )
                     if row:
                         scored_missing[tk] = row
+                        try:
+                            cache.kv.set_json(_SNAP_KEY + tk, row, _SNAP_TTL)   # warm for next load
+                        except Exception:
+                            pass
                 except Exception:
                     pass
         except Exception as e:
             logger.debug(f"[quant.snapshot] scoring missing tickers failed: {e}")
 
     for tk in syms:
-        r = cached.get(tk) or scored_missing.get(tk)
+        r = cached.get(tk) or pt_cached.get(tk) or scored_missing.get(tk)
         if r:
             out[tk] = {k: r.get(k) for k in _SNAPSHOT_KEEP}
 
