@@ -3225,6 +3225,25 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled insider Form-4: feed poll 5m + full sweep 3×/day (8:15/13:15/20:15 ET)")
 
+    # ── Churn/Absorption daily snapshot (resolution scorecard, measure-only) ──
+    def _run_churn_snapshot():
+        try:
+            from engine import churn_history
+            from engine.session_classifier import is_market_open_today
+            if not is_market_open_today():
+                return
+            churn_history.snapshot_today(_supabase())
+        except Exception as _e:
+            logger.error(f"[runner] churn snapshot failed: {_e}")
+
+    scheduler.add_job(
+        _run_churn_snapshot,
+        trigger=CronTrigger(hour=16, minute=45, timezone="America/New_York"),
+        id="churn_snapshot", name="Churn/Absorption daily snapshot (4:45 PM ET, trading days)",
+        replace_existing=True, max_instances=1, coalesce=True,
+    )
+    logger.info("[runner] Scheduled churn/absorption daily snapshot (4:45 PM ET)")
+
     # ── Overnight (Blue Ocean) display-only price poll ───────────────────────
     # During the ~8pm-4am ET overnight session, poll Alpaca's OVERNIGHT feed for
     # the watched tickers and publish to price_store so the watchlist / quote
