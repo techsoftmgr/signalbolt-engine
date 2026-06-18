@@ -87,8 +87,20 @@ def test_evaluate_flags_event_pin_near_highs():
     assert abs(it["changePct"]) <= 1.5       # but flat today (the pin)
 
 
-def test_evaluate_needs_today_bar():
-    # last bar is NOT `today` → skip (stale / market closed)
+def test_evaluate_rejects_stale_data():
+    # last bar is far in the past (> _STALE_DAYS) → skip (halted / delisted)
     closes = [100.0] * 22
     vols   = [1_000_000] * 21 + [2_000_000]
     assert cs._evaluate("OLD", _df(closes, vols), frac=1.0, today=pd.Timestamp("2026-07-01").date()) is None
+
+
+def test_carries_recent_session_overnight():
+    # FIX: last bar is the prior session; "today" is the next day (overnight / pre-open).
+    # Outside RTH frac=1.0 → the realized read must STILL be returned, not blanked like the
+    # old `!= today` guard did from midnight ET until the next open. Updates live at the open
+    # when a new forming bar appears.
+    closes = [98.0, 102.0] * 10 + [100.0, 100.2]
+    vols   = [1_000_000] * 21 + [2_000_000]
+    nxt = (pd.Timestamp(END) + pd.Timedelta(days=1)).date()   # day after the last session bar
+    it = cs._evaluate("CARRY", _df(closes, vols), frac=1.0, today=nxt)
+    assert it is not None and it["relVol"] == 2.0   # carried realized 2.0x, not dropped
