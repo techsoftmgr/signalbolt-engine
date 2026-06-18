@@ -864,13 +864,14 @@ def get_detector_policy(request: Request, days: int = 45):
     return detector_policy.compute(sb, days=max(7, min(int(days), 180)))
 
 
-@app.get("/admin/churn-scorecard")
-def get_churn_scorecard(request: Request, days: int = 60):
-    """Churn/Absorption RESOLUTION scorecard — does absorption predict the next move? Forward
-    return over HORIZON_DAYS by zone (accumulation→up / distribution→down / churn) + by coiling
-    streak. Measure-only, read-only; fills in as daily snapshots + their horizons accrue. Admin."""
-    _user_id, sb = _require_admin_jwt(request)
+@app.get("/churn-scorecard")
+def get_churn_scorecard(days: int = 60):
+    """PUBLIC (in-app Quant-tab screen, like /trend-ride-scorecard): Churn/Absorption RESOLUTION
+    scorecard — does absorption predict the next move? Forward return over HORIZON_DAYS by zone
+    (accumulation→up / distribution→down / churn) + by coiling streak. Read-only; fills in as daily
+    snapshots + their horizons accrue. Re-gate with _require_admin_jwt if it should be admin-only."""
     from engine import churn_history
+    sb = _make_supabase()
     return churn_history.score(sb, days=max(7, min(int(days), 180)))
 
 
