@@ -31,6 +31,8 @@ logger = logging.getLogger("signalbolt.churn")
 _CACHE_KEY  = "markets:churn:v1"
 _TTL        = 180   # safety-net: the warmer keeps it fresh; serve last-good if a cycle hiccups
 _inflight   = threading.Lock()
+_ET         = ZoneInfo("America/New_York")
+_STALE_DAYS = 5     # carry the last session this many days before treating data as stale
 
 _MIN_PRICE   = float(os.environ.get("CHURN_MIN_PRICE", "5"))
 _MIN_RELVOL  = float(os.environ.get("CHURN_MIN_RELVOL", "1.0"))     # at/above its own avg pace
@@ -64,7 +66,19 @@ def _evaluate(symbol: str, df, frac: float, today, signal=None) -> dict | None:
     try:
         if df is None or len(df) < 22:
             return None
-        if df.index[-1].date() != today:          # need today's (forming) bar present
+        # Use the MOST RECENT session's daily bar. During RTH that IS today's forming bar
+        # (Alpaca includes it) so session_fraction() pace-projects it; OUTSIDE RTH it's the
+        # last COMPLETED session and session_fraction()==1.0 gives the realized read — so the
+        # screen CARRIES overnight / pre-open instead of going blank once the ET date rolls
+        # past the last bar (the old `!= today` guard rejected everything from midnight ET to
+        # the next open), then updates live at the open when a new forming bar appears. Reject
+        # only genuinely STALE data (halted / delisted).
+        try:
+            _last = df.index[-1]
+            _last_et = _last.tz_convert(_ET).date() if getattr(df.index, "tz", None) is not None else _last.date()
+        except Exception:
+            _last_et = today
+        if (today - _last_et).days > _STALE_DAYS:
             return None
         c = df["close"].values.astype(float)
         v = df["volume"].values.astype(float)
@@ -160,7 +174,7 @@ def compute_churn(limit: int = 25, force: bool = False) -> dict:
         except Exception as e:
             logger.debug(f"[churn] active-signal overlay failed: {e}")
 
-        now_et = datetime.now(ZoneInfo("America/New_York"))
+        now_et = datetime.now(_ET)
         frac = session_fraction(now_et)
         today = now_et.date()
         items = [it for s, df in bars.items()
