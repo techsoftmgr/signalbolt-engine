@@ -687,30 +687,15 @@ def _score_ticker(
     )
 
     # ── Volume Score (0-100) ──────────────────────────────────────────────────
-    avg_vol    = float(np.mean(volumes[-20:])) if len(volumes) >= 20 else float(np.mean(volumes))
-    today_vol  = 0.0
-    if intraday_df is not None and not intraday_df.empty:
-        today = datetime.now(timezone.utc).date()
-        try:
-            today_mask = intraday_df.index.date == today
-            today_vol  = _safe(intraday_df[today_mask]["volume"].sum())
-        except Exception:
-            today_vol  = _safe(intraday_df["volume"].tail(78).sum())
-
-    if avg_vol > 0 and today_vol > 0:
-        # Project today's volume-so-far to a full day via the EMPIRICAL intraday
-        # volume curve (front-loaded), NOT a naive elapsed/390 — which assumed
-        # volume arrives linearly and massively over-projected the open (the HOOD
-        # 9:46am "2.3x" false accum, 2026-06-04). This is the SIGNAL-firing volume
-        # gating accum/distrib/breakout/breakdown/turnaround/peak — same curve the
-        # heatmap display uses.
-        from engine.volume_curve import expected_volume_fraction
-        now_utc  = datetime.now(timezone.utc)
-        elapsed  = now_utc.hour * 60 + now_utc.minute - (13 * 60 + 30)
-        proj_vol = today_vol / max(0.05, expected_volume_fraction(elapsed))
-        rel_vol  = proj_vol / avg_vol
-    else:
-        rel_vol = 1.0
+    # Relative volume keyed to the ET TRADING SESSION (not the UTC calendar date) so it
+    # doesn't reset to 1.0x overnight (the UTC date rolls over at 8 PM ET), and pace-
+    # projected via the EMPIRICAL front-loaded curve ONLY during live RTH — which avoids
+    # the naive elapsed/390 over-projection at the open (HOOD 9:46am "2.3x" false accum,
+    # 2026-06-04). Outside RTH it shows the realized session ratio. Shared single source of
+    # truth in volume_curve (same value the heatmap display + signal gating use).
+    from engine.volume_curve import session_relvol
+    avg_vol = float(np.mean(volumes[-20:])) if len(volumes) >= 20 else (float(np.mean(volumes)) if len(volumes) else 0.0)
+    rel_vol = session_relvol(intraday_df, avg_vol)
 
     volume_score = float(np.clip(_normalize(rel_vol, 0.5, 3.0), 0, 100))
 
@@ -790,8 +775,8 @@ def _score_ticker(
     vwap = None
     if intraday_df is not None and not intraday_df.empty:
         try:
-            today = datetime.now(timezone.utc).date()
-            t_df  = intraday_df[intraday_df.index.date == today]
+            from engine.volume_curve import latest_session_bars
+            t_df  = latest_session_bars(intraday_df)   # ET session, not UTC date (overnight-safe)
             if not t_df.empty:
                 vol_col = t_df["volume"]
                 typ_col = (t_df["high"] + t_df["low"] + t_df["close"]) / 3
