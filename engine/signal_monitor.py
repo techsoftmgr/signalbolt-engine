@@ -525,14 +525,24 @@ def _update_sl(sb: Client, sig_id: str, new_sl: float, sig: dict | None = None) 
 
 
 def _set_trend_ride_flag(sb: Client, sig: dict, on: bool) -> None:
-    """Persist the trend_ride state inside score_breakdown so (a) the expiry/early-exit
-    paths can tell a riding swing apart and (b) the feature's effect is measurable.
-    Idempotent — only writes when the flag actually changes. Mutates `sig` in place so
-    the rest of this pass sees the new state."""
+    """Persist the trend_ride state inside score_breakdown so (a) the early-exit paths can
+    tell a riding swing apart and (b) the feature's effect is measurable.
+      • trend_ride       — LIVE "currently riding" flag (set/cleared as the ride starts/ends)
+      • trend_ride_ever  — SET-ONCE durable marker (never cleared) so a CLOSED row still records
+                           that it rode even after the live flag was cleared on the trend_break
+                           exit — this is what the trend_ride scorecard segments on.
+    Idempotent — only writes when something actually changes. Mutates `sig` in place so the
+    rest of this pass sees the new state."""
     bd = dict(sig.get("score_breakdown") or {})
-    if bool(bd.get("trend_ride")) == bool(on):
+    changed = False
+    if bool(bd.get("trend_ride")) != bool(on):
+        bd["trend_ride"] = bool(on)
+        changed = True
+    if on and not bd.get("trend_ride_ever"):
+        bd["trend_ride_ever"] = True
+        changed = True
+    if not changed:
         return
-    bd["trend_ride"] = bool(on)
     sig["score_breakdown"] = bd
     try:
         sb.table("signals").update({"score_breakdown": bd}).eq("id", sig["id"]).execute()

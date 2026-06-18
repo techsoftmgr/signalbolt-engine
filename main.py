@@ -864,6 +864,16 @@ def get_detector_policy(request: Request, days: int = 45):
     return detector_policy.compute(sb, days=max(7, min(int(days), 180)))
 
 
+@app.get("/admin/trend-ride-scorecard")
+def get_trend_ride_scorecard(request: Request, days: int = 30):
+    """Measures the trend_ride feature (let confirmed-green swings run): RODE vs DID-NOT
+    swings, the new trend_break exit vs the old early-exit baseline (structure_reversal/
+    market_close), and the 'gave it back' failure count. Read-only. Admin."""
+    _user_id, sb = _require_admin_jwt(request)
+    from engine import trend_ride_scorecard
+    return trend_ride_scorecard.build(sb, days=max(7, min(int(days), 180)))
+
+
 @app.get("/jobs/status")
 def get_jobs_status():
     """Daily Jobs report — every scheduled job (catalog) merged with its last-run
