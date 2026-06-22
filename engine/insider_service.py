@@ -41,6 +41,7 @@ _WINDOW_DAYS = int(os.environ.get("INSIDER_WINDOW_DAYS", "30"))   # rolling last
 _CLUSTER_MIN_BUYERS = int(os.environ.get("INSIDER_CLUSTER_MIN_BUYERS", "2"))
 _NOTABLE_BUY_USD = float(os.environ.get("INSIDER_NOTABLE_BUY_USD", "250000"))      # single open-market buy alert floor
 _NOTABLE_SELL_USD = float(os.environ.get("INSIDER_NOTABLE_SELL_USD", "1000000"))   # discretionary-sell alert floor (sells noisier → higher bar)
+_ALERT_MAX_AGE_DAYS = int(os.environ.get("INSIDER_ALERT_MAX_AGE_DAYS", "4"))        # only PUSH on filings filed within this many days (older = persist, no push)
 _TXN_DISPLAY_CAP = int(os.environ.get("INSIDER_TXN_DISPLAY_CAP", "60"))            # per-ticker screen: max transactions shown
 _FEED_COUNT = int(os.environ.get("INSIDER_FEED_COUNT", "100"))                      # getcurrent atom page size
 _FEED_MAX_PAGES = int(os.environ.get("INSIDER_FEED_MAX_PAGES", "3"))               # max pages per feed poll (3×100 = 150 filings of headroom)
@@ -252,10 +253,27 @@ def _txn_uid(t: dict) -> str:
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]
 
 
+def _is_fresh_filing(t: dict) -> bool:
+    """True if this Form 4 was FILED recently enough to PUSH a notification. STALE filings — a
+    ticker that just entered the scan universe (its whole 30-day history backfills), a re-parse
+    after a truncated seen-set, or a very-late filing — are still PERSISTED for the screen, but
+    must NOT fire a push, else the user gets a "new" alert for weeks-old activity (NCLH's Jun-1
+    buy pinged Jun-17). Keyed to the FILING date (when it became public), not the trade date.
+    Fail-open when the filing date is unknown."""
+    fd = t.get("filing_date")
+    if not fd:
+        return True
+    try:
+        d = datetime.fromisoformat(str(fd)[:10]).date()
+        return (datetime.now(timezone.utc).date() - d).days <= _ALERT_MAX_AGE_DAYS
+    except Exception:
+        return True
+
+
 def _persist_txn(sb, t: dict, stats: dict) -> None:
     """Upsert one parsed open-market transaction (idempotent on txn_uid) and record it as
-    a NOTABLE buy/sell if it clears the alert bar. Shared by the per-CIK sweep and the
-    fast-lane feed poller so both store + flag for alerting identically."""
+    a NOTABLE buy/sell if it clears the alert bar AND was filed recently. Shared by the per-CIK
+    sweep and the fast-lane feed poller so both store + flag for alerting identically."""
     row = {
         "txn_uid": _txn_uid(t), "ticker": t["ticker"], "owner": t["owner"], "role": t["role"],
         "txn_date": t.get("txn_date"), "code": t["code"], "side": t["side"],
@@ -267,10 +285,13 @@ def _persist_txn(sb, t: dict, stats: dict) -> None:
         sb.table("insider_transactions").upsert(row, on_conflict="txn_uid").execute()
         stats["new_transactions"] += 1
         stats.setdefault("updated_tickers", set()).add(t["ticker"])
-        if t["code"] == "P" and t["value_usd"] >= _NOTABLE_BUY_USD:
+        # Persist always (the screen shows the full 30-day window); only flag for a PUSH if the
+        # filing is FRESH — so a backfill / re-parse / late filing never pushes a stale "new" alert.
+        _fresh = _is_fresh_filing(t)
+        if t["code"] == "P" and t["value_usd"] >= _NOTABLE_BUY_USD and _fresh:
             stats["notable_buys"].append(t)
         elif (t["code"] == "S" and not t.get("scheduled") and not t.get("comp_related")
-              and t["value_usd"] >= _NOTABLE_SELL_USD):
+              and t["value_usd"] >= _NOTABLE_SELL_USD and _fresh):
             stats["notable_sells"].append(t)
     except Exception as e:
         logger.debug(f"[insider] upsert {t.get('ticker')} failed: {e}")
@@ -304,10 +325,16 @@ def refresh_universe(sb, window_days: int = _WINDOW_DAYS) -> dict:
     seen_by_ticker: dict = {}
     try:
         since_iso = (datetime.now(timezone.utc) - timedelta(days=window_days)).date().isoformat()
-        rows = (sb.table("insider_transactions").select("ticker,accession")
-                .gte("txn_date", since_iso).execute().data) or []
-        for r in rows:
-            seen_by_ticker.setdefault(r["ticker"], set()).add(r["accession"])
+        # PAGINATE — an unbounded select hits PostgREST's 1000-row default, so the seen-accession
+        # set was truncated once the window held >1000 rows → already-stored filings looked "unseen"
+        # → re-parsed every sweep (wasteful, and pre-idempotency caused re-alerts like MELI/Aguzin).
+        for _off in range(0, 100_000, 1000):
+            _chunk = (sb.table("insider_transactions").select("ticker,accession")
+                      .gte("txn_date", since_iso).range(_off, _off + 999).execute().data) or []
+            for r in _chunk:
+                seen_by_ticker.setdefault(r["ticker"], set()).add(r["accession"])
+            if len(_chunk) < 1000:
+                break
     except Exception as e:
         logger.debug(f"[insider] seen-accession load failed: {e}")
 
@@ -430,8 +457,18 @@ def build_screen(sb, window_days: int = _WINDOW_DAYS, limit: int = 60) -> dict:
     empty = {"asOf": datetime.now(timezone.utc).isoformat(), "items": []}
     try:
         since_iso = (datetime.now(timezone.utc) - timedelta(days=window_days)).date().isoformat()
-        rows = (sb.table("insider_transactions").select("*").gte("txn_date", since_iso)
-                .order("txn_date", desc=True).limit(5000).execute().data) or []
+        # PAGINATE — never a single .limit(N). A flat limit ordered by txn_date desc silently
+        # truncated the OLDEST in-window transactions once the universe had >limit rows, so a
+        # name whose (large) buys land early in the window dropped off the screen entirely while
+        # newer/smaller activity stayed — e.g. NCLH's $25M Jun-1/2 buys vanished while MELI's
+        # $200K Jun-11 buy showed. Fetch every in-window row in pages so the ranking is complete.
+        rows = []
+        for _off in range(0, 100_000, 1000):
+            _chunk = (sb.table("insider_transactions").select("*").gte("txn_date", since_iso)
+                      .order("txn_date", desc=True).range(_off, _off + 999).execute().data) or []
+            rows += _chunk
+            if len(_chunk) < 1000:
+                break
     except Exception as e:
         logger.error(f"[insider] screen query failed: {e}")
         return empty

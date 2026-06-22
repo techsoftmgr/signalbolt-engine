@@ -142,6 +142,37 @@ def test_txn_uid_deterministic():
     assert ins._txn_uid(t) == ins._txn_uid(dict(t)) and len(ins._txn_uid(t)) == 20
 
 
+# ── Filing-freshness gate: don't PUSH alerts for old information ─────────────
+def test_is_fresh_filing():
+    from datetime import datetime, timezone, timedelta
+    today = datetime.now(timezone.utc).date()
+    def d(n): return (today - timedelta(days=n)).isoformat()
+    assert ins._is_fresh_filing({"filing_date": d(0)}) is True
+    assert ins._is_fresh_filing({"filing_date": d(3)}) is True
+    assert ins._is_fresh_filing({"filing_date": d(10)}) is False   # stale → no push
+    assert ins._is_fresh_filing({}) is True                        # unknown → fail open
+
+
+def test_stale_filing_persists_but_does_not_alert():
+    """The NCLH/MELI case: a weeks-old filing (backfill / re-parse) must still be STORED for the
+    screen but must NOT be flagged for a push."""
+    from unittest.mock import MagicMock
+    from datetime import datetime, timezone, timedelta
+    today = datetime.now(timezone.utc).date()
+    def d(n): return (today - timedelta(days=n)).isoformat()
+    def _t(filing_n):
+        return {"ticker": "NCLH", "owner": "Pagliuca", "role": "Director", "txn_date": d(filing_n + 1),
+                "code": "P", "side": "BUY", "shares": 100, "price": 25.0, "value_usd": 12_000_000,
+                "scheduled": False, "comp_related": False, "accession": f"acc{filing_n}", "filing_date": d(filing_n)}
+    sb = MagicMock()
+    st = {"new_transactions": 0, "notable_buys": [], "notable_sells": []}
+    ins._persist_txn(sb, _t(1), st)                  # fresh filing
+    assert st["new_transactions"] == 1 and len(st["notable_buys"]) == 1     # persisted AND alerted
+    st2 = {"new_transactions": 0, "notable_buys": [], "notable_sells": []}
+    ins._persist_txn(sb, _t(14), st2)                # stale filing (14d old)
+    assert st2["new_transactions"] == 1 and st2["notable_buys"] == []        # persisted, NOT alerted
+
+
 # ── Fast-lane: getcurrent feed parsing ──────────────────────────────────────
 _FEED_SAMPLE = b"""<?xml version="1.0" encoding="ISO-8859-1" ?>
 <feed xmlns="http://www.w3.org/2005/Atom">
