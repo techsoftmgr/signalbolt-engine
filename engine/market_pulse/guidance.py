@@ -11,36 +11,67 @@ DISCLAIMER = (
     "read, not a recommendation to buy or sell any security."
 )
 
-# guidance_key == regime label. headline + bullets are the "what it implies" layer.
+# A read of CURRENT conditions, not a price forecast. Surfaced on the card so a label like
+# "Correction" isn't misread as "the market is about to fall" — it describes the tape RIGHT NOW.
+NOT_FORECAST = "Describes current market conditions, not a prediction of where it goes next."
+
+# guidance_key == regime label. Layers:
+#   state    — plain "what's happening RIGHT NOW" (not a forecast)
+#   posture  — the one-word stance the conditions historically favor
+#   headline + bullets — the "what it historically implies" layer
+#   toDo — concrete "what to do in this regime" (educational; how traders typically act)
 GUIDANCE: dict[str, dict] = {
     C.CONFIRMED_UPTREND: {
         "emoji": "🟢",
         "title": "Confirmed Uptrend",
+        "posture": "Offense",
+        "state": "Right now the broad market is rising with broad participation and selling is contained — the wind is at your back.",
         "headline": "Market is in a confirmed uptrend — the most favorable environment for new long setups.",
         "bullets": [
             "Breadth is participating and institutional selling is contained.",
             "Historically the regime where breakouts follow through and leaders make their biggest moves.",
             "Favors offense; traders are typically most willing to take new long setups here.",
         ],
+        "toDo": [
+            "Offense: new long setups have their best odds here — normal position size.",
+            "Lean into leaders and breakouts that follow through; let winners run.",
+            "Still honor stops — even strong uptrends have sharp pullbacks.",
+        ],
     },
     C.UNDER_PRESSURE: {
         "emoji": "🟡",
         "title": "Under Pressure",
+        "posture": "Selective",
+        "state": "Right now selling is picking up and breadth is softening — a transition phase, not yet a full correction.",
         "headline": "Uptrend under pressure — institutional selling is elevated.",
         "bullets": [
             "Distribution or weakening breadth signals more sellers stepping in.",
             "Historically, breakouts fail more often and follow-through is less reliable.",
             "A transition state — many traders turn more selective, tighten risk, and avoid aggressive new buys.",
         ],
+        "toDo": [
+            "Turn selective: smaller new positions, tighten stops, trim the weakest longs.",
+            "Demand stronger setups — marginal breakouts fail more often here.",
+            "Let it resolve — up (a follow-through day) or down (into correction) — before adding risk.",
+        ],
     },
     C.CORRECTION: {
         "emoji": "🔴",
         "title": "Correction",
-        "headline": "Market in correction — historically a capital-preservation environment.",
+        "posture": "Defense",
+        "state": "Right now the broad market is selling off and most stocks are trending down with it.",
+        "headline": "Market in correction — historically a capital-preservation environment (a state, not a forecast).",
         "bullets": [
             "Most new buys fail when the broad market is in correction (~3 of 4 stocks follow the market's trend).",
             "Historically the regime where defense matters most and patience tends to be rewarded.",
             "Traders commonly wait for a new confirmed uptrend (follow-through day) before re-engaging long.",
+        ],
+        "toDo": [
+            "Defense first: smaller size, fewer new longs, more cash — preserve capital.",
+            "If you go long, only relative-strength leaders (holding up / higher lows while the market falls).",
+            "Short strength, not weakness — fade bounces into resistance; don't short a multi-day flush into oversold.",
+            "Don't dip-buy every red day — catching the falling knife is how most longs fail here.",
+            "Wait for a follow-through day (a strong up day on rising volume) before re-engaging long.",
         ],
     },
 }
@@ -129,8 +160,12 @@ def build(regime: str, vix_band: str | None, vix_rising: bool | None) -> dict:
         "regime": regime,
         "emoji": g["emoji"],
         "title": g["title"],
+        "posture": g.get("posture"),
+        "state": g.get("state"),
         "headline": g["headline"],
         "bullets": g["bullets"],
+        "toDo": g.get("toDo", []),
+        "notForecast": NOT_FORECAST,
         "vix_line": vix_line(vix_band, vix_rising),
         "disclaimer": DISCLAIMER,
     }

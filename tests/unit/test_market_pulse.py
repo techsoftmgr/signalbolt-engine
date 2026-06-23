@@ -249,6 +249,12 @@ def test_guidance_build_has_disclaimer_and_vix_line():
     assert "high" in g["vix_line"].lower()
     # VIX null → unavailable line
     assert "unavailable" in guidance.build(C.CONFIRMED_UPTREND, None, None)["vix_line"].lower()
+    # state (current-conditions framing, not a forecast) + posture + a "what to do" playbook
+    assert g["posture"] == "Defense"
+    assert g["state"] and "right now" in g["state"].lower()
+    assert isinstance(g["toDo"], list) and len(g["toDo"]) >= 3
+    assert "not a prediction" in g["notForecast"].lower()
+    assert guidance.build(C.CONFIRMED_UPTREND, None, None)["posture"] == "Offense"
 
 # ── Thrust / breakdown playbook (SPY/QQQ 9/20 levels) ───────────────────────
 from engine.market_pulse import playbook
