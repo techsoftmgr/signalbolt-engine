@@ -84,7 +84,11 @@ def _global_cooldown_ok(kind: str, sub: str = "") -> bool:
     """True + stamp if no market-wide push of this kind/state fired within the global window."""
     now = time.monotonic()
     k = f"{kind}:{sub}"
-    if now - _global_last.get(k, 0.0) >= _GLOBAL_COOLDOWNS.get(kind, 1800.0):
+    last = _global_last.get(k)
+    # Never-seen state always fires (don't compare against a 0.0 default — on a freshly
+    # started process time.monotonic() can be < the cooldown, which would suppress the
+    # very first market-wide push).
+    if last is None or now - last >= _GLOBAL_COOLDOWNS.get(kind, 1800.0):
         _global_last[k] = now
         return True
     return False
