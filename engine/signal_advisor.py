@@ -73,14 +73,38 @@ def _cooldown_ok(sig_id: str, advice_type: str) -> bool:
     return False
 
 
+# ── GLOBAL (cross-signal) cooldown — for MARKET-WIDE advice that must fire ONCE, not per open
+#    position. A regime shift is market-wide; without this the user gets one "Market shifted to
+#    PANIC" push PER active card. Keyed by event+state so a genuinely NEW state can notify again.
+_global_last: dict[str, float] = {}
+_GLOBAL_COOLDOWNS: dict[str, float] = {"regime_shift": 1800.0}   # one market-wide push / 30 min
+
+
+def _global_cooldown_ok(kind: str, sub: str = "") -> bool:
+    """True + stamp if no market-wide push of this kind/state fired within the global window."""
+    now = time.monotonic()
+    k = f"{kind}:{sub}"
+    last = _global_last.get(k)
+    # Never-seen state always fires (don't compare against a 0.0 default — on a freshly
+    # started process time.monotonic() can be < the cooldown, which would suppress the
+    # very first market-wide push).
+    if last is None or now - last >= _GLOBAL_COOLDOWNS.get(kind, 1800.0):
+        _global_last[k] = now
+        return True
+    return False
+
+
 def _send_advice(
     sig: dict,
     price: float,
     title: str,
     body: str,
     advice_type: str,
+    push: bool = True,
 ) -> None:
-    """Write a signal_events row and fire a push notification (best-effort)."""
+    """Write a signal_events row and (if `push`) fire a push notification (best-effort).
+    `push=False` logs the per-card insight line WITHOUT a notification — used for market-wide
+    advice where a single global push is sent separately instead of one-per-position."""
     try:
         import os
         from supabase import create_client as _sc
@@ -96,18 +120,19 @@ def _send_advice(
             "note":       body,
         }).execute()
 
-        try:
-            _push._send_raw(
-                title=title,
-                body=body,
-                data={
-                    "type":      f"advisor_{advice_type}",
-                    "ticker":    sig["ticker"],
-                    "signal_id": str(sig["id"]),
-                },
-            )
-        except Exception:
-            pass
+        if push:
+            try:
+                _push._send_raw(
+                    title=title,
+                    body=body,
+                    data={
+                        "type":      f"advisor_{advice_type}",
+                        "ticker":    sig["ticker"],
+                        "signal_id": str(sig["id"]),
+                    },
+                )
+            except Exception:
+                pass
 
         logger.info(
             f"[advisor] {advice_type.upper()} {sig['ticker']} {sig['direction']} "
@@ -343,6 +368,9 @@ def check(
         vix_chg     = regime.get("vix_change_pct", 0.0)
         if regime_type in ("PANIC", "HIGH_VOL") or vix_chg > 15.0:
             spike_note = f" (VIX +{vix_chg:.0f}%)" if vix_chg > 15.0 else ""
+            # Per-card insight line on THIS position (so each card shows the context) — but NO
+            # push: a regime shift is MARKET-WIDE, so a per-position push spams one notification
+            # per open card. The single market-wide push is sent once below (global cooldown).
             _send_advice(
                 sig, price=price,
                 title=f"⚡ Regime Alert — {ticker}",
@@ -352,7 +380,19 @@ def check(
                     f"P&L: {pnl_pct:+.1f}% — review position."
                 ),
                 advice_type="regime_shift",
+                push=False,
             )
+            # ONE general market-wide push, deduped across ALL open positions (not per card).
+            if _global_cooldown_ok("regime_shift", regime_type):
+                try:
+                    from engine import push as _push
+                    _push._send_raw(
+                        title="⚡ Market Regime Alert",
+                        body=f"Market shifted to {regime_type}{spike_note} — review your open positions.",
+                        data={"type": "regime_shift_market", "regime": regime_type},
+                    )
+                except Exception:
+                    pass
             return
 
     # ── 5. Day trade time limit (held >5 hours) ───────────────────────────────
