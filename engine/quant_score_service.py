@@ -621,6 +621,30 @@ def _build_dashboard(tickers: list[str]) -> dict:
         return {}
 
 
+def _recent_max_rsi(closes, lookback: int = 10, period: int = 14) -> float:
+    """Max RSI(period) over the last `lookback` bars. A TOP confirms as RSI FALLS, so gating the
+    peak detector on CURRENT RSI alone blinds it exactly through the rollover — MSFT hit RSI 73 at
+    its 466 top, fell below 60 by the time it broke down, and the detector stopped being evaluated
+    (the 466→370 miss). This lets a recently-overbought name keep being evaluated. numpy-only/cheap."""
+    try:
+        c = np.asarray(closes, dtype=float)
+        if c.size < period + lookback + 1:
+            return 0.0
+        d = np.diff(c)
+        best = 0.0
+        for i in range(lookback):
+            w = d[-(period + i):(-i if i else None)]
+            if w.size < period:
+                continue
+            g = float(w[w > 0].sum()); l = float(-w[w < 0].sum())
+            r = 100.0 - 100.0 / (1.0 + (g / (l if l > 0 else 1e-10)))
+            if r > best:
+                best = r
+        return best
+    except Exception:
+        return 0.0
+
+
 def _score_ticker(
     ticker: str,
     latest_price: Optional[float],
@@ -878,8 +902,11 @@ def _score_ticker(
     peak_score = 0.0
     peak_stage = "none"
     peak_reasons: list[str] = []
-    # Pre-filter: tops only form from overbought — skip the rest.
-    if rsi >= 60:
+    # Pre-filter: tops form from overbought — but a top CONFIRMS as RSI falls, so evaluate a name
+    # that is overbought NOW *or was recently* (≥70 in the last ~10 bars). Without the latch the
+    # detector goes silent the moment a name starts rolling over — exactly when we'd want the short
+    # (MSFT 466→370: "watch" at the RSI-73 top, then un-evaluated all the way down to the 377 break).
+    if rsi >= 60 or _recent_max_rsi(closes) >= 70.0:
         try:
             from engine import peak_detector
             _pk = peak_detector.score_peak(

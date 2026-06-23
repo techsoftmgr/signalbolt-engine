@@ -55,3 +55,15 @@ def test_snapshot_prefers_universe_over_per_ticker_cache(monkeypatch):
 
     out = qs.snapshot(["NVDA"])
     assert "NVDA" in out
+
+
+def test_recent_max_rsi_latches_through_rollover():
+    """Peak-detector latch: a name that WAS overbought must still register as recently-overbought
+    after it starts rolling over (current RSI < 60) — the MSFT 466→370 miss."""
+    rising = list(range(100, 145))                       # strictly up → RSI ~100
+    assert qs._recent_max_rsi(rising) >= 70
+    rolled = rising + [144, 142, 140, 138, 136]          # now rolling over (current RSI has dropped)
+    assert qs._recent_max_rsi(rolled, lookback=10) >= 70 # latch still holds through the rollover
+    flat = [100 + (i % 2) for i in range(45)]            # choppy/flat → never overbought
+    assert qs._recent_max_rsi(flat) < 70
+    assert qs._recent_max_rsi([1, 2, 3]) == 0.0          # too little history → safe 0
