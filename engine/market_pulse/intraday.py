@@ -238,16 +238,26 @@ def _read_summary(indices: dict) -> str:
 
 
 _CACHE_KEY = "market_pulse:intraday:v1"
-_CACHE_TTL = 60   # recompute once/min server-side, served to all viewers (NOT the daily table)
+# TTL > the worker's refresh interval (50s) so the cache never expires between
+# refreshes — the WEB endpoint then always serves a warm value and never pays the
+# inline compute (cold volume-profile = a 60-day 30-min fetch for SPY+QQQ, which
+# was the once-a-day ~20s spike a user could land on). The worker keeps it warm
+# via read_all(force=True); web stays a pure cache read. Mirrors the quant
+# dashboard precompute pattern.
+_CACHE_TTL = 150
 
 
-def read_all(now_et=None) -> dict:
+def read_all(now_et=None, force: bool = False) -> dict:
     """{asOf, provisional, summary, indices:{SPY, QQQ}} — provisional, never persisted
-    to the EOD table. The LIVE path (now_et=None) is cached 60s in the ephemeral kv
-    so it's computed once on the server and served to every viewer (tests pass now_et
-    to bypass the cache)."""
+    to the EOD table.
+
+    LIVE path (now_et=None): served from the ephemeral kv cache so it's computed
+    once on the server and shared by every viewer. force=True bypasses the cache
+    READ and recomputes — used by the worker's warmer so the heavy cold-cache
+    compute happens OFF the request path, never on a user's first load. (Tests
+    pass now_et to bypass the cache entirely.)"""
     from datetime import datetime as _dt, timezone as _tz
-    if now_et is None:
+    if now_et is None and not force:
         try:
             from engine import cache
             cached = cache.kv.get_json(_CACHE_KEY)

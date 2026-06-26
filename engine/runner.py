@@ -3691,6 +3691,39 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled Market Pulse catch-up (hourly + on boot)")
 
+    # ── Market Pulse INTRADAY warmer — keep the provisional read cache hot ───────
+    # The provisional intraday read is computed on the fly the first time each
+    # minute and cached for all viewers. But a COLD cache (esp. the once-a-day
+    # volume-profile rebuild = a 60-day 30-min fetch for SPY+QQQ) makes that first
+    # request slow — and a user could land on it (the ~20s Market Pulse load), with
+    # the app's intraday fetch then timing out so the provisional banner never shows.
+    # Fix: the WORKER refreshes the cache every 50s during RTH (force=True, off the
+    # request path), so the WEB endpoint is always a warm cache read. Mirrors the
+    # quant dashboard precompute. Cheap off-hours (read_all bails before any fetch).
+    def _warm_market_pulse_intraday():
+        try:
+            from datetime import datetime as _dt
+            from zoneinfo import ZoneInfo as _ZI
+            now_et = _dt.now(_ZI("America/New_York"))
+            # Only during ~RTH on a trading day; outside this read_all bails cheaply
+            # anyway, but skip the needless Alpaca calls + cache writes.
+            if now_et.weekday() >= 5 or not (9 <= now_et.hour < 17):
+                return
+            from engine.market_pulse import intraday
+            intraday.read_all(force=True)
+        except Exception as _e:
+            logger.debug(f"[runner] market pulse intraday warm failed: {_e}")
+
+    scheduler.add_job(
+        _warm_market_pulse_intraday,
+        trigger=IntervalTrigger(seconds=50),
+        id="market_pulse_intraday_warm",
+        name="Market Pulse intraday cache warmer (50s during RTH)",
+        replace_existing=True, max_instances=1, coalesce=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=20),
+    )
+    logger.info("[runner] Scheduled Market Pulse intraday cache warmer (50s, RTH)")
+
     # ── Sector Leaders — daily RS ranking of the 11 SPDR sectors, 4:50 PM ET
     # (just after Market Pulse, both post-close). Standalone; trading-day gated. ──
     def _run_sector_leaders():
