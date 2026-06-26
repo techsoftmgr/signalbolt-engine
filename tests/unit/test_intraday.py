@@ -25,6 +25,24 @@ def test_confidence_floor():
     assert intraday.confidence_for(15.0) == "HIGH"
 
 
+def test_read_all_force_bypasses_cache(monkeypatch):
+    """force=True must NOT serve the cached value — it recomputes (the worker
+    warmer relies on this to refresh the cache off the request path)."""
+    from engine import cache
+    # A stale cache value that the non-force web path would return verbatim...
+    monkeypatch.setattr(cache.kv, "get_json", lambda *a, **k: {"summary": "STALE"})
+    stored = {}
+    monkeypatch.setattr(cache.kv, "set_json", lambda k, v, ttl=None: stored.update({"v": v}))
+    monkeypatch.setattr(intraday, "intraday_read",
+                        lambda sym, now_et=None: {"symbol": sym, "status": "NEUTRAL"})
+    # non-force → serves the stale cache
+    assert intraday.read_all()["summary"] == "STALE"
+    # force → ignores the stale cache, recomputes, and re-stores
+    fresh = intraday.read_all(force=True)
+    assert fresh["summary"] != "STALE" and fresh["indices"]["SPY"]["status"] == "NEUTRAL"
+    assert stored.get("v") is not None
+
+
 def test_classify_status():
     assert intraday.classify_status(2.0e9, 1.0e9, -0.5, 0.3) == "ON_PACE_DISTRIBUTION"
     assert intraday.classify_status(2.0e9, 1.0e9, 0.1, 0.3) == "ON_PACE_STALLING"
