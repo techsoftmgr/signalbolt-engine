@@ -213,6 +213,42 @@ def set_prev_close(ticker: str, close: float) -> None:
     _prev_close[ticker] = close
 
 
+def reseed_prev_close(ticker: str, prev_close: float) -> None:
+    """
+    Refresh the prior-day close used to compute live changePercent WITHOUT
+    disturbing the live price stream.
+
+    Why this exists: the worker is a long-lived process that seeds prev_close
+    ONCE at boot. After the daily session rollover the baseline goes stale —
+    every streamed changePercent is then computed against a multi-day-old close,
+    so the live price stays correct but the % is wrong (the "price right, %
+    wrong across all watchlist tickers" bug). A periodic reseed keeps the
+    baseline anchored to the CURRENT session's prior close. Sibling of the
+    relvol / churn session-rollover fixes.
+
+    Unlike seed(), this leaves _prices[ticker]["price"] untouched (no visible
+    price blip) — it only updates the baseline, recomputes the stored % against
+    the latest known price, marks the ticker dirty, and republishes so the
+    corrected % reaches clients immediately even without a fresh trade tick.
+    """
+    if not prev_close or prev_close <= 0:
+        return
+    _prev_close[ticker] = prev_close
+    cur = (_prices.get(ticker) or {}).get("price")
+    if not cur or cur <= 0:
+        return
+    entry = dict(_prices.get(ticker) or {})
+    entry["changePercent"] = round((cur - prev_close) / prev_close * 100, 3)
+    entry["session"]       = _market_session_now()
+    _prices[ticker] = entry
+    # Push the corrected % to this machine's WS clients...
+    if _loop and not _loop.is_closed():
+        _loop.call_soon_threadsafe(_dirty.add, ticker)
+    # ...and fan it out to the other engine machines (web) via the Redis bridge,
+    # so they don't keep serving the stale % until the next trade tick.
+    publish_tick(ticker, cur)
+
+
 def seed(ticker: str, price: float, change_pct: float, session: str) -> None:
     """
     Seed from a REST snapshot (startup or first WS subscribe).
