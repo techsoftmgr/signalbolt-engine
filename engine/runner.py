@@ -3724,6 +3724,32 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled Market Pulse intraday cache warmer (50s, RTH)")
 
+    # ── RS-Pullback signals — fire LONGs on relative-strength leaders pulling back
+    # to the rising 20-MA (the one long edge that measured +EV, +0.24R even in a
+    # weak tape). Reads the worker's cached scored universe; trend_ride rides the
+    # winners. Tagged detector_source=RS_PULLBACK; kill-switch RS_PULLBACK_SIGNALS_ENABLED;
+    # PANIC-gated. Scans every 30 min during the intraday entry window. ──
+    def _scan_rs_pullbacks():
+        try:
+            if not _intraday_entry_window_open():
+                return
+            from engine import rs_pullback_signals
+            n = rs_pullback_signals.scan_and_fire(_supabase())
+            if n:
+                logger.info(f"[runner] RS-Pullback scan fired {n} signal(s)")
+        except Exception as _e:
+            logger.error(f"[runner] RS-Pullback scan failed: {_e}")
+
+    scheduler.add_job(
+        _scan_rs_pullbacks,
+        trigger=IntervalTrigger(minutes=30),
+        id="rs_pullback_scan",
+        name="RS-Pullback signal scan (30 min, RTH)",
+        replace_existing=True, max_instances=1, coalesce=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=90),
+    )
+    logger.info("[runner] Scheduled RS-Pullback signal scan (30 min, RTH)")
+
     # ── Sector Leaders — daily RS ranking of the 11 SPDR sectors, 4:50 PM ET
     # (just after Market Pulse, both post-close). Standalone; trading-day gated. ──
     def _run_sector_leaders():
