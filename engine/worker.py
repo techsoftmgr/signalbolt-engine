@@ -37,13 +37,18 @@ logging.basicConfig(
 logger = logging.getLogger("engine.worker")
 
 
-async def _seed_prices() -> None:
+async def _seed_prices(reseed: bool = False) -> None:
     """
     Best-effort REST snapshot seed so the WS has prices before first trade.
 
     Re-uses main._alpaca_stock_snapshots, which is the same helper the web
     process used before this split. We import lazily to avoid pulling FastAPI
     into the worker boot path until actually needed.
+
+    reseed=True: refresh ONLY prev_close (the changePercent baseline) without
+    clobbering the live price stream — used by the periodic refresh that keeps
+    the baseline anchored to the current session's prior close. See
+    price_store.reseed_prev_close for the why (stale-after-rollover bug).
     """
     try:
         from engine import price_store
@@ -52,18 +57,56 @@ async def _seed_prices() -> None:
         seed_tickers = list(dict.fromkeys(ALL_TICKERS))[:40]
         snaps = _alpaca_stock_snapshots(seed_tickers)
         for ticker, data in snaps.items():
-            price_store.seed(
-                ticker,
-                data["price"],
-                data["changePercent"],
-                data.get("session", "market"),
-            )
-            chg = data["changePercent"]
+            chg  = data["changePercent"]
+            # Derive the prior-day close Alpaca used (price / (1 + chg)). This
+            # recovers previous_daily_bar.close exactly, which during RTH is the
+            # CURRENT session's prior close (the correct baseline).
             prev = data["price"] / (1 + chg / 100) if chg != -100 else data["price"]
-            price_store.set_prev_close(ticker, prev)
-        logger.info(f"[worker] Price store seeded with {len(snaps)} tickers")
+            if reseed:
+                price_store.reseed_prev_close(ticker, prev)
+            else:
+                price_store.seed(
+                    ticker,
+                    data["price"],
+                    chg,
+                    data.get("session", "market"),
+                )
+                price_store.set_prev_close(ticker, prev)
+        logger.info(
+            f"[worker] Price store {'re-' if reseed else ''}seeded with {len(snaps)} tickers"
+        )
     except Exception as e:
-        logger.warning(f"[worker] Price seed failed (non-fatal): {e}")
+        logger.warning(f"[worker] Price {'re' if reseed else ''}seed failed (non-fatal): {e}")
+
+
+async def _reseed_prev_close_loop(stop_event: asyncio.Event) -> None:
+    """
+    Periodically refresh prev_close so live changePercent stays anchored to the
+    CURRENT session's prior close.
+
+    The worker outlives every daily session rollover but seeds prev_close only
+    once at boot, so without this the baseline freezes at boot-day's value and
+    every streamed % drifts (live price stays correct, % is computed against a
+    multi-day-old close — the watchlist "price right, % wrong" bug). Cheap: one
+    batched Alpaca snapshot per cycle. Self-healing and never re-raises.
+    """
+    import os
+    interval = int(os.environ.get("PREV_CLOSE_RESEED_SEC", "600"))  # 10 min
+    logger.info(f"[worker] prev_close reseed loop started — every {interval}s")
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass   # interval elapsed → do a reseed
+        except asyncio.CancelledError:
+            logger.info("[worker] prev_close reseed loop cancelled")
+            raise
+        if stop_event.is_set():
+            break
+        try:
+            await _seed_prices(reseed=True)
+        except Exception as e:
+            logger.warning(f"[worker] prev_close reseed cycle failed (non-fatal): {e}")
 
 
 async def main() -> None:
@@ -102,8 +145,14 @@ async def main() -> None:
     publish_task = asyncio.create_task(
         price_store.publish_batch_loop(), name="price_publish_batch"
     )
+    # Keeps the changePercent baseline anchored to the current session's prior
+    # close (the worker is long-lived; boot-time prev_close goes stale after the
+    # daily rollover → "price right, % wrong" watchlist bug).
+    reseed_task = asyncio.create_task(
+        _reseed_prev_close_loop(stop_event), name="prev_close_reseed"
+    )
 
-    logger.info("SignalBolt worker started — scheduler + Alpaca stream + heartbeat + Redis publish active")
+    logger.info("SignalBolt worker started — scheduler + Alpaca stream + heartbeat + Redis publish + prev_close reseed active")
 
     try:
         await stop_event.wait()
@@ -130,6 +179,10 @@ async def main() -> None:
         publish_task.cancel()
         with suppress(asyncio.CancelledError):
             await publish_task
+
+        reseed_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await reseed_task
 
         try:
             scheduler.shutdown(wait=False)
