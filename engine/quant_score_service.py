@@ -259,6 +259,7 @@ _SNAPSHOT_KEEP = (
     "breakoutLevel", "breakdownLevel", "distToBreakoutPct",
     "turnaroundStage", "peakStage",
     "wk52High", "wk52Low", "wk52Pct",
+    "regimeCategory", "rsVsSpy",
 )
 
 
@@ -645,6 +646,42 @@ def _recent_max_rsi(closes, lookback: int = 10, period: int = 14) -> float:
         return 0.0
 
 
+def _regime_category(closes, current: float, ma20: float, rsi: float,
+                     spy_long_df) -> tuple[str, Optional[float]]:
+    """
+    Classify a name for the watchlist "Game Plan" tap-filter — which longs are
+    +EV in a weak tape vs falling knives. Mirrors relative_strength.is_rs_leader
+    (outperforming SPY 20d + rising 20-EMA + above 50-SMA), then splits leaders
+    into "at a pullback" (the actionable entry) vs "extended" (wait), and tags
+    downtrenders as knives. Returns (category, rs_vs_spy_pts). Never raises.
+
+    category ∈ {rs_pullback, rs_leader, knife, neutral}.
+    """
+    try:
+        import pandas as pd
+        if len(closes) < 21 or spy_long_df is None or len(spy_long_df) < 21:
+            return "neutral", None
+        spy_c     = spy_long_df["close"].values.astype(float)
+        ret20     = (closes[-1] - closes[-21]) / closes[-21] if closes[-21] else 0.0
+        spy_ret20 = (spy_c[-1]  - spy_c[-21])  / spy_c[-21]  if spy_c[-21]  else 0.0
+        rs_vs_spy = round((ret20 - spy_ret20) * 100, 1)
+        _ema       = pd.Series(closes).ewm(span=20, adjust=False).mean().values
+        ema_rising = bool(_ema[-1] > _ema[-6]) if len(_ema) >= 6 else False
+        sma50      = float(np.mean(closes[-50:])) if len(closes) >= 50 else ma20
+        above50    = current > sma50
+        is_leader  = (rs_vs_spy > 0) and ema_rising and above50
+        near_ma    = (ma20 * 0.97) < current < (ma20 * 1.01)
+        if is_leader and near_ma and 40 <= rsi <= 62:
+            return "rs_pullback", rs_vs_spy   # actionable long even in a weak tape
+        if is_leader:
+            return "rs_leader", rs_vs_spy     # strong but extended → wait for a pullback
+        if (not above50) and (not ema_rising):
+            return "knife", rs_vs_spy         # downtrend / underperformer → -EV bottom-fish
+        return "neutral", rs_vs_spy
+    except Exception:
+        return "neutral", None
+
+
 def _score_ticker(
     ticker: str,
     latest_price: Optional[float],
@@ -937,10 +974,15 @@ def _score_ticker(
         except Exception as _ce:
             logger.debug(f"[quant] {ticker} cycle_context: {_ce}")
 
+    # ── Regime "Game Plan" category (watchlist tap-filter) ────────────────────
+    regime_category, rs_vs_spy = _regime_category(closes, current, ma20, rsi, spy_long_df)
+
     return {
         "ticker":              ticker,
         "price":               round(current, 2),
         "dayChangePct":        round(day_change_pct, 2),   # today's move vs prior close (direction)
+        "regimeCategory":      regime_category,            # rs_pullback | rs_leader | knife | neutral
+        "rsVsSpy":             rs_vs_spy,                  # 20d return vs SPY (pts)
         "vwap":                vwap,
         "rsi":                 round(rsi, 1),
         "relativeVolume":      round(rel_vol, 2),
