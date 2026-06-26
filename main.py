@@ -4197,7 +4197,12 @@ async def admin_detector_scorecard(request: Request, days: int = 30, cost_pct: f
 
     group_by: 'detector' (detector×strategy, default) | 'regime' | 'detector_regime'
               | 'conviction' | 'detector_conviction' (per-detector × confidence tier
-              — shows whether high-conviction signals actually beat low ones).
+              — shows whether high-conviction signals actually beat low ones)
+              | 'rs_exempt' | 'detector_rs_exempt' (isolates the RS-exemption
+              cohort — longs that fired through the regime long-veto on relative
+              strength — so its realized edge is visible vs standard signals).
+              NOTE: RS-exempt longs also surface as their own 'SMC·RSx' line in
+              every detector-keyed view.
     Admin only.
     """
     _user_id, sb = _require_admin_jwt(request)
