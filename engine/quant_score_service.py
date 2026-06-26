@@ -647,15 +647,22 @@ def _recent_max_rsi(closes, lookback: int = 10, period: int = 14) -> float:
 
 
 def _regime_category(closes, current: float, ma20: float, rsi: float,
-                     spy_long_df) -> tuple[str, Optional[float]]:
+                     spy_long_df, peak_stage: str = "none",
+                     setup_type: str = "") -> tuple[str, Optional[float]]:
     """
-    Classify a name for the watchlist "Game Plan" tap-filter — which longs are
-    +EV in a weak tape vs falling knives. Mirrors relative_strength.is_rs_leader
-    (outperforming SPY 20d + rising 20-EMA + above 50-SMA), then splits leaders
-    into "at a pullback" (the actionable entry) vs "extended" (wait), and tags
-    downtrenders as knives. Returns (category, rs_vs_spy_pts). Never raises.
+    Classify a name for the watchlist "Game Plan" tap-filter — a two-sided read
+    of what to do in the current tape. Returns (category, rs_vs_spy_pts). Never
+    raises. category ∈ {rs_pullback, rs_leader, short_setup, knife, neutral}.
 
-    category ∈ {rs_pullback, rs_leader, knife, neutral}.
+    LONG side — mirrors relative_strength.is_rs_leader (outperforming SPY 20d +
+    rising 20-EMA + above 50-SMA): rs_pullback (leader at the 20-MA = +EV long
+    even in a weak tape) vs rs_leader (extended → wait).
+
+    SHORT side — "short STRENGTH, not weakness": short_setup = a confirmed top
+    (peak) OR a momentum breakdown that ISN'T yet washed out (rsi > 42). We do
+    NOT short the falling knife — a measured backtest had shorting the oversold
+    low at -0.08R (you short into the squeeze), so a deeply-oversold downtrender
+    stays a "knife" (avoid BOTH sides), not a short.
     """
     try:
         import pandas as pd
@@ -671,12 +678,19 @@ def _regime_category(closes, current: float, ma20: float, rsi: float,
         above50    = current > sma50
         is_leader  = (rs_vs_spy > 0) and ema_rising and above50
         near_ma    = (ma20 * 0.97) < current < (ma20 * 1.01)
+
+        # SHORT STRENGTH: confirmed top, or a breakdown that's not yet oversold.
+        short_top = peak_stage == "peak"
+        short_brk = (setup_type == "breakdown") and rsi > 42
+        if (short_top or short_brk) and not (is_leader and near_ma):
+            return "short_setup", rs_vs_spy
+
         if is_leader and near_ma and 40 <= rsi <= 62:
             return "rs_pullback", rs_vs_spy   # actionable long even in a weak tape
         if is_leader:
             return "rs_leader", rs_vs_spy     # strong but extended → wait for a pullback
         if (not above50) and (not ema_rising):
-            return "knife", rs_vs_spy         # downtrend / underperformer → -EV bottom-fish
+            return "knife", rs_vs_spy         # downtrend + washed out → avoid BOTH sides
         return "neutral", rs_vs_spy
     except Exception:
         return "neutral", None
@@ -975,7 +989,10 @@ def _score_ticker(
             logger.debug(f"[quant] {ticker} cycle_context: {_ce}")
 
     # ── Regime "Game Plan" category (watchlist tap-filter) ────────────────────
-    regime_category, rs_vs_spy = _regime_category(closes, current, ma20, rsi, spy_long_df)
+    regime_category, rs_vs_spy = _regime_category(
+        closes, current, ma20, rsi, spy_long_df,
+        peak_stage=peak_stage, setup_type=setup_type,
+    )
 
     return {
         "ticker":              ticker,
