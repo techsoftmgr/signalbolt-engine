@@ -891,6 +891,29 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
         (direction == "LONG"  and _rt in ("TRENDING_BEAR", "RISK_OFF", "PANIC")) or
         (direction == "SHORT" and _rt == "TRENDING_BULL")
     )
+    # ── Relative-strength exemption (measured +EV) ───────────────────────
+    # A LONG on a name with relative strength (outperforming SPY 20d + intact
+    # daily uptrend) is +EV even in a weak market (+0.24R vs -0.79R for non-RS
+    # longs — 2y/858-event study). Don't blanket-block these. PANIC is excluded
+    # (acute crashes flush even leaders); SHORT-in-bull is never exempted.
+    # Kill switch RS_EXEMPTION_ENABLED. Tagged in score_breakdown.rs_exempt so
+    # the gate scorecard tracks its live expectancy before we trust it further.
+    _rs_exempt = None
+    if (_regime_blocks and direction == "LONG"
+            and _rt in ("TRENDING_BEAR", "RISK_OFF")):
+        try:
+            from engine import relative_strength
+            if relative_strength.enabled():
+                _ok, _rsd = relative_strength.is_rs_leader(ticker)
+                if _ok:
+                    _rs_exempt = {"regime": _rt, **_rsd}
+                    _regime_blocks = False
+                    logger.info(
+                        f"[runner] {ticker} [{strategy_type}] RS-EXEMPT LONG in "
+                        f"{_rt} — RS {_rsd.get('rs_vs_spy_pct')}% vs SPY"
+                    )
+        except Exception as _rse:
+            logger.debug(f"[runner] {ticker} RS exemption check failed: {_rse}")
     if _regime_blocks:
         reason = f"market regime {_rt} against {direction}"
         logger.info(f"[runner] {ticker} [{strategy_type}] BLOCKED — {reason}")
@@ -1125,6 +1148,9 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
             # Tape bonus computed at fire-time from in-memory rolling tape.
             # Affects displayed confidence and feeds the optimizer feedback loop.
             "tape_bonus":    _tape_b,
+            # Set only when this LONG fired via the RS exemption to the regime
+            # long-veto — lets the scorecard isolate its realized expectancy.
+            **({"rs_exempt": _rs_exempt} if _rs_exempt else {}),
         },
         # New lifecycle / quality metadata
         "confidence_grade":   scored.get("confidence_grade", "B"),
