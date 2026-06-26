@@ -45,6 +45,18 @@ def _seg_fields(row: dict, group_by: str) -> dict:
     src    = bd.get("detector_source") or "SMC"
     strat  = row.get("strategy_type") or "—"
     regime = row.get("regime_type") or bd.get("regime_type") or bd.get("regime") or "—"
+    rs_x   = bool(bd.get("rs_exempt"))
+    # RS-exemption cohort: longs that fired through the regime long-veto because
+    # the name had relative strength. Tag the detector label so this experimental
+    # cohort shows as its own line ("SMC·RSx") in every detector-keyed view —
+    # that's how we watch its realized edge vs the standard detectors before
+    # trusting the exemption further.
+    if rs_x:
+        src = f"{src}·RSx"
+    if group_by in ("rs_exempt", "detector_rs_exempt"):
+        cohort = "RS-exempt" if rs_x else "Standard"
+        return ({"cohort": cohort} if group_by == "rs_exempt"
+                else {"detector": src, "cohort": cohort})
     if group_by == "regime":
         return {"regime": regime}
     if group_by == "detector_regime":
@@ -81,6 +93,8 @@ def _label(fields: dict) -> str:
         parts.append(f"{fields['side']}")
     if fields.get("conviction"):
         parts.append(f"@{fields['conviction']}")
+    if fields.get("cohort"):
+        parts.append(str(fields["cohort"]))
     return " · ".join(parts) if parts else "—"
 
 
@@ -239,7 +253,8 @@ def compute(rows: list, group_by: str = "detector",
     """
     if group_by not in ("detector", "regime", "detector_regime",
                         "conviction", "detector_conviction",
-                        "bucket", "detector_bucket", "detector_direction"):
+                        "bucket", "detector_bucket", "detector_direction",
+                        "rs_exempt", "detector_rs_exempt"):
         group_by = "detector"
 
     segs: dict = {}
