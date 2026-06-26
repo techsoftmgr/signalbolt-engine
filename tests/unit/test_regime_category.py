@@ -40,6 +40,33 @@ def test_knife_downtrend_underperformer():
     assert cat == "knife" and rs < 0
 
 
+def test_short_setup_on_confirmed_peak():
+    # A confirmed top → short strength, regardless of trend bucket.
+    closes = np.linspace(60, 100, 60)
+    ma20 = float(np.mean(closes[-20:]))
+    cat, _ = _regime_category(closes, ma20 * 1.10, ma20, 68.0, _spy(2.0), peak_stage="peak")
+    assert cat == "short_setup"
+
+
+def test_short_setup_on_momentum_breakdown_not_oversold():
+    # Breaking down but NOT yet washed out (rsi>42) → short.
+    closes = np.linspace(100, 70, 60)
+    ma20 = float(np.mean(closes[-20:]))
+    cat, _ = _regime_category(closes, float(closes[-1]), ma20, 48.0, _spy(-1.0),
+                              setup_type="breakdown")
+    assert cat == "short_setup"
+
+
+def test_oversold_breakdown_stays_knife_not_short():
+    # Breaking down AND deeply oversold (rsi<=42) → the falling knife: avoid BOTH
+    # sides (shorting the washed-out low measured -EV), so NOT short_setup.
+    closes = np.linspace(100, 60, 60)
+    ma20 = float(np.mean(closes[-20:]))
+    cat, _ = _regime_category(closes, float(closes[-1]), ma20, 30.0, _spy(-1.0),
+                              setup_type="breakdown")
+    assert cat == "knife"
+
+
 def test_neutral_when_no_spy():
     closes = np.linspace(60, 100, 60)
     cat, rs = _regime_category(closes, 100.0, 95.0, 55.0, None)
