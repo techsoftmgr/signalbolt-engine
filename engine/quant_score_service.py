@@ -838,7 +838,7 @@ def _score_ticker(
     # ── Setup type classification ─────────────────────────────────────────────
     setup_type, setup_reason = _classify_setup(
         current, ma20, rsi, rel_vol, breakout_score, mean_reversion_score, vwap,
-        breakdown_score,
+        breakdown_score, trend_score,
     )
 
     # ── Watch status ──────────────────────────────────────────────────────────
@@ -990,7 +990,7 @@ def _score_ticker(
 def _classify_setup(
     price: float, ma20: float, rsi: float, rel_vol: float,
     breakout_score: float, mean_rev_score: float, vwap: Optional[float],
-    breakdown_score: float = 0.0,
+    breakdown_score: float = 0.0, trend_score: float = 50.0,
 ) -> tuple[str, str]:
     """Return (setup_type, plain-English reason)."""
 
@@ -1014,9 +1014,15 @@ def _classify_setup(
     if vwap and price > vwap and price < vwap * 1.005:
         return "vwap_reclaim", "Price reclaiming VWAP — intraday structure improving"
 
-    # Pullback: healthy stock pulling back to MA
-    if price > ma20 * 0.97 and price < ma20 * 1.01 and rsi < 50:
-        return "pullback", f"Pulling back to 20-day average — possible support zone at {ma20:.2f}"
+    # Pullback: healthy stock in an UPTREND pulling back to its 20-day average.
+    # RSI band is 40–62 (not <50): a shallow pullback in a strong trend keeps RSI
+    # mid-range — the old rsi<50 gate only caught DEEP pullbacks (which usually
+    # mean the trend is breaking) and missed the good buy-the-dip setup (HOOD
+    # held its rising 20-EMA at ~93 with RSI 55). trend_score>=50 keeps this from
+    # mislabeling a bear-flag at a FALLING MA as a buyable pullback (the MSFT trap).
+    if (price > ma20 * 0.97 and price < ma20 * 1.01
+            and 40 <= rsi <= 62 and trend_score >= 50):
+        return "pullback", f"Pulling back to 20-day average in an uptrend — possible support zone at {ma20:.2f}"
 
     # Oversold bounce: RSI < 35, well below MA
     if rsi <= 35 and price < ma20 * 0.97:
