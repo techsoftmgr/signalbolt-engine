@@ -261,6 +261,8 @@ _SNAPSHOT_KEEP = (
     "wk52High", "wk52Low", "wk52Pct",
     "regimeCategory", "rsVsSpy",
     "cmf", "cmfState", "cmfCross", "cmfHistory",
+    "adx", "adxState", "squeezeState", "squeezeBias", "mfi", "mfiState",
+    "adrPct", "atrStopPct",
 )
 
 
@@ -717,6 +719,103 @@ def _cmf_state(cmf: Optional[float]) -> str:
     return "neutral"
 
 
+def _adx(daily_df, period: int = 14) -> Optional[float]:
+    """Wilder ADX — trend STRENGTH (not direction). >25 trending, <20 chop."""
+    try:
+        import pandas as pd
+        h = daily_df["high"].astype(float); l = daily_df["low"].astype(float); c = daily_df["close"].astype(float)
+        if len(c) < period * 2 + 1:
+            return None
+        up = h.diff(); dn = -l.diff()
+        plus_dm  = (((up > dn) & (up > 0)) * up.clip(lower=0))
+        minus_dm = (((dn > up) & (dn > 0)) * dn.clip(lower=0))
+        tr  = pd.concat([(h - l), (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+        a   = 1.0 / period
+        atr = tr.ewm(alpha=a, adjust=False).mean().replace(0, 1e-10)
+        pdi = 100 * plus_dm.ewm(alpha=a, adjust=False).mean()  / atr
+        mdi = 100 * minus_dm.ewm(alpha=a, adjust=False).mean() / atr
+        dx  = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, 1e-10)
+        adx = dx.ewm(alpha=a, adjust=False).mean()
+        return round(float(adx.iloc[-1]), 1)
+    except Exception:
+        return None
+
+
+def _adx_state(adx: Optional[float]) -> str:
+    if adx is None:  return "unknown"
+    if adx >= 25:    return "trending"      # trend strong enough to trade
+    if adx >= 20:    return "developing"
+    return "choppy"                          # no trend — chop/avoid
+
+
+def _squeeze(daily_df, length: int = 20, bb_mult: float = 2.0, kc_mult: float = 1.5) -> tuple[str, str]:
+    """TTM Squeeze — Bollinger Bands inside Keltner Channels = volatility coil.
+    Returns (state, bias): state ∈ on (coiling) / fired (just released) / off;
+    bias ∈ bull / bear / flat (price vs the basis = expected release direction)."""
+    try:
+        import pandas as pd
+        c = daily_df["close"].astype(float); h = daily_df["high"].astype(float); l = daily_df["low"].astype(float)
+        if len(c) < length + 2:
+            return "unknown", "flat"
+        basis = c.rolling(length).mean()
+        dev   = bb_mult * c.rolling(length).std()
+        up_bb, lo_bb = basis + dev, basis - dev
+        tr  = pd.concat([(h - l), (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+        rng = tr.rolling(length).mean()
+        up_kc, lo_kc = basis + kc_mult * rng, basis - kc_mult * rng
+        on = (lo_bb > lo_kc) & (up_bb < up_kc)
+        on_now, on_prev = bool(on.iloc[-1]), bool(on.iloc[-2])
+        state = "on" if on_now else ("fired" if on_prev else "off")
+        mom = float(c.iloc[-1] - basis.iloc[-1])
+        bias = "bull" if mom > 0 else ("bear" if mom < 0 else "flat")
+        return state, bias
+    except Exception:
+        return "unknown", "flat"
+
+
+def _mfi(daily_df, period: int = 14) -> Optional[float]:
+    """Money Flow Index — volume-weighted RSI (0-100). >80 overbought, <20 oversold."""
+    try:
+        h = daily_df["high"].values.astype(float); l = daily_df["low"].values.astype(float)
+        c = daily_df["close"].values.astype(float); v = daily_df["volume"].values.astype(float)
+        if len(c) < period + 1:
+            return None
+        tp  = (h + l + c) / 3.0
+        rmf = tp * v
+        d   = np.diff(tp)
+        pos = float(np.sum(np.where(d > 0, rmf[1:], 0.0)[-period:]))
+        neg = float(np.sum(np.where(d < 0, rmf[1:], 0.0)[-period:]))
+        if neg == 0:
+            return 100.0 if pos > 0 else 50.0
+        return round(100 - 100 / (1 + pos / neg), 1)
+    except Exception:
+        return None
+
+
+def _mfi_state(mfi: Optional[float]) -> str:
+    if mfi is None: return "unknown"
+    if mfi >= 80:   return "overbought"
+    if mfi <= 20:   return "oversold"
+    return "neutral"
+
+
+def _atr_adr(daily_df, price: float, period: int = 14) -> tuple[Optional[float], Optional[float]]:
+    """(adr_pct, atr_stop_pct): average daily range % + a 1.5×ATR stop distance as
+    % of price (a suggested swing-stop width / sizing aid)."""
+    try:
+        import pandas as pd
+        h = daily_df["high"].astype(float); l = daily_df["low"].astype(float); c = daily_df["close"].astype(float)
+        if len(c) < period + 1 or not price:
+            return None, None
+        tr  = pd.concat([(h - l), (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+        atr = float(tr.tail(period).mean())
+        adr_pct  = round(float(((h - l) / c * 100).tail(period).mean()), 2)
+        stop_pct = round(1.5 * atr / price * 100, 2)
+        return adr_pct, stop_pct
+    except Exception:
+        return None, None
+
+
 def _regime_category(closes, current: float, ma20: float, rsi: float,
                      spy_long_df, peak_stage: str = "none",
                      setup_type: str = "") -> tuple[str, Optional[float]]:
@@ -1070,6 +1169,12 @@ def _score_ticker(
     cmf_state = _cmf_state(cmf_val)
     cmf_cross = _cmf_cross(cmf_hist)
 
+    # ── ADX (trend strength) · TTM Squeeze (coil) · MFI (vol-weighted RSI) · ATR/ADR ──
+    adx_val = _adx(daily_df)
+    squeeze_state, squeeze_bias = _squeeze(daily_df)
+    mfi_val = _mfi(daily_df)
+    adr_pct, atr_stop_pct = _atr_adr(daily_df, current)
+
     return {
         "ticker":              ticker,
         "price":               round(current, 2),
@@ -1077,6 +1182,14 @@ def _score_ticker(
         "cmfState":            cmf_state,
         "cmfCross":            cmf_cross,        # 'bullish' | 'bearish' | None (recent zero-line cross)
         "cmfHistory":          cmf_hist,
+        "adx":                 adx_val,
+        "adxState":            _adx_state(adx_val),      # trending | developing | choppy
+        "squeezeState":        squeeze_state,            # on (coiling) | fired | off
+        "squeezeBias":         squeeze_bias,             # bull | bear | flat
+        "mfi":                 mfi_val,
+        "mfiState":            _mfi_state(mfi_val),       # overbought | oversold | neutral
+        "adrPct":              adr_pct,                   # avg daily range %
+        "atrStopPct":          atr_stop_pct,             # 1.5×ATR stop width, % of price
         "dayChangePct":        round(day_change_pct, 2),   # today's move vs prior close (direction)
         "regimeCategory":      regime_category,            # rs_pullback | rs_leader | knife | neutral
         "rsVsSpy":             rs_vs_spy,                  # 20d return vs SPY (pts)
