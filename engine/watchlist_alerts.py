@@ -37,6 +37,7 @@ def _state_of(q: dict, price) -> dict:
         "peak":    q.get("peakStage") or "none",
         "status":  q.get("watchStatus") or "",
         "aboveMA": bool(above),
+        "cmf":     q.get("cmf"),
     }
 
 
@@ -55,6 +56,19 @@ def _events(prev: dict, cur: dict) -> list[tuple[str, str, str]]:
     if (not cur["aboveMA"]) and prev.get("aboveMA") is True:
         out.append(("losttrend", "⚠️ {t} — Trend lost",
                     "{t} dropped below its 20-day average. Tap for details."))
+    # Money-flow zero-line cross (Chaikin Money Flow). Bullish = institutional
+    # money rotating IN; bearish = distribution starting. ±0.05 buffer filters
+    # chop right at the zero line.
+    pcmf, ccmf = prev.get("cmf"), cur.get("cmf")
+    if pcmf is not None and ccmf is not None:
+        if pcmf <= 0 and ccmf >= 0.05:
+            out.append(("cmf_bull", "💰 {t} — Money flowing in",
+                        "{t} money flow just crossed positive (CMF > 0) — institutional buyers "
+                        "stepping in. Tap for the money-flow read."))
+        elif pcmf >= 0 and ccmf <= -0.05:
+            out.append(("cmf_bear", "💸 {t} — Money flowing out",
+                        "{t} money flow just crossed negative (CMF < 0) — distribution starting. "
+                        "Tap for the money-flow read."))
     return out
 
 

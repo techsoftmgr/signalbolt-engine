@@ -4,7 +4,7 @@ Pure OHLCV math; pins the bounds, the state classifier, and edge cases.
 """
 import pandas as pd
 
-from engine.quant_score_service import _cmf, _cmf_state
+from engine.quant_score_service import _cmf, _cmf_state, _cmf_cross
 
 
 def _df(rows):
@@ -55,3 +55,18 @@ def test_state_thresholds():
     assert _cmf_state(-0.07) == "mild_distribution"
     assert _cmf_state(-0.20) == "distribution"
     assert _cmf_state(None) == "unknown"
+
+
+def test_cmf_cross_detects_bullish_and_bearish():
+    # crossed up through zero into accumulation (the MSFT screenshot case)
+    assert _cmf_cross([-0.13, -0.08, -0.03, 0.02, 0.08]) == "bullish"
+    # crossed down through zero into distribution
+    assert _cmf_cross([0.12, 0.06, 0.01, -0.03, -0.09]) == "bearish"
+
+
+def test_cmf_cross_ignores_chop_at_zero_line():
+    # oscillating just around zero, never clears the ±0.05 buffer → no cross
+    assert _cmf_cross([-0.01, 0.01, -0.02, 0.02, 0.01]) is None
+    # already positive, no fresh cross
+    assert _cmf_cross([0.10, 0.11, 0.12, 0.13, 0.14]) is None
+    assert _cmf_cross([]) is None and _cmf_cross([0.1, 0.2]) is None
