@@ -260,7 +260,7 @@ _SNAPSHOT_KEEP = (
     "turnaroundStage", "peakStage",
     "wk52High", "wk52Low", "wk52Pct",
     "regimeCategory", "rsVsSpy",
-    "cmf", "cmfState", "cmfHistory",
+    "cmf", "cmfState", "cmfCross", "cmfHistory",
 )
 
 
@@ -683,6 +683,25 @@ def _cmf(daily_df, period: int = 20, hist: int = 30) -> tuple[Optional[float], l
         return None, []
 
 
+def _cmf_cross(hist: list, buffer: float = 0.05, lookback: int = 2) -> Optional[str]:
+    """Recent CMF zero-line cross → 'bullish' (money rotating IN) / 'bearish'
+    (distribution starting) / None. Requires a decisive cross past ±buffer within
+    the last `lookback` sessions (filters chop right at the zero line)."""
+    try:
+        if not hist or len(hist) < 3:
+            return None
+        recent  = hist[-(lookback + 1):]
+        latest  = recent[-1]
+        earlier = recent[:-1]
+        if latest >= buffer and min(earlier) < 0:
+            return "bullish"
+        if latest <= -buffer and max(earlier) > 0:
+            return "bearish"
+        return None
+    except Exception:
+        return None
+
+
 def _cmf_state(cmf: Optional[float]) -> str:
     """Plain-English money-flow read from the CMF value."""
     if cmf is None:
@@ -1049,12 +1068,14 @@ def _score_ticker(
     # ── Chaikin Money Flow (institutional accumulation/distribution) ──────────
     cmf_val, cmf_hist = _cmf(daily_df)
     cmf_state = _cmf_state(cmf_val)
+    cmf_cross = _cmf_cross(cmf_hist)
 
     return {
         "ticker":              ticker,
         "price":               round(current, 2),
         "cmf":                 round(cmf_val, 3) if cmf_val is not None else None,
         "cmfState":            cmf_state,
+        "cmfCross":            cmf_cross,        # 'bullish' | 'bearish' | None (recent zero-line cross)
         "cmfHistory":          cmf_hist,
         "dayChangePct":        round(day_change_pct, 2),   # today's move vs prior close (direction)
         "regimeCategory":      regime_category,            # rs_pullback | rs_leader | knife | neutral
