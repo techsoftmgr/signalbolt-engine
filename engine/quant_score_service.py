@@ -260,6 +260,7 @@ _SNAPSHOT_KEEP = (
     "turnaroundStage", "peakStage",
     "wk52High", "wk52Low", "wk52Pct",
     "regimeCategory", "rsVsSpy",
+    "cmf", "cmfState", "cmfHistory",
 )
 
 
@@ -646,6 +647,57 @@ def _recent_max_rsi(closes, lookback: int = 10, period: int = 14) -> float:
         return 0.0
 
 
+def _cmf(daily_df, period: int = 20, hist: int = 30) -> tuple[Optional[float], list]:
+    """
+    Chaikin Money Flow (CMF-N) — money flowing IN vs OUT over N sessions.
+      Money Flow Multiplier = ((C-L) - (H-C)) / (H-L)   (0 if H==L)
+      Money Flow Volume      = MFM * volume
+      CMF(N)                 = Σ MFV(N) / Σ vol(N)   → range [-1, +1]
+    Positive = accumulation (buyers in control), negative = distribution. Returns
+    (latest_cmf, last `hist` CMF values for a sparkline). None if insufficient data.
+    Never raises.
+    """
+    try:
+        if daily_df is None or "high" not in daily_df or "low" not in daily_df or "volume" not in daily_df:
+            return None, []
+        h = daily_df["high"].values.astype(float)
+        l = daily_df["low"].values.astype(float)
+        c = daily_df["close"].values.astype(float)
+        v = daily_df["volume"].values.astype(float)
+        if len(c) < period + 1:
+            return None, []
+        rng = np.where((h - l) == 0, np.nan, h - l)
+        mfm = ((c - l) - (h - c)) / rng
+        mfv = np.nan_to_num(mfm) * v                      # 0-range bars contribute 0 flow
+        # rolling CMF over `period` (cumsum trick), keep the last `hist` points
+        n = len(c)
+        series = []
+        start = max(period, n - hist + 1)
+        for i in range(start, n + 1):
+            win_mfv = float(np.sum(mfv[i - period:i]))
+            win_vol = float(np.sum(v[i - period:i]))
+            series.append(round(win_mfv / win_vol, 4) if win_vol > 0 else 0.0)
+        latest = series[-1] if series else None
+        return latest, series
+    except Exception:
+        return None, []
+
+
+def _cmf_state(cmf: Optional[float]) -> str:
+    """Plain-English money-flow read from the CMF value."""
+    if cmf is None:
+        return "unknown"
+    if cmf >= 0.10:
+        return "accumulation"          # money flowing in (institutional buying)
+    if cmf >= 0.05:
+        return "mild_accumulation"
+    if cmf <= -0.10:
+        return "distribution"          # money flowing out (institutional selling)
+    if cmf <= -0.05:
+        return "mild_distribution"
+    return "neutral"
+
+
 def _regime_category(closes, current: float, ma20: float, rsi: float,
                      spy_long_df, peak_stage: str = "none",
                      setup_type: str = "") -> tuple[str, Optional[float]]:
@@ -994,9 +1046,16 @@ def _score_ticker(
         peak_stage=peak_stage, setup_type=setup_type,
     )
 
+    # ── Chaikin Money Flow (institutional accumulation/distribution) ──────────
+    cmf_val, cmf_hist = _cmf(daily_df)
+    cmf_state = _cmf_state(cmf_val)
+
     return {
         "ticker":              ticker,
         "price":               round(current, 2),
+        "cmf":                 round(cmf_val, 3) if cmf_val is not None else None,
+        "cmfState":            cmf_state,
+        "cmfHistory":          cmf_hist,
         "dayChangePct":        round(day_change_pct, 2),   # today's move vs prior close (direction)
         "regimeCategory":      regime_category,            # rs_pullback | rs_leader | knife | neutral
         "rsVsSpy":             rs_vs_spy,                  # 20d return vs SPY (pts)
