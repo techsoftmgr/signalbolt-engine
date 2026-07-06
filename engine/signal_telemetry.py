@@ -136,6 +136,7 @@ _CTX_FIELDS = (
     "relativeVolume", "ma20", "atrPct", "rsi", "dayChangePct",
     "distToBreakoutPct", "trendScore", "momentumScore",
     "turnaroundStage", "peakStage", "setupType",
+    "cmf", "cmfState", "cmfCross",   # money-flow context at fire time (for the scorecard segment)
 )
 
 

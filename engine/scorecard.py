@@ -72,6 +72,13 @@ def _seg_fields(row: dict, group_by: str) -> dict:
         return {"bucket": bkt} if group_by == "bucket" else {"detector": src, "bucket": bkt}
     if group_by == "detector_direction":
         return {"detector": src, "side": (row.get("direction") or "?").upper()}
+    if group_by in ("cmf", "detector_cmf"):
+        # Money-flow context at fire time (Chaikin Money Flow state). Answers
+        # "do signals fired while money was flowing IN beat those fired during
+        # distribution?" — the measure-first gate before wiring CMF into firing.
+        cmf_state = bd.get("cmfState") or "unknown"
+        return ({"cmf": cmf_state} if group_by == "cmf"
+                else {"detector": src, "cmf": cmf_state})
     return {"detector": src, "strategy": strat}   # default: detector
 
 
@@ -95,6 +102,8 @@ def _label(fields: dict) -> str:
         parts.append(f"@{fields['conviction']}")
     if fields.get("cohort"):
         parts.append(str(fields["cohort"]))
+    if fields.get("cmf"):
+        parts.append(f"flow:{fields['cmf']}")
     return " · ".join(parts) if parts else "—"
 
 
@@ -254,7 +263,8 @@ def compute(rows: list, group_by: str = "detector",
     if group_by not in ("detector", "regime", "detector_regime",
                         "conviction", "detector_conviction",
                         "bucket", "detector_bucket", "detector_direction",
-                        "rs_exempt", "detector_rs_exempt"):
+                        "rs_exempt", "detector_rs_exempt",
+                        "cmf", "detector_cmf"):
         group_by = "detector"
 
     segs: dict = {}
