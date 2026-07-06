@@ -192,3 +192,55 @@ def _close_momentum(sb, sig_id, ticker, direction, entry, price, why: str) -> No
                note=(f"{'✅' if won else '🔴'} Trend exit ({why}) @ ${price:.2f} "
                      f"({'+' if pnl >= 0 else ''}{pnl:.1f}%) — rode the move"))
     logger.info(f"[momentum_monitor] {ticker} CLOSED via {why} @ ${price:.2f} ({pnl:+.1f}%)")
+
+
+def stop_backstop(sb) -> dict:
+    """
+    LAST-RESORT safety net for TREND_MOMENTUM signals — closes any whose last
+    COMPLETED daily close is beyond its stored stop_loss but that manage() failed
+    to close (e.g. the primary job errored / didn't run — LRCX sat 34 days open).
+
+    TREND_MOMENTUM is otherwise managed ONLY by manage() (generic signal_monitor
+    skips it), so without this a manage() outage orphans the position with no stop.
+    This runs on a SEPARATE schedule (see runner) so one job's failure can't
+    disable the other. Daily-close based (respects the ignore-wicks design) and
+    does NOTHING but enforce the stored stop — no trailing, no targets. The caller
+    gates it to run only when the market is CLOSED, so closes[-1] is a settled bar.
+    """
+    stats = {"checked": 0, "closed": 0, "ok": 0}
+    try:
+        rows = (sb.table("signals").select("*").eq("status", "active").execute().data) or []
+    except Exception as e:
+        logger.error(f"[momentum_backstop] fetch failed: {e}")
+        return {"error": str(e)}
+    mom = [r for r in rows if _is_momentum(r) and (r.get("management_mode") or "engine") != "manual"]
+    stats["checked"] = len(mom)
+    for sig in mom:
+        try:
+            ticker = sig["ticker"]; is_long = sig["direction"] == "LONG"
+            entry = float(sig["entry_price"]); sl = float(sig["stop_loss"]); sig_id = sig["id"]
+            df = alpaca_client.get_bars(ticker, timeframe="1Day", days=6)
+            if df is None or len(df) < 2:
+                continue
+            last_close = float(df["close"].values.astype(float)[-1])
+            breached = (last_close < sl) if is_long else (last_close > sl)
+            if not breached:
+                stats["ok"] += 1
+                continue
+            # Re-validate against a sane close price so a single bad print can't
+            # force a spurious backstop close (phantom-guard discipline).
+            price = alpaca_client.sane_close_price(ticker, last_close) or last_close
+            still = (price < sl) if is_long else (price > sl)
+            if not still:
+                stats["ok"] += 1
+                continue
+            logger.warning(f"[momentum_backstop] {ticker} daily close {last_close:.2f} beyond "
+                           f"stored stop {sl:.2f} but still open — SAFETY CLOSE")
+            _close_momentum(sb, sig_id, ticker, sig["direction"], entry, price,
+                            "stop backstop (daily close beyond stored stop — manage() missed it)")
+            stats["closed"] += 1
+        except Exception as e:
+            logger.debug(f"[momentum_backstop] {sig.get('ticker')} error: {e}")
+    if stats["closed"]:
+        logger.info(f"[momentum_backstop] done — {stats}")
+    return stats

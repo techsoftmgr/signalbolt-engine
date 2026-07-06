@@ -3750,6 +3750,35 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled RS-Pullback signal scan (30 min, RTH)")
 
+    # ── Momentum stop BACKSTOP — safety net for TREND_MOMENTUM ───────────────
+    # TREND_MOMENTUM is managed only by momentum_monitor.manage(); the generic
+    # signal_monitor skips it. If manage() errors/doesn't run, a signal is orphaned
+    # with no stop (LRCX sat 34 days past its stop). This independent job closes any
+    # momentum signal whose last COMPLETED daily close is beyond its stored stop.
+    # Runs every 4h but self-gates to market-CLOSED times only (so closes[-1] is a
+    # settled bar and it never front-runs the intraday-riding design).
+    def _run_momentum_backstop():
+        try:
+            from datetime import datetime as _dt
+            from zoneinfo import ZoneInfo as _ZI
+            now_et = _dt.now(_ZI("America/New_York"))
+            if now_et.weekday() < 5 and (9 <= now_et.hour < 16):
+                return   # during RTH the last daily bar is in-progress — skip
+            from engine import momentum_monitor
+            momentum_monitor.stop_backstop(_supabase())
+        except Exception as _e:
+            logger.error(f"[runner] momentum stop backstop failed: {_e}")
+
+    scheduler.add_job(
+        _run_momentum_backstop,
+        trigger=IntervalTrigger(hours=4),
+        id="momentum_stop_backstop",
+        name="Momentum stop backstop (4h, market-closed only)",
+        replace_existing=True, max_instances=1, coalesce=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=150),
+    )
+    logger.info("[runner] Scheduled Momentum stop backstop (4h, market-closed)")
+
     # ── Sector Leaders — daily RS ranking of the 11 SPDR sectors, 4:50 PM ET
     # (just after Market Pulse, both post-close). Standalone; trading-day gated. ──
     def _run_sector_leaders():
