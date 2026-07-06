@@ -188,7 +188,7 @@ def _empty_dashboard(warming: bool = False) -> dict:
         },
         "topMomentum": [], "pullbacks": [], "breakouts": [], "breakdowns": [],
         "highVolumeUp": [], "highVolumeDown": [], "vwapReclaim": [],
-        "oversoldBounce": [], "turnaround": [], "peak": [], "allScored": [],
+        "oversoldBounce": [], "turnaround": [], "peak": [], "squeeze": [], "allScored": [],
         "warming": warming,
     }
 
@@ -588,6 +588,16 @@ def _build_dashboard(tickers: list[str]) -> dict:
             key=lambda x: -(x.get("peakScore") or 0),
         )[:_BUCKET_LIMIT]
 
+        # Squeeze (volatility coil → breakout) — universe scan for names in a TTM
+        # squeeze. FIRED (just released, actionable now) first, then COILING (the
+        # watch pipeline), each ranked by ADX (a coil resolving into a strong trend
+        # is the higher-quality setup). Display/discovery only — not a fired signal.
+        _sq_rank = {"fired": 0, "on": 1}
+        squeeze = sorted(
+            [x for x in scored if x.get("squeezeState") in ("on", "fired")],
+            key=lambda x: (_sq_rank.get(x.get("squeezeState"), 9), -(x.get("adx") or 0)),
+        )[:_BUCKET_LIMIT]
+
         # Persist the FULL scored universe (every name, not just the top-20
         # allScored) so universe-wide consumers — the breakdown/heavy-selling
         # alerts — can read each ticker's current state and reuse THIS scan
@@ -617,6 +627,7 @@ def _build_dashboard(tickers: list[str]) -> dict:
             "oversoldBounce": oversold_bounce,
             "turnaround":     turnaround,
             "peak":           peak,
+            "squeeze":        squeeze,
             "allScored":      sorted_by_quant[:20],
         }
 
