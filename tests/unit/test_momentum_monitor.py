@@ -107,3 +107,43 @@ class TestRatchetedStopFloor:
             sl=300.0, roll_high=420.0, atr=15.0, last_close=380.0,
             entry=329.75, sma50=320.0)
         assert eff_sl == round(chand, 2) and eff_sl > 300.0 and exits is False
+
+
+class TestStopBackstop:
+    """The independent safety net: closes a TREND_MOMENTUM signal whose completed
+    daily close is beyond its stored stop but manage() didn't close it."""
+
+    class _SB:
+        def __init__(self, rows): self._rows = rows
+        def table(self, *_): return self
+        def select(self, *_): return self
+        def eq(self, *_): return self
+        def execute(self): return type("R", (), {"data": self._rows})()
+
+    def _row(self, stop, direction="LONG"):
+        return {"id": "s1", "ticker": "LRCX", "direction": direction, "entry_price": 329.75,
+                "stop_loss": stop, "status": "active",
+                "score_breakdown": {"detector_source": "TREND_MOMENTUM"}}
+
+    def test_closes_when_daily_close_beyond_stored_stop(self, monkeypatch):
+        import pandas as pd
+        df = pd.DataFrame({"close": [400, 390, 353.34], "high": [0, 0, 0],
+                           "low": [0, 0, 0], "open": [0, 0, 0], "volume": [1, 1, 1]})
+        monkeypatch.setattr(mm.alpaca_client, "get_bars", lambda *a, **k: df)
+        monkeypatch.setattr(mm.alpaca_client, "sane_close_price", lambda t, p: p)
+        closed = {}
+        monkeypatch.setattr(mm, "_close_momentum",
+                            lambda sb, sid, tk, d, e, px, why: closed.update({"px": px, "why": why}))
+        stats = mm.stop_backstop(self._SB([self._row(stop=372.49)]))
+        assert stats["closed"] == 1 and closed["px"] == 353.34 and "backstop" in closed["why"]
+
+    def test_leaves_open_when_close_above_stop(self, monkeypatch):
+        import pandas as pd
+        df = pd.DataFrame({"close": [400, 390, 380.0], "high": [0, 0, 0],
+                           "low": [0, 0, 0], "open": [0, 0, 0], "volume": [1, 1, 1]})
+        monkeypatch.setattr(mm.alpaca_client, "get_bars", lambda *a, **k: df)
+        monkeypatch.setattr(mm.alpaca_client, "sane_close_price", lambda t, p: p)
+        monkeypatch.setattr(mm, "_close_momentum",
+                            lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not close")))
+        stats = mm.stop_backstop(self._SB([self._row(stop=372.49)]))
+        assert stats["closed"] == 0 and stats["ok"] == 1
