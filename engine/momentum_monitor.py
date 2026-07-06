@@ -129,19 +129,26 @@ def manage(sb) -> dict:
                 # last_close, so it can't force a spurious exit — only ratchets up.
                 if gain_pct >= _GIVEBACK_MIN_GAIN:
                     chandelier = max(chandelier, last_close * (1 - _GIVEBACK_CAP))
-                # Exit only on a CONFIRMED daily close below the stop or the
-                # structural SMA50 (trend regime break). Wicks are ignored.
-                if last_close < chandelier or last_close < sma50:
-                    why = "chandelier" if last_close < chandelier else "SMA50 break"
+                # Ratchet the stored stop UP toward the chandelier — never down.
+                # The stop is a HARD FLOOR: the recomputed chandelier can WIDEN
+                # (loosen) when the open gain shrinks — mult 2.5→3.0 — or ATR
+                # expands, so exiting on the raw chandelier let a locked gain be
+                # given back AND made the displayed stop a lie (LRCX: displayed
+                # 372.49, raw chandelier re-widened to 348.74, close 353 → never
+                # closed though "stopped"). Exit on the RATCHETED floor instead.
+                eff_sl = round(max(sl, chandelier), 2)
+                # Exit only on a CONFIRMED daily close below the ratcheted stop or
+                # the structural SMA50 (trend regime break). Wicks are ignored.
+                if last_close < eff_sl or last_close < sma50:
+                    why = "trailing stop" if last_close < eff_sl else "SMA50 break"
                     _close_momentum(sb, sig_id, ticker, "LONG", entry, price, why)
                     stats["closed"] += 1
                     continue
-                new_sl = round(max(sl, chandelier), 2)   # ratchet up only
-                if new_sl > sl + 0.01:
-                    _update_sl(sb, sig_id, new_sl, sig=sig)
-                    _locked = (new_sl - entry) / entry * 100
+                if eff_sl > sl + 0.01:
+                    _update_sl(sb, sig_id, eff_sl, sig=sig)
+                    _locked = (eff_sl - entry) / entry * 100
                     _log_event(sb, sig_id, "be_move", price=price,
-                               note=(f"📈 Chandelier trail → ${new_sl:.2f} "
+                               note=(f"📈 Chandelier trail → ${eff_sl:.2f} "
                                      f"({_mtxt} below {roll_high:.2f}, locks "
                                      f"{'+' if _locked >= 0 else ''}{_locked:.0f}%, rides the trend)"))
                     stats["trailed"] += 1
@@ -150,17 +157,20 @@ def manage(sb) -> dict:
                 chandelier = roll_low + mult * atr
                 if gain_pct >= _GIVEBACK_MIN_GAIN:
                     chandelier = min(chandelier, last_close * (1 + _GIVEBACK_CAP))
-                if last_close > chandelier or last_close > sma50:
-                    why = "chandelier" if last_close > chandelier else "SMA50 break"
+                # Ratchet DOWN only; exit on the ratcheted floor, not the raw
+                # chandelier (mirror of the LONG fix — a loosening cover level must
+                # not give back a locked short gain / contradict the displayed stop).
+                eff_sl = round(min(sl, chandelier), 2)
+                if last_close > eff_sl or last_close > sma50:
+                    why = "trailing stop" if last_close > eff_sl else "SMA50 break"
                     _close_momentum(sb, sig_id, ticker, "SHORT", entry, price, why)
                     stats["closed"] += 1
                     continue
-                new_sl = round(min(sl, chandelier), 2)
-                if new_sl < sl - 0.01:
-                    _update_sl(sb, sig_id, new_sl, sig=sig)
-                    _locked = (entry - new_sl) / entry * 100
+                if eff_sl < sl - 0.01:
+                    _update_sl(sb, sig_id, eff_sl, sig=sig)
+                    _locked = (entry - eff_sl) / entry * 100
                     _log_event(sb, sig_id, "be_move", price=price,
-                               note=(f"📉 Chandelier trail → ${new_sl:.2f} "
+                               note=(f"📉 Chandelier trail → ${eff_sl:.2f} "
                                      f"({_mtxt} above {roll_low:.2f}, locks "
                                      f"{'+' if _locked >= 0 else ''}{_locked:.0f}%, rides the trend)"))
                     stats["trailed"] += 1

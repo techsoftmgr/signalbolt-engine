@@ -66,3 +66,44 @@ class TestGivebackFloor:
             roll_high=110.0, atr=10.0, last_close=108.0, entry=100.0)
         assert gain < mm._GIVEBACK_MIN_GAIN
         assert chand == 110.0 - 3.0 * 10.0   # full 3×ATR, no floor
+
+
+class TestRatchetedStopFloor:
+    """The stored stop is a HARD floor: the exit must use max(sl, chandelier),
+    not the raw (re-widening) chandelier. Pins the LRCX bug fix — a locked stop
+    must not loosen when the open gain shrinks / ATR expands."""
+
+    @staticmethod
+    def _long_exit(sl, roll_high, atr, last_close, entry, sma50):
+        gain = (last_close - entry) / entry * 100
+        chand = roll_high - mm._atr_mult_for_gain(gain) * atr
+        if gain >= mm._GIVEBACK_MIN_GAIN:
+            chand = max(chand, last_close * (1 - mm._GIVEBACK_CAP))
+        eff_sl = round(max(sl, chand), 2)         # ratchet up only — the FIX
+        return (last_close < eff_sl or last_close < sma50), eff_sl, chand
+
+    def test_lrcx_locked_stop_still_exits_when_chandelier_reloosens(self):
+        # LRCX: stop ratcheted to 372.49 at +31% (mult 2.5); gain fell to +7%
+        # (mult 3.0) + ATR grew → raw chandelier re-widened to ~348.74. Close 353
+        # is BELOW the locked stop but ABOVE the raw chandelier.
+        exits, eff_sl, chand = self._long_exit(
+            sl=372.49, roll_high=438.50, atr=29.92, last_close=353.34,
+            entry=329.75, sma50=322.84)
+        assert round(chand, 2) < 372.49            # raw chandelier loosened below the lock
+        assert eff_sl == 372.49                     # exit honors the ratcheted floor
+        assert exits is True                        # → CLOSES (the bug closed nothing)
+
+    def test_still_rides_while_above_the_locked_stop(self):
+        # Above the ratcheted stop → keep riding (no premature exit).
+        exits, eff_sl, _ = self._long_exit(
+            sl=372.49, roll_high=438.50, atr=29.92, last_close=400.0,
+            entry=329.75, sma50=322.84)
+        assert exits is False and eff_sl == 372.49
+
+    def test_chandelier_above_stop_tightens_exit(self):
+        # Still trending: chandelier ABOVE the old stop → exit uses the higher
+        # chandelier (eff_sl ratchets up), same as before the fix.
+        exits, eff_sl, chand = self._long_exit(
+            sl=300.0, roll_high=420.0, atr=15.0, last_close=380.0,
+            entry=329.75, sma50=320.0)
+        assert eff_sl == round(chand, 2) and eff_sl > 300.0 and exits is False
