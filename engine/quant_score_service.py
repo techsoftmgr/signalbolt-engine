@@ -765,7 +765,20 @@ def _squeeze(daily_df, length: int = 20, bb_mult: float = 2.0, kc_mult: float = 
     bias ∈ bull / bear / flat (price vs the basis = expected release direction)."""
     try:
         import pandas as pd
-        c = daily_df["close"].astype(float); h = daily_df["high"].astype(float); l = daily_df["low"].astype(float)
+        # Compute on the last COMPLETED daily bar — drop today's still-forming bar so
+        # the state is a SETTLED daily read that changes at most once/day (at the
+        # close), instead of flickering fired↔coiling intraday as today's bar builds.
+        df = daily_df
+        try:
+            from datetime import datetime as _dt
+            from zoneinfo import ZoneInfo as _ZI
+            _et = _ZI("America/New_York")
+            _last = df.index[-1]
+            if getattr(_last, "tzinfo", None) is not None and _last.tz_convert(_et).date() == _dt.now(_et).date():
+                df = df.iloc[:-1]
+        except Exception:
+            pass
+        c = df["close"].astype(float); h = df["high"].astype(float); l = df["low"].astype(float)
         if len(c) < length + 2:
             return "unknown", "flat"
         basis = c.rolling(length).mean()
