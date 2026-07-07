@@ -50,6 +50,24 @@ def test_squeeze_unknown_on_short_data():
     assert _squeeze(_df([1, 2, 3])) == ("unknown", "flat")
 
 
+def test_squeeze_ignores_todays_forming_bar():
+    # A daily indicator should read the last COMPLETED bar — dropping today's
+    # still-forming bar so the state doesn't flicker fired↔coiling intraday.
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo("America/New_York")
+    today = pd.Timestamp(datetime.now(et).date(), tz=et)
+    idx = pd.date_range(end=today, periods=41, freq="D", tz=et)   # last row == today
+    closes = np.linspace(90, 110, 41)
+    df = pd.DataFrame({"open": closes, "high": closes + 1, "low": closes - 1,
+                       "close": closes, "volume": [1e6] * 41}, index=idx)
+    # Make today's (forming) bar anomalous — it would change the state IF used.
+    df.iloc[-1, df.columns.get_loc("high")] = 200.0
+    df.iloc[-1, df.columns.get_loc("low")]  = 50.0
+    df.iloc[-1, df.columns.get_loc("close")] = 195.0
+    assert _squeeze(df) == _squeeze(df.iloc[:-1])   # today's bar was dropped
+
+
 # ── MFI ──────────────────────────────────────────────────────────────────────
 def test_mfi_bounds_and_states():
     up = _df(np.linspace(50, 150, 30))            # every bar up → strong inflow
