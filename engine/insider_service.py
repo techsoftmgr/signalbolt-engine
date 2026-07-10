@@ -86,6 +86,14 @@ def parse_form4(xml_bytes: bytes, ticker: str, filing_date: str | None = None) -
         root = ET.fromstring(xml_bytes)
     except Exception:
         return out
+    # ISSUER guard: our per-CIK feed (e.g. Robinhood's CIK) also returns Form 4s
+    # where this entity is the 10% OWNER of ANOTHER company — those report the OTHER
+    # stock (a ~$31 name) and must NOT be tagged to HOOD. Only keep filings whose
+    # ISSUER trading symbol matches the ticker we're ingesting. (Root cause of the
+    # "Robinhood Markets, Inc. — 10% Owner — $31.35" rows on HOOD.)
+    issuer_sym = (_txt(root, ".//issuer/issuerTradingSymbol") or "").strip().upper()
+    if issuer_sym and ticker and issuer_sym != ticker.strip().upper():
+        return out
     owner = _txt(root, ".//reportingOwner/reportingOwnerId/rptOwnerName") or "?"
     role = _role(root.find(".//reportingOwner/reportingOwnerRelationship"))
     # Filing-level context for classifying SELLS as scheduled / comp-driven vs discretionary:
