@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 
 from engine.quant_score_service import (
-    _adx, _adx_state, _squeeze, _mfi, _mfi_state, _atr_adr,
+    _adx, _adx_state, _squeeze, _mfi, _mfi_state, _atr_adr, _opening_relvol,
 )
 
 
@@ -78,6 +78,28 @@ def test_mfi_bounds_and_states():
 
 
 # ── ATR / ADR ────────────────────────────────────────────────────────────────
+def test_opening_relvol_flags_heavy_open():
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo("America/New_York")
+    recs = []
+    days = pd.date_range("2026-07-06", periods=4, freq="D", tz=et)
+    for i, day in enumerate(days):
+        openv = 2_000_000 if i == len(days) - 1 else 1_000_000       # today's open 2×
+        for hh, mm, is_open in [(9, 30, True), (9, 45, True), (10, 0, False), (10, 30, False)]:
+            ts = day.replace(hour=hh, minute=mm).tz_convert("UTC")
+            recs.append((ts, openv if is_open else 300_000))
+    df = pd.DataFrame({"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0,
+                       "volume": [r[1] for r in recs]},
+                      index=pd.DatetimeIndex([r[0] for r in recs]))
+    rv, state = _opening_relvol(df)          # first 30m: 2×2M vs 2×1M
+    assert rv == 2.0 and state == "heavy"
+
+
+def test_opening_relvol_none_on_thin_data():
+    assert _opening_relvol(None) == (None, "unknown")
+    assert _opening_relvol(_df(np.full(5, 100.0)))[0] is None   # no datetime index / RTH
+
+
 def test_atr_adr_positive_and_scales_with_range():
     tight = _df(np.full(30, 100.0), rng=0.5)
     wide  = _df(np.full(30, 100.0), rng=4.0)

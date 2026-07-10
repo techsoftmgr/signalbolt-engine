@@ -262,7 +262,7 @@ _SNAPSHOT_KEEP = (
     "regimeCategory", "rsVsSpy",
     "cmf", "cmfState", "cmfCross", "cmfHistory",
     "adx", "adxState", "squeezeState", "squeezeBias", "mfi", "mfiState",
-    "adrPct", "atrStopPct",
+    "adrPct", "atrStopPct", "openingRelVol", "openingVolState",
 )
 
 
@@ -871,6 +871,39 @@ def _atr_adr(daily_df, price: float, period: int = 14) -> tuple[Optional[float],
         return None, None
 
 
+def _opening_relvol(intraday_df, window_min: int = 30) -> tuple[Optional[float], str]:
+    """Opening relative volume — today's first `window_min` minutes of RTH volume vs
+    the AVERAGE of the same opening window over prior sessions. Catches a heavy-volume
+    OPEN (a gap/rejection sold or bought hard at the bell) that the full-session
+    pace-adjusted relVol MASKS — e.g. HOOD 2026-07-10 opened ~1.7× on a -6% dump while
+    the full day came in at 0.76×. None if not enough intraday history. Never raises."""
+    try:
+        if intraday_df is None or "volume" not in intraday_df or len(intraday_df) < 3:
+            return None, "unknown"
+        et  = intraday_df.index.tz_convert("America/New_York")
+        hm  = np.array([t.hour * 60 + t.minute for t in et])
+        day = np.array([t.date() for t in et])
+        vol = intraday_df["volume"].values.astype(float)
+        mask = (hm >= 570) & (hm < 570 + window_min)   # 9:30 .. 9:30+window (RTH open)
+        if not mask.any():
+            return None, "unknown"
+        by_day: dict = {}
+        for d_, v_ in zip(day[mask], vol[mask]):
+            by_day[d_] = by_day.get(d_, 0.0) + float(v_)
+        days = sorted(by_day.keys())
+        if len(days) < 3:
+            return None, "unknown"
+        today_v = by_day[days[-1]]
+        base    = float(np.mean([by_day[d_] for d_ in days[:-1]]))
+        if base <= 0:
+            return None, "unknown"
+        rv = round(today_v / base, 2)
+        state = "heavy" if rv >= 1.5 else ("light" if rv < 0.7 else "normal")
+        return rv, state
+    except Exception:
+        return None, "unknown"
+
+
 def _regime_category(closes, current: float, ma20: float, rsi: float,
                      spy_long_df, peak_stage: str = "none",
                      setup_type: str = "") -> tuple[str, Optional[float]]:
@@ -1021,6 +1054,8 @@ def _score_ticker(
     from engine.volume_curve import session_relvol
     avg_vol = float(np.mean(volumes[-20:])) if len(volumes) >= 20 else (float(np.mean(volumes)) if len(volumes) else 0.0)
     rel_vol = session_relvol(intraday_df, avg_vol)
+    # Opening relVol — heavy volume AT THE OPEN that the full-session relVol masks.
+    opening_relvol, opening_vol_state = _opening_relvol(intraday_df)
 
     volume_score = float(np.clip(_normalize(rel_vol, 0.5, 3.0), 0, 100))
 
@@ -1251,6 +1286,8 @@ def _score_ticker(
         "vwap":                vwap,
         "rsi":                 round(rsi, 1),
         "relativeVolume":      round(rel_vol, 2),
+        "openingRelVol":       opening_relvol,       # first-30-min vol vs prior sessions
+        "openingVolState":     opening_vol_state,    # heavy | normal | light | unknown
         # Component scores (0-100)
         "trendScore":          round(trend_score, 1),
         "momentumScore":       round(momentum_score, 1),
