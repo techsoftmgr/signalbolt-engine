@@ -389,7 +389,7 @@ def cached_score(ticker: str) -> tuple[Optional[dict], Optional[str]]:
 
 
 _FULL_SNAP_KEY = "quant:snapfull:"   # + TICKER → full _score_ticker row for the ticker HUB
-_FULL_SNAP_TTL = int(os.environ.get("QUANT_FULL_SNAP_TTL", "180"))   # 3 min
+_FULL_SNAP_TTL = int(os.environ.get("QUANT_FULL_SNAP_TTL", "300"))   # 5 min > 2-min pre-warm interval
 
 
 def cached_full_single(ticker: str) -> tuple[Optional[dict], Optional[str]]:

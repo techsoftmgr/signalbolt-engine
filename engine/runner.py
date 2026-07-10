@@ -3750,6 +3750,79 @@ def start_scheduler() -> BackgroundScheduler:
     )
     logger.info("[runner] Scheduled RS-Pullback signal scan (30 min, RTH)")
 
+    # ── Ticker-hub snap pre-warm — kill the /overview cold-tap timeout ───────
+    # /ticker/{sym}/overview serves the cached universe scan for scanned names, but
+    # a NON-universe ticker (GOOG — the scan uses GOOGL; custom watchlist adds; a
+    # buzz-alerted name) fell back to a full cold inline compute on the first tap →
+    # timeout (#390). This worker job pre-computes the full-row snap OFF the request
+    # path for the tickers users actually tap — watchlist + active-signal + buzzing
+    # (social_snapshots) names not already in the scan — so even the FIRST tap is a
+    # warm cache read. Every 2 min during market hours; bounded + best-effort.
+    _HUB_WARM_CAP = 40
+
+    def _warm_hub_snaps():
+        try:
+            from datetime import datetime as _dt
+            from zoneinfo import ZoneInfo as _ZI
+            now_et = _dt.now(_ZI("America/New_York"))
+            if now_et.weekday() >= 5 or not (9 <= now_et.hour < 17):
+                return
+            from engine import quant_score_service as _q, alpaca_client as _ac, regime_detector as _rd, cache as _cache
+            sb = _supabase()
+            targets: list[str] = []
+            def _add(rows):
+                for r in (rows or []):
+                    t = (r.get("ticker") or "").upper().strip()
+                    if t and t not in targets:
+                        targets.append(t)
+            try: _add(sb.table("social_snapshots").select("ticker").order("created_at", desc=True).limit(150).execute().data)
+            except Exception: pass
+            try: _add(sb.table("watchlist").select("ticker").execute().data)
+            except Exception: pass
+            try: _add(sb.table("signals").select("ticker").eq("status", "active").execute().data)
+            except Exception: pass
+            try: scored = {(r.get("ticker") or "").upper() for r in (_cache.kv.get_json(_q._SCORED_KEY) or [])}
+            except Exception: scored = set()
+            todo = [t for t in targets if t not in scored][:_HUB_WARM_CAP]   # buzz-first order
+            if not todo:
+                return
+            try:
+                _rr = _rd.detect() or {}
+                regime_type = _rr.get("regime_type") or _rr.get("regime")
+            except Exception:
+                regime_type = None
+            try: spy_long = _ac.get_bars("SPY", "1Day", days=400)
+            except Exception: spy_long = None
+            warmed = 0
+            for tk in todo:
+                try:
+                    daily = _ac.get_bars(tk, "1Day", days=400)
+                    if daily is None or len(daily) < 60:
+                        continue
+                    intr  = _ac.get_bars(tk, "15Min", days=5)
+                    price = _ac.get_latest_price(tk)
+                    row = _q._score_ticker(tk, price, daily, intr, daily_long_df=daily,
+                                           regime_type=regime_type, spy_long_df=spy_long)
+                    if row:
+                        _q.store_full_single(tk, row, datetime.now(timezone.utc).isoformat())
+                        warmed += 1
+                except Exception:
+                    pass
+            if warmed:
+                logger.info(f"[runner] hub snap pre-warm: {warmed}/{len(todo)} non-universe tickers")
+        except Exception as _e:
+            logger.error(f"[runner] hub snap pre-warm failed: {_e}")
+
+    scheduler.add_job(
+        _warm_hub_snaps,
+        trigger=IntervalTrigger(minutes=2),
+        id="hub_snap_warm",
+        name="Ticker-hub snap pre-warm (2 min, RTH)",
+        replace_existing=True, max_instances=1, coalesce=True,
+        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=45),
+    )
+    logger.info("[runner] Scheduled ticker-hub snap pre-warm (2 min, RTH)")
+
     # ── Momentum stop BACKSTOP — safety net for TREND_MOMENTUM ───────────────
     # TREND_MOMENTUM is managed only by momentum_monitor.manage(); the generic
     # signal_monitor skips it. If manage() errors/doesn't run, a signal is orphaned
