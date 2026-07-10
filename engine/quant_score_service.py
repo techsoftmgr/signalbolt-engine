@@ -388,6 +388,37 @@ def cached_score(ticker: str) -> tuple[Optional[dict], Optional[str]]:
     return None, None
 
 
+_FULL_SNAP_KEY = "quant:snapfull:"   # + TICKER → full _score_ticker row for the ticker HUB
+_FULL_SNAP_TTL = int(os.environ.get("QUANT_FULL_SNAP_TTL", "180"))   # 3 min
+
+
+def cached_full_single(ticker: str) -> tuple[Optional[dict], Optional[str]]:
+    """Ticker-hub full-row cache for NON-UNIVERSE tickers (GOOG, custom adds).
+    Returns (full_row, asOf) or (None, None). Keeps a buzz-alerted / custom ticker
+    from being a full cold recompute on every tap (the /overview timeout)."""
+    tk = (ticker or "").upper().strip()
+    if not tk:
+        return None, None
+    try:
+        blob = cache.kv.get_json(_FULL_SNAP_KEY + tk)
+        if blob and isinstance(blob, dict) and blob.get("row"):
+            return blob["row"], blob.get("asOf")
+    except Exception:
+        pass
+    return None, None
+
+
+def store_full_single(ticker: str, row: dict, as_of: str) -> None:
+    """Cache a freshly-scored full row for the ticker hub. Best-effort."""
+    tk = (ticker or "").upper().strip()
+    if not tk or not row:
+        return
+    try:
+        cache.kv.set_json(_FULL_SNAP_KEY + tk, {"row": row, "asOf": as_of}, _FULL_SNAP_TTL)
+    except Exception:
+        pass
+
+
 def _enrich_breakouts(result: dict) -> None:
     """Add lifecycle state + catalyst + R:R to each breakout row, plus a top-level
     Watch Accuracy summary. Best-effort — never breaks the dashboard."""

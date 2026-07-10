@@ -5004,6 +5004,14 @@ async def ticker_overview(request: Request, symbol: str, refresh: bool = False):
             if cached_row:
                 quant       = cached_row
                 quant_as_of = _as_of
+            else:
+                # Non-universe ticker (e.g. GOOG — the scan uses GOOGL). Serve the
+                # per-ticker full-row snap cache so a buzz-alerted / custom ticker
+                # isn't a full cold recompute on every tap (the /overview timeout).
+                snap_row, snap_as_of = quant_score_service.cached_full_single(sym)
+                if snap_row:
+                    quant       = snap_row
+                    quant_as_of = snap_as_of
 
         # 52-week range / performance below needs the daily history either way.
         daily_df = get_bars(sym, "1Day", days=400)
@@ -5031,6 +5039,11 @@ async def ticker_overview(request: Request, symbol: str, refresh: bool = False):
                 spy_long_df=spy_long_df,
             )
             quant_as_of = datetime.now(timezone.utc).isoformat()
+            # Cache the cold-computed row so the NEXT tap / concurrent viewer of
+            # this non-universe ticker is instant (and a client that already timed
+            # out gets a fast retry — the server still completed + cached).
+            if quant and not quant_score_service.cached_score(sym)[0]:
+                quant_score_service.store_full_single(sym, quant, quant_as_of)
     except Exception as e:
         logger.debug(f"GET /ticker/{sym}/overview quant error: {e}")
 
