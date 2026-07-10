@@ -60,6 +60,24 @@ def test_parse_drops_bad():
     assert ins.parse_form4(b"<not-xml", "X") == []
 
 
+def _f4_issuer(sym: str, rows: str) -> bytes:
+    return _f4(rows).replace(b"<issuerTradingSymbol>HOOD</issuerTradingSymbol>",
+                             f"<issuerTradingSymbol>{sym}</issuerTradingSymbol>".encode())
+
+
+def test_parse_skips_when_issuer_is_a_different_company():
+    # The CIK feed (Robinhood's) also returns Form 4s where it's a 10% OWNER of
+    # ANOTHER company (a ~$31 stock) — issuer != HOOD, so it must NOT be tagged to
+    # HOOD (the "Robinhood Markets, Inc. — 10% Owner — $31.35" bug).
+    assert ins.parse_form4(_f4_issuer("XYZ", _tx("S", 10033, "31.35")), "HOOD") == []
+    # sanity: a matching issuer still parses
+    assert len(ins.parse_form4(_f4_issuer("HOOD", _tx("S", 200, "115.00")), "HOOD")) == 1
+    # no issuer symbol → can't verify → keep (don't over-filter)
+    no_iss = _f4(_tx("S", 200, "115.00")).replace(
+        b"<issuer><issuerTradingSymbol>HOOD</issuerTradingSymbol></issuer>", b"<issuer></issuer>")
+    assert len(ins.parse_form4(no_iss, "HOOD")) == 1
+
+
 def test_aggregate_splits_discretionary_vs_scheduled():
     txns = [
         {"owner": "A", "code": "P", "shares": 1000, "price": 80, "value_usd": 80000, "txn_date": "2026-05-28"},
