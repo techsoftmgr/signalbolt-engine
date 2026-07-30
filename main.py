@@ -4824,6 +4824,61 @@ async def quant_snapshot(request: Request, tickers: str = ""):
         return {"snapshot": {}}
 
 
+@app.get("/watchlist/overview")
+async def watchlist_overview(request: Request, tickers: str = ""):
+    """ONE warm round-trip for the Watchlist screen — collapses the 4 separate
+    fetches (snapshot, insiders, buzz, active-signal) into a single call so the
+    screen opens in one request instead of four. Every section is best-effort
+    (empty on failure) and served from worker-warmed caches / cheap DB reads —
+    no request-path compute. Powers every sort/filter button (all client-side)."""
+    _require_jwt(request)
+    import anyio
+    tlist = [t.strip().upper() for t in tickers.split(",") if t.strip()][:60]
+    out = {"snapshot": {}, "marketSession": None, "insiders": {}, "buzz": {}, "activeSig": {}}
+    if not tlist:
+        return out
+    sb = _make_supabase()
+    # 1) quant snapshot (%chg / volume / RSI / money-flow / squeeze / game-plan) + session
+    try:
+        from engine.quant_score_service import snapshot as _snapshot
+        out["snapshot"] = await anyio.to_thread.run_sync(_snapshot, tlist)
+    except Exception as e:
+        logger.debug(f"[wl_overview] snapshot: {e}")
+    try:
+        from engine.session_classifier import market_session
+        out["marketSession"] = market_session()
+    except Exception:
+        pass
+    # 2) open-market insider summaries (table-only DB read)
+    try:
+        from engine import insider_service
+        out["insiders"] = await anyio.to_thread.run_sync(insider_service.summary_batch, sb, tlist)
+    except Exception as e:
+        logger.debug(f"[wl_overview] insiders: {e}")
+    # 3) buzz — filter the worker-warmed trending cache to the watched tickers
+    try:
+        from engine import social_insights
+        tr = await anyio.to_thread.run_sync(lambda: social_insights.get_enriched_trending(sb, limit=100))
+        want = set(tlist)
+        for it in (tr.get("trending") or []):
+            tk = (it.get("ticker") or "").upper()
+            if tk in want:
+                out["buzz"][tk] = {"chg": it.get("reddit_change_pct"), "viral": bool(it.get("goingViral"))}
+    except Exception as e:
+        logger.debug(f"[wl_overview] buzz: {e}")
+    # 4) active-signal direction per ticker
+    try:
+        rows = (sb.table("signals").select("ticker,direction")
+                .eq("status", "active").in_("ticker", tlist).execute().data) or []
+        for r in rows:
+            tk = (r.get("ticker") or "").upper()
+            if tk and tk not in out["activeSig"]:
+                out["activeSig"][tk] = r.get("direction")
+    except Exception as e:
+        logger.debug(f"[wl_overview] activeSig: {e}")
+    return out
+
+
 @app.get("/quant/breakout-history")
 async def quant_breakout_history(request: Request, days: int = 30, bucket: str = "breakouts"):
     """
