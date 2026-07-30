@@ -266,12 +266,17 @@ _SNAPSHOT_KEEP = (
 )
 
 
-def snapshot(tickers: list[str]) -> dict:
+def snapshot(tickers: list[str], compute_missing: bool = True) -> dict:
     """Compact per-ticker quant read for the watchlist (price + current setup
     signals) so each row can show a plain-English "latest setup" line WITHOUT a
     per-ticker round trip. Reuses the cached full universe scan for names already
     scored; scores any remaining (custom) tickers on demand in one batched fetch.
     Best-effort — missing/failed tickers are simply omitted.
+
+    `compute_missing=False` serves ONLY warm data (universe scan + per-ticker
+    cache) and skips the on-demand scoring — for the request path, which must not
+    cold-compute (see `snapshot_warm`). The un-warmed tickers are returned under a
+    reserved `__pending__` key so the caller can warm them in the background.
     """
     out: dict = {}
     syms = [t.upper().strip() for t in (tickers or []) if t and t.strip()][:50]
@@ -305,7 +310,7 @@ def snapshot(tickers: list[str]) -> dict:
     #    and write each result to the per-ticker cache so the next load serves it warm.
     missing = [t for t in syms if t not in cached and t not in pt_cached]
     scored_missing: dict = {}
-    if missing:
+    if missing and compute_missing:
         try:
             from engine.alpaca_client import get_multi_bars, get_latest_prices
             from engine import regime_detector
@@ -362,7 +367,23 @@ def snapshot(tickers: list[str]) -> dict:
                 pass
     except Exception as e:
         logger.debug(f"[quant.snapshot] fundamentals enrich failed: {e}")
+
+    # Warm-only callers get the un-warmed tickers back so they can background-warm.
+    if missing and not compute_missing:
+        out["__pending__"] = list(missing)
     return out
+
+
+def snapshot_warm(tickers: list[str]) -> tuple[dict, list]:
+    """Warm-only watchlist read for the REQUEST path — serves the universe scan +
+    per-ticker cache and NEVER cold-computes (no inline bar fetch / scoring), so the
+    watchlist open is always fast (precompute-no-inline). Returns (rows, missing):
+    `missing` are tickers with no warm row yet; the caller should warm them in the
+    BACKGROUND (off the request) so a quick re-poll serves them warm.
+    """
+    out = snapshot(tickers, compute_missing=False)
+    missing = out.pop("__pending__", []) or []
+    return out, missing
 
 
 def cached_score(ticker: str) -> tuple[Optional[dict], Optional[str]]:

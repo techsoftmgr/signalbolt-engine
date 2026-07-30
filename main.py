@@ -4825,23 +4825,31 @@ async def quant_snapshot(request: Request, tickers: str = ""):
 
 
 @app.get("/watchlist/overview")
-async def watchlist_overview(request: Request, tickers: str = ""):
+async def watchlist_overview(request: Request, background_tasks: BackgroundTasks, tickers: str = ""):
     """ONE warm round-trip for the Watchlist screen — collapses the 4 separate
     fetches (snapshot, insiders, buzz, active-signal) into a single call so the
     screen opens in one request instead of four. Every section is best-effort
     (empty on failure) and served from worker-warmed caches / cheap DB reads —
-    no request-path compute. Powers every sort/filter button (all client-side)."""
+    NEVER cold-computes on the request path. Cold (not-yet-warmed) tickers come
+    back in `pending` and are warmed in the BACKGROUND so the app's quick re-poll
+    fills them in seconds instead of blocking the open. Powers every sort/filter
+    button (all client-side)."""
     _require_jwt(request)
     import anyio
     tlist = [t.strip().upper() for t in tickers.split(",") if t.strip()][:60]
-    out = {"snapshot": {}, "marketSession": None, "insiders": {}, "buzz": {}, "activeSig": {}}
+    out = {"snapshot": {}, "marketSession": None, "insiders": {}, "buzz": {}, "activeSig": {}, "pending": []}
     if not tlist:
         return out
     sb = _make_supabase()
-    # 1) quant snapshot (%chg / volume / RSI / money-flow / squeeze / game-plan) + session
+    # 1) quant snapshot (%chg / volume / RSI / money-flow / squeeze / game-plan) + session.
+    #    Warm-only — cold tickers are warmed off the request path, then re-polled.
     try:
-        from engine.quant_score_service import snapshot as _snapshot
-        out["snapshot"] = await anyio.to_thread.run_sync(_snapshot, tlist)
+        from engine import quant_score_service as _q
+        snap, pending = await anyio.to_thread.run_sync(_q.snapshot_warm, tlist)
+        out["snapshot"] = snap
+        out["pending"] = pending
+        if pending:
+            background_tasks.add_task(_q.snapshot, pending)   # warms quant:snap: after the response
     except Exception as e:
         logger.debug(f"[wl_overview] snapshot: {e}")
     try:
