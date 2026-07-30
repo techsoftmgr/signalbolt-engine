@@ -3775,11 +3775,13 @@ def start_scheduler() -> BackgroundScheduler:
                     t = (r.get("ticker") or "").upper().strip()
                     if t and t not in targets:
                         targets.append(t)
-            try: _add(sb.table("social_snapshots").select("ticker").order("created_at", desc=True).limit(150).execute().data)
-            except Exception: pass
+            # Watchlist FIRST (the screen users open most — its custom tickers must
+            # always be warm), then active signals, then buzz names.
             try: _add(sb.table("watchlist").select("ticker").execute().data)
             except Exception: pass
             try: _add(sb.table("signals").select("ticker").eq("status", "active").execute().data)
+            except Exception: pass
+            try: _add(sb.table("social_snapshots").select("ticker").order("created_at", desc=True).limit(150).execute().data)
             except Exception: pass
             try: scored = {(r.get("ticker") or "").upper() for r in (_cache.kv.get_json(_q._SCORED_KEY) or [])}
             except Exception: scored = set()
@@ -3805,11 +3807,16 @@ def start_scheduler() -> BackgroundScheduler:
                                            regime_type=regime_type, spy_long_df=spy_long)
                     if row:
                         _q.store_full_single(tk, row, datetime.now(timezone.utc).isoformat())
+                        # Warm the WATCHLIST snapshot cache too (quant:snap:) so the
+                        # watchlist load serves these non-universe tickers instantly
+                        # instead of cold-computing on open (the "2-min to load" lag).
+                        try: _cache.kv.set_json(_q._SNAP_KEY + tk, row, _q._SNAP_TTL)
+                        except Exception: pass
                         warmed += 1
                 except Exception:
                     pass
             if warmed:
-                logger.info(f"[runner] hub snap pre-warm: {warmed}/{len(todo)} non-universe tickers")
+                logger.info(f"[runner] hub+watchlist snap pre-warm: {warmed}/{len(todo)} non-universe tickers")
         except Exception as _e:
             logger.error(f"[runner] hub snap pre-warm failed: {_e}")
 
