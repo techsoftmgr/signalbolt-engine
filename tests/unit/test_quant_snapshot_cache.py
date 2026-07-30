@@ -57,6 +57,29 @@ def test_snapshot_prefers_universe_over_per_ticker_cache(monkeypatch):
     assert "NVDA" in out
 
 
+def test_snapshot_warm_never_cold_computes_and_reports_pending(monkeypatch):
+    """Precompute-no-inline (do-not-regress): the watchlist READ path must serve
+    only warm data and NEVER cold-compute — the 30-60s first-open lag. `snapshot_warm`
+    returns warm rows + the un-warmed tickers as `missing` (for background warming)."""
+    fake = _FakeKV()
+    monkeypatch.setattr(qs.cache, "kv", fake)
+    fake.store[qs._SCORED_KEY] = [{"ticker": "NVDA", "price": 100, "relativeVolume": 1.0, "rsi": 50}]
+    fake.store[qs._SNAP_KEY + "AAA"] = {"ticker": "AAA", "price": 10, "relativeVolume": 1.2, "rsi": 55}
+    monkeypatch.setattr(ticker_fundamentals, "get", lambda *a, **k: {})
+    # Any cold-compute path blows up the test — the read path must not touch it.
+    boom = lambda *a, **k: (_ for _ in ()).throw(AssertionError("cold-computed on the read path"))
+    monkeypatch.setattr(qs, "_score_ticker", boom)
+    monkeypatch.setattr(qs, "_get_long_bars", boom)
+    monkeypatch.setattr(alpaca_client, "get_multi_bars", boom)
+    monkeypatch.setattr(alpaca_client, "get_latest_prices", boom)
+
+    rows, missing = qs.snapshot_warm(["NVDA", "AAA", "BBB"])
+
+    assert set(rows.keys()) == {"NVDA", "AAA"}   # both warm sources served
+    assert missing == ["BBB"]                    # the un-warmed one is reported, not computed
+    assert "__pending__" not in rows             # reserved key never leaks to the caller
+
+
 def test_recent_max_rsi_latches_through_rollover():
     """Peak-detector latch: a name that WAS overbought must still register as recently-overbought
     after it starts rolling over (current RSI < 60) — the MSFT 466→370 miss."""
