@@ -36,10 +36,12 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 from supabase import create_client, Client
 
+import time
 from engine import smc, push
 from engine import alpaca_client as _alpaca
 from engine import exit_intelligence
 from engine import trend_ride
+from engine import exit_engine
 
 logger = logging.getLogger("signalbolt.monitor")
 
@@ -55,6 +57,29 @@ _EOD_WARNED: set[str] = set()
 # Updated every monitor pass while the swing signal is between T1 and T2.
 # Evicted when the signal closes via any path.
 _SWING_PEAK: dict[str, float] = {}   # signal_id → peak price after T1
+
+# Completed daily bars for the smart confluence exit, cached per ticker (daily bars
+# change once a day → a long TTL is fine and keeps the monitor cheap).
+_SE_DAILY_CACHE: dict = {}
+_SE_DAILY_TTL = 600  # 10 min
+
+
+def _smart_exit_daily(ticker: str):
+    """Completed-bar daily OHLCV for exit_engine (today's forming bar dropped), cached."""
+    now = time.time()
+    hit = _SE_DAILY_CACHE.get(ticker)
+    if hit and (now - hit[0]) < _SE_DAILY_TTL:
+        return hit[1]
+    df = None
+    try:
+        raw = smc.fetch_candles(ticker, period="3mo", interval="1d")
+        df = trend_ride._completed_daily(raw)
+        if df is None or len(df) < 25:
+            df = None
+    except Exception:
+        df = None
+    _SE_DAILY_CACHE[ticker] = (now, df)
+    return df
 
 ET = ZoneInfo("America/New_York")
 
@@ -1153,6 +1178,51 @@ def _monitor_stocks(sb: Client) -> None:
                     _set_trend_ride_flag(sb, sig, False)
             except Exception as _e:
                 logger.debug(f"[monitor] trend_ride error for {ticker}: {_e}")
+
+        # ── 3c. Smart CONFLUENCE exit (measure-first, default OFF: SMART_EXIT_ENABLED) ──
+        # Fixes the single-metric whipsaw (a lone bearish CMF / RSI-peak / CHoCH bailing us
+        # out right before the trend resumes) AND protects a real run. Two legs:
+        #   • giveback cap — once a run ≥5% is made, lock ≥half of it (the AAPL +10%→−3% and
+        #     TTD +7%→flat round-trips), ratcheted into the visible stop;
+        #   • confluence break — exit ONLY on a daily CLOSE through the 20-EMA (or a structure
+        #     break) WITH corroboration (RSI/MACD/CMF/RS). Momentum/flow can NEVER exit alone.
+        # When on it OWNS swing management (like trend_ride) and continues; the hard stop + T2
+        # (checked above) stay the backstops. Exit reason is stored in closed_reason for the
+        # scorecard so we can measure capture-ratio lift before trusting it.
+        if (exit_engine.enabled() and trend_ride.is_swing(sig)
+                and _det_src != "EMA_RECLAIM"):
+            try:
+                _pk = _SWING_PEAK.get(sig["id"], price)
+                _pk = max(_pk, price) if is_long else min(_pk, price)
+                _SWING_PEAK[sig["id"]] = _pk
+                _ddf = _smart_exit_daily(ticker)
+                if _ddf is not None:
+                    _xr = exit_engine.evaluate(direction, entry, price, _pk, _ddf,
+                                               spy_df=_smart_exit_daily("SPY"),
+                                               cfg=exit_engine.config_from_env())
+                    if _xr["exit"]:
+                        logger.info(f"[monitor] {ticker} SMART EXIT ({_xr['reason']}) "
+                                    f"score={_xr['score']} pnl={pnl_pct:+.1f}%")
+                        _close_signal(sb, sig["id"], _xr["reason"],
+                                      current_price=price, entry_price=entry,
+                                      direction=direction, ticker=ticker)
+                        _log_event(sb, sig["id"], "smart_exit", price=price,
+                                   note=(f"🧠 Smart exit — {_xr['reason']} @ ${price:.2f} "
+                                         f"({pnl_pct:+.1f}%) [{', '.join(list(_xr['signals'])[:4])}]"))
+                        _SWING_PEAK.pop(sig["id"], None)
+                        _STATUS_CACHE.pop(sig["id"], None)
+                        continue
+                    # Still in the trade — ratchet the visible stop up to the giveback floor.
+                    _gf = _xr.get("giveback_floor")
+                    if _gf is not None:
+                        _up = (_gf > sl + 0.01) if is_long else (_gf < sl - 0.01)
+                        if _up:
+                            _update_sl(sb, sig["id"], round(_gf, 2), sig=sig)
+                            _log_event(sb, sig["id"], "be_move", price=price,
+                                       note=f"🔒 Profit-lock stop → ${_gf:.2f} (giveback cap)")
+                    continue   # smart-exit manages this swing — skip the single-metric early exits
+            except Exception as _e:
+                logger.debug(f"[monitor] smart_exit error for {ticker}: {_e}")
 
         # ── 4. T1 hit → move SL to breakeven ─────────────────────────────────
         try:
