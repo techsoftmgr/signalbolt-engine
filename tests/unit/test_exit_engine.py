@@ -116,6 +116,22 @@ def test_manages_allowlist(monkeypatch):
     assert ex.manages(None) is False
 
 
+def test_replay_captures_lifecycle_past_close():
+    # This is the "actual trade already closed, but smart-exit would've held/given back"
+    # measurement: replay from entry over daily bars that extend past the real close.
+    hist = list(np.linspace(80, 100, 40))         # pre-entry history (indicators)
+    fwd = [100, 105, 110, 108, 102, 98, 95]        # ran +10% then round-tripped
+    closes = hist + fwd
+    idx = pd.date_range("2026-05-01", periods=len(closes), freq="D")
+    df = pd.DataFrame({"open": closes, "high": np.array(closes) + 1, "low": np.array(closes) - 1,
+                       "close": closes, "volume": [1e6] * len(closes)}, index=idx)
+    r = ex.replay("LONG", entry=100, stop=90, daily_df=df, entry_date=idx[40].date())
+    assert r is not None and r["exit_reason"] == "giveback_cap"
+    assert 4.0 <= r["pnl_pct"] <= 6.5             # locked ~half of the ~+11% peak
+    # insufficient data → None (fail-safe)
+    assert ex.replay("LONG", 100, 90, _df([100, 101, 102])) is None
+
+
 def test_kill_switches_default_off(monkeypatch):
     for v in ("SMART_EXIT_ENABLED", "SMART_EXIT_SHADOW"):
         monkeypatch.delenv(v, raising=False)
