@@ -103,3 +103,22 @@ def test_short_mirror_confluence():
 def test_short_data_is_failsafe_hold():
     r = ex.evaluate("LONG", entry=100, price=101, peak=101, daily_df=_df([100, 101, 102]))
     assert r["action"] == "hold" and r["exit"] is False
+
+
+# ── rollout gates: per-detector allowlist + kill switches ────────────────────
+def test_manages_allowlist(monkeypatch):
+    monkeypatch.delenv("SMART_EXIT_DETECTORS", raising=False)
+    assert ex.manages("TREND_MOMENTUM") is True          # unset = all swings
+    monkeypatch.setenv("SMART_EXIT_DETECTORS", "TREND_MOMENTUM, RS_PULLBACK")
+    assert ex.manages("TREND_MOMENTUM") is True
+    assert ex.manages("rs_pullback") is True             # case-insensitive
+    assert ex.manages("PEAK_FORMING") is False           # winners left on old logic
+    assert ex.manages(None) is False
+
+
+def test_kill_switches_default_off(monkeypatch):
+    for v in ("SMART_EXIT_ENABLED", "SMART_EXIT_SHADOW"):
+        monkeypatch.delenv(v, raising=False)
+    assert ex.enabled() is False and ex.shadow() is False
+    monkeypatch.setenv("SMART_EXIT_SHADOW", "true")
+    assert ex.shadow() is True

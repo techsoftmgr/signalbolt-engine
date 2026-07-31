@@ -575,6 +575,44 @@ def _set_trend_ride_flag(sb: Client, sig: dict, on: bool) -> None:
         logger.debug(f"[monitor] trend_ride flag update failed for {sig.get('id')}: {e}")
 
 
+def _tag_smart_exit(sb: Client, sig: dict, shadow: bool) -> None:
+    """SET-ONCE durable marker that the smart confluence exit MANAGED this swing —
+    so the scorecard can segment the whole smart-exit cohort (not just trades it
+    closed), and so a config bump (VERSION) yields a distinguishable cohort. Records
+    live-vs-shadow so shadow observations aren't confused with real exits."""
+    bd = dict(sig.get("score_breakdown") or {})
+    if bd.get("smart_exit_managed"):
+        return
+    bd["smart_exit_managed"] = True
+    bd["smart_exit_v"] = exit_engine.VERSION
+    bd["smart_exit_mode"] = "shadow" if shadow else "live"
+    sig["score_breakdown"] = bd
+    try:
+        sb.table("signals").update({"score_breakdown": bd}).eq("id", sig["id"]).execute()
+    except Exception as e:
+        logger.debug(f"[monitor] smart_exit tag failed for {sig.get('id')}: {e}")
+
+
+def _record_shadow_exit(sb: Client, sig: dict, xr: dict, price: float, pnl_pct: float) -> None:
+    """Shadow mode: record the FIRST point smart-exit WOULD have closed (set-once),
+    without acting. When the trade later closes under the OLD logic, comparing
+    smart_exit_shadow.pnl_pct (would-be) vs result_pct (actual) measures the edge —
+    the data we accumulate before ever trusting it live."""
+    bd = dict(sig.get("score_breakdown") or {})
+    if bd.get("smart_exit_shadow"):
+        return
+    bd["smart_exit_shadow"] = {"reason": xr.get("reason"), "score": xr.get("score"),
+                               "pnl_pct": round(pnl_pct, 2), "price": round(price, 2),
+                               "signals": list(xr.get("signals") or {})[:6]}
+    sig["score_breakdown"] = bd
+    try:
+        sb.table("signals").update({"score_breakdown": bd}).eq("id", sig["id"]).execute()
+    except Exception as e:
+        logger.debug(f"[monitor] smart_exit shadow record failed for {sig.get('id')}: {e}")
+    logger.info(f"[monitor] {sig.get('ticker')} SHADOW smart-exit WOULD close "
+                f"({xr.get('reason')}) @ ${price:.2f} ({pnl_pct:+.1f}%)")
+
+
 # ── Corporate-action (split) guard ──────────────────────────────────────────
 # Alpaca bars are split-ADJUSTED (alpaca_client get_bars/get_latest), but a stored
 # signal's price levels are the NOMINAL values captured at entry. After a split the
@@ -1189,18 +1227,28 @@ def _monitor_stocks(sb: Client) -> None:
         # When on it OWNS swing management (like trend_ride) and continues; the hard stop + T2
         # (checked above) stay the backstops. Exit reason is stored in closed_reason for the
         # scorecard so we can measure capture-ratio lift before trusting it.
+        # SMART_EXIT_SHADOW=true → observe & record only (old logic still runs, zero risk).
+        # SMART_EXIT_DETECTORS=A,B → scope to those detectors (enable on LOSERS first;
+        # leave the already-profitable detectors on their current exit logic until proven).
         if (exit_engine.enabled() and trend_ride.is_swing(sig)
-                and _det_src != "EMA_RECLAIM"):
+                and _det_src != "EMA_RECLAIM" and exit_engine.manages(_det_src)):
             try:
                 _pk = _SWING_PEAK.get(sig["id"], price)
                 _pk = max(_pk, price) if is_long else min(_pk, price)
                 _SWING_PEAK[sig["id"]] = _pk
                 _ddf = _smart_exit_daily(ticker)
                 if _ddf is not None:
+                    _shadow = exit_engine.shadow()
                     _xr = exit_engine.evaluate(direction, entry, price, _pk, _ddf,
                                                spy_df=_smart_exit_daily("SPY"),
                                                cfg=exit_engine.config_from_env())
-                    if _xr["exit"]:
+                    _tag_smart_exit(sb, sig, _shadow)   # mark the cohort (set-once, versioned)
+                    if _shadow:
+                        # OBSERVE ONLY — record the first would-be exit, DON'T act.
+                        if _xr["exit"]:
+                            _record_shadow_exit(sb, sig, _xr, price, pnl_pct)
+                        # fall through to the normal (old) exit logic — no continue
+                    elif _xr["exit"]:
                         logger.info(f"[monitor] {ticker} SMART EXIT ({_xr['reason']}) "
                                     f"score={_xr['score']} pnl={pnl_pct:+.1f}%")
                         _close_signal(sb, sig["id"], _xr["reason"],
@@ -1212,15 +1260,16 @@ def _monitor_stocks(sb: Client) -> None:
                         _SWING_PEAK.pop(sig["id"], None)
                         _STATUS_CACHE.pop(sig["id"], None)
                         continue
-                    # Still in the trade — ratchet the visible stop up to the giveback floor.
-                    _gf = _xr.get("giveback_floor")
-                    if _gf is not None:
-                        _up = (_gf > sl + 0.01) if is_long else (_gf < sl - 0.01)
-                        if _up:
-                            _update_sl(sb, sig["id"], round(_gf, 2), sig=sig)
-                            _log_event(sb, sig["id"], "be_move", price=price,
-                                       note=f"🔒 Profit-lock stop → ${_gf:.2f} (giveback cap)")
-                    continue   # smart-exit manages this swing — skip the single-metric early exits
+                    else:
+                        # Still in the trade — ratchet the visible stop to the giveback floor.
+                        _gf = _xr.get("giveback_floor")
+                        if _gf is not None:
+                            _up = (_gf > sl + 0.01) if is_long else (_gf < sl - 0.01)
+                            if _up:
+                                _update_sl(sb, sig["id"], round(_gf, 2), sig=sig)
+                                _log_event(sb, sig["id"], "be_move", price=price,
+                                           note=f"🔒 Profit-lock stop → ${_gf:.2f} (giveback cap)")
+                        continue   # smart-exit manages this swing — skip the single-metric early exits
             except Exception as _e:
                 logger.debug(f"[monitor] smart_exit error for {ticker}: {_e}")
 

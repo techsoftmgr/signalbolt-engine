@@ -37,9 +37,34 @@ import numpy as np
 import pandas as pd
 
 
+# Bump when the logic/defaults change so cohorts are distinguishable in the data.
+VERSION = 1
+
+
+def _flag(name: str, default: str = "false") -> bool:
+    return os.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
 # ── kill switch (matches trend_ride.enabled pattern) ──────────────────────────
 def enabled() -> bool:
-    return os.environ.get("SMART_EXIT_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+    return _flag("SMART_EXIT_ENABLED")
+
+
+def shadow() -> bool:
+    """Shadow mode — evaluate + record what we WOULD do, but DON'T act (old logic
+    keeps running). Captures forward data on the new exit with zero live risk."""
+    return _flag("SMART_EXIT_SHADOW")
+
+
+def manages(detector_source: Optional[str]) -> bool:
+    """Per-detector allowlist so we can enable on the LOSERS first and leave the
+    already-profitable detectors on their current (working) exit logic. Empty /
+    unset = all swings. e.g. SMART_EXIT_DETECTORS=TREND_MOMENTUM,RS_PULLBACK."""
+    allow = os.environ.get("SMART_EXIT_DETECTORS", "").strip()
+    if not allow:
+        return True
+    want = {d.strip().upper() for d in allow.split(",") if d.strip()}
+    return (detector_source or "SMC").upper() in want
 
 
 @dataclass
