@@ -19,6 +19,8 @@ class _Q:
         return self
     def gte(self, *a, **k): return self
     def limit(self, *a, **k): return self
+    def order(self, *a, **k): return self
+    def range(self, *a, **k): return self
     def update(self, payload): self.up = payload; return self
     def execute(self):
         if self.up is not None:
@@ -73,3 +75,24 @@ def test_backfill_skips_premature_window_end(monkeypatch):
     res = sxs.backfill_batch(_SB(store), limit=10)
     assert res["evaluated"] == 0 and res["pending"] == 1
     assert "smart_exit_shadow_final" not in store[0]["score_breakdown"]
+
+
+def _final(det, mode, actual, shadow, reason):
+    return {"direction": "LONG", "result_pct": actual, "status": "closed",
+            "score_breakdown": {"detector_source": det, "smart_exit_managed": True, "smart_exit_mode": mode,
+                                "smart_exit_shadow_final": {"pnl_pct": shadow, "exit_reason": reason}}}
+
+
+def test_scorecard_aggregates_by_detector():
+    store = [
+        _final("TREND_MOMENTUM", "shadow", -3.0, 5.0, "giveback_cap"),   # smart better by +8
+        _final("PEAK_FORMING", "shadow", 2.0, 1.0, "confluence_break"),  # smart worse by -1
+        {"direction": "LONG", "result_pct": 1.0, "status": "closed",     # no final → ignored
+         "score_breakdown": {"detector_source": "SMC"}},
+    ]
+    res = sxs.scorecard(_SB(store), days=30)
+    assert res["evaluated"] == 2 and res["overall"]["n"] == 2
+    assert res["overall"]["delta_total"] == 7.0        # shadow 6 − actual (−1)
+    assert res["overall"]["shadow_better"] == 1 and res["overall"]["shadow_worse"] == 1
+    assert res["detectors"][0]["detector"] == "TREND_MOMENTUM"   # sorted by delta desc
+    assert res["detectors"][0]["delta_total"] == 8.0
