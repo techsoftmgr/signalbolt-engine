@@ -11,6 +11,7 @@ READ-ONLY on outcomes: it only adds one namespaced key to score_breakdown; it ne
 touches result / result_pct / status / closed_reason. Sibling of gate_validator.
 """
 from datetime import datetime, timezone, timedelta
+from collections import defaultdict
 import logging
 
 from engine import exit_engine, alpaca_client
@@ -76,3 +77,60 @@ def backfill_batch(sb, limit: int = 300, lookback_days: int = 60) -> dict:
                "smart_better": better, "smart_worse": worse}
     logger.info(f"[shadow_backfill] {summary}")
     return summary
+
+
+def _detector(bd: dict) -> str:
+    return (bd.get("detector_source") if isinstance(bd, dict) else None) or "SMC"
+
+
+def scorecard(sb, days: int = 45) -> dict:
+    """Per-detector comparison of the ACTUAL exit vs the smart-exit SHADOW replay,
+    over closed shadow-tagged trades that have been backfilled. Read-only. Shaped for
+    the in-app screen: {days, overall{}, detectors[], closed_pulled, evaluated}."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    rows = []
+    for off in range(0, 8000, 1000):
+        chunk = (sb.table("signals")
+                 .select("direction,result_pct,score_breakdown")
+                 .eq("status", "closed").gte("created_at", since)
+                 .order("created_at").range(off, off + 999).execute().data) or []
+        rows += chunk
+        if len(chunk) < 1000:
+            break
+
+    def _new():
+        return {"n": 0, "actual": 0.0, "shadow": 0.0, "better": 0, "worse": 0,
+                "awin": 0, "swin": 0, "reasons": defaultdict(int)}
+    seg: dict = defaultdict(_new)
+    overall = _new()
+    evaluated = 0
+    for r in rows:
+        bd = r.get("score_breakdown")
+        f = bd.get("smart_exit_shadow_final") if isinstance(bd, dict) else None
+        actual = r.get("result_pct")
+        if not (isinstance(f, dict) and f.get("pnl_pct") is not None and actual is not None):
+            continue
+        actual = float(actual); shadow = float(f["pnl_pct"]); evaluated += 1
+        d = seg[_detector(bd)]
+        for b in (d, overall):
+            b["n"] += 1; b["actual"] += actual; b["shadow"] += shadow
+            b["better"] += shadow > actual + 0.01
+            b["worse"] += shadow < actual - 0.01
+            b["awin"] += actual > 0; b["swin"] += shadow > 0
+        d["reasons"][f.get("exit_reason") or "?"] += 1
+
+    def _pack(b, name=None):
+        n = b["n"] or 1
+        o = {"n": b["n"], "actual_total": round(b["actual"], 1), "shadow_total": round(b["shadow"], 1),
+             "delta_total": round(b["shadow"] - b["actual"], 1),
+             "actual_avg": round(b["actual"] / n, 3), "shadow_avg": round(b["shadow"] / n, 3),
+             "shadow_better": b["better"], "shadow_worse": b["worse"],
+             "actual_win": round(100 * b["awin"] / n, 1), "shadow_win": round(100 * b["swin"] / n, 1)}
+        if name is not None:
+            o["detector"] = name
+            o["exit_reasons"] = dict(b["reasons"])
+        return o
+
+    dets = sorted((_pack(v, k) for k, v in seg.items()), key=lambda x: x["delta_total"], reverse=True)
+    return {"days": days, "overall": _pack(overall), "detectors": dets,
+            "evaluated": evaluated, "closed_pulled": len(rows)}

@@ -897,6 +897,17 @@ def get_trend_ride_scorecard(days: int = 30):
     return trend_ride_scorecard.build(sb, days=max(7, min(int(days), 180)))
 
 
+@app.get("/smart-exit-scorecard")
+def get_smart_exit_scorecard(days: int = 45):
+    """PUBLIC (in-app Quant screen, like /trend-ride-scorecard — pre-launch, no admin
+    gate): smart-exit SHADOW scorecard. Per detector, ACTUAL exit vs the smart-exit
+    replay (giveback cap + confluence) on shadow-tagged closed trades, with the delta.
+    Read-only measurement — empty until SMART_EXIT_SHADOW has accrued + been backfilled."""
+    from engine import smart_exit_shadow
+    sb = _make_supabase()
+    return smart_exit_shadow.scorecard(sb, days=max(7, min(int(days), 180)))
+
+
 @app.get("/jobs/status")
 def get_jobs_status():
     """Daily Jobs report — every scheduled job (catalog) merged with its last-run
