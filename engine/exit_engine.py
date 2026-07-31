@@ -277,6 +277,64 @@ def evaluate(direction: str, entry: float, price: float, peak: float,
     return out
 
 
+def replay(direction: str, entry: float, stop: float, daily_df: pd.DataFrame, *,
+           entry_date=None, spy_df: Optional[pd.DataFrame] = None,
+           cfg: Optional[ExitConfig] = None, max_hold: int = 25) -> Optional[dict]:
+    """Replay the FULL smart-exit lifecycle over daily bars from entry — the original
+    hard stop kept as the backstop, the upside managed by giveback cap + confluence.
+    Because it walks forward from entry over price history that extends PAST where the
+    real trade closed, this measures 'would have held longer / capped the giveback'
+    AFTER the actual trade is already closed (the case the in-loop shadow can't see).
+
+    daily_df : OHLCV daily bars with a DatetimeIndex; must include ~40+ bars BEFORE
+               entry (for the indicators) plus the forward bars to replay.
+    Returns {pnl_pct, exit_reason, held_days, exit_price} or None (insufficient data).
+    """
+    cfg = cfg or config_from_env()
+    if daily_df is None or len(daily_df) < 40:
+        return None
+    cols = {c.lower(): c for c in daily_df.columns}
+    if not all(k in cols for k in ("high", "low", "close")):
+        return None
+    hi_c, lo_c, cl_c = cols["high"], cols["low"], cols["close"]
+    is_long = direction.upper() == "LONG"
+
+    # locate the entry bar (first bar on/after entry_date); else assume the last
+    # ~max_hold bars are the trade window and history precedes it.
+    start = None
+    if entry_date is not None and hasattr(daily_df.index, "date"):
+        for i in range(len(daily_df)):
+            if daily_df.index[i].date() >= entry_date:
+                start = i
+                break
+    if start is None:
+        start = max(0, len(daily_df) - max_hold)
+    if start < 30:                              # not enough history before entry for indicators
+        return None
+
+    peak = entry
+    for i in range(start, min(start + max_hold, len(daily_df))):
+        hi = float(daily_df[hi_c].iloc[i]); lo = float(daily_df[lo_c].iloc[i]); cl = float(daily_df[cl_c].iloc[i])
+        peak = max(peak, hi) if is_long else min(peak, lo)
+        # original hard stop first (intraday) — downside protection unchanged
+        if (is_long and lo <= stop) or (not is_long and hi >= stop):
+            px = stop
+            return {"pnl_pct": round(((px - entry) if is_long else (entry - px)) / entry * 100, 3),
+                    "exit_reason": "stop_hit", "held_days": i - start, "exit_price": round(px, 2)}
+        hist = daily_df.iloc[:i + 1]
+        sp = spy_df[spy_df.index <= daily_df.index[i]] if spy_df is not None else None
+        r = evaluate(direction, entry, cl, peak, hist, spy_df=sp, cfg=cfg)
+        if r["exit"]:
+            px = r["giveback_floor"] if (r["reason"] == "giveback_cap" and r.get("giveback_floor")) else cl
+            return {"pnl_pct": round(((px - entry) if is_long else (entry - px)) / entry * 100, 3),
+                    "exit_reason": r["reason"], "held_days": i - start, "exit_price": round(px, 2)}
+    # ran the whole window without an exit signal → mark the window-end close
+    last = float(daily_df[cl_c].iloc[min(start + max_hold, len(daily_df)) - 1])
+    return {"pnl_pct": round(((last - entry) if is_long else (entry - last)) / entry * 100, 3),
+            "exit_reason": "window_end", "held_days": min(max_hold, len(daily_df) - start) - 1,
+            "exit_price": round(last, 2)}
+
+
 def config_from_env() -> ExitConfig:
     """Allow live tuning without a deploy (env overrides on the dataclass defaults)."""
     c = ExitConfig()

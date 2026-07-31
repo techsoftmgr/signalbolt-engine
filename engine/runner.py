@@ -2588,6 +2588,22 @@ def _run_phantom_audit() -> None:
         logger.error(f"[runner] Phantom audit failed: {e}", exc_info=True)
 
 
+def _run_shadow_backfill() -> None:
+    """Smart-exit SHADOW backfill: replay smart-exit over forward daily bars for closed
+    shadow-tagged trades and record the alternate outcome (score_breakdown.
+    smart_exit_shadow_final) — so we capture 'would've held longer / capped the giveback'
+    even after the real trade closed. No-op when nothing is shadow-tagged."""
+    try:
+        from engine import smart_exit_shadow
+        sb = create_client(os.environ["SUPABASE_URL"], _supabase_key())
+        result = smart_exit_shadow.backfill_batch(sb, limit=300)
+        if result.get("evaluated"):
+            logger.info(f"[runner] ═══ Smart-exit shadow backfill — {result} ═══")
+    except Exception as e:
+        sentry_sdk.capture_exception(e)
+        logger.error(f"[runner] Shadow backfill failed: {e}", exc_info=True)
+
+
 def _run_gate_validator() -> None:
     """
     Nightly entry-gate rejection validator. Walks unjudged rows in
@@ -3904,6 +3920,19 @@ def start_scheduler() -> BackgroundScheduler:
         replace_existing=True,
     )
     logger.info("[runner] Scheduled entry-gate validator (4:15 PM ET, post-close)")
+
+    # ── Smart-exit shadow backfill (post-close) ──────────────────────────
+    # Records the alternate (smart-exit) outcome for closed shadow-tagged trades —
+    # the "would've held longer / capped the giveback" measurement the in-loop shadow
+    # can't see. Cheap no-op until SMART_EXIT_SHADOW is enabled and trades are tagged.
+    scheduler.add_job(
+        _run_shadow_backfill,
+        trigger=CronTrigger(hour=17, minute=0, timezone="America/New_York"),
+        id="shadow_backfill",
+        name="SignalBolt smart-exit shadow backfill",
+        replace_existing=True,
+    )
+    logger.info("[runner] Scheduled smart-exit shadow backfill (5 PM ET, post-close)")
 
     # ── Market Tape bias track record (V3) ───────────────────────────────
     # Log the day's risk-on/off bias near the close, then score it the next
