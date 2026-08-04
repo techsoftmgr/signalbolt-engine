@@ -4824,14 +4824,28 @@ def quant_scan_health():
         except Exception as e: out["fetch_intraday5m_err"] = repr(e)
         try: out["fetch_prices"] = len(get_latest_prices(uni) or {})
         except Exception as e: out["fetch_prices_err"] = repr(e)
-        # FORCE a fresh build (bypasses cache) — reveals if scoring drops tickers vs
-        # a stale cache, and writes the good result back if the build is healthy.
+        # Per-ticker scoring test on 10 known-liquid names — does _score_ticker drop
+        # them (and why)? Avoids the 150-name build timeout.
         try:
-            fresh = q.get_quant_dashboard(force=True)
-            out["forced_scored"] = len(fresh.get("allScored") or [])
+            from engine import regime_detector
+            tt = ["SPY", "AAPL", "MSFT", "NVDA", "AMD", "MU", "AMAT", "SOXL", "TSLA", "META"]
+            db = get_multi_bars(tt, timeframe="1Day", days=60) or {}
+            dl = get_multi_bars(tt + ["SPY"], timeframe="1Day", days=365) or {}
+            it = get_multi_bars(tt, timeframe="5Min", days=2) or {}
+            px = get_latest_prices(tt) or {}
+            reg = (regime_detector.detect() or {}).get("regime_type")
+            res = {}
+            for tk in tt:
+                try:
+                    row = q._score_ticker(tk, px.get(tk), db.get(tk), it.get(tk),
+                                          daily_long_df=dl.get(tk), regime_type=reg,
+                                          spy_long_df=dl.get("SPY"))
+                    res[tk] = "scored" if row else "None"
+                except Exception as e:
+                    res[tk] = f"ERR:{repr(e)[:70]}"
+            out["score_test"] = res
         except Exception as e:
-            import traceback
-            out["forced_err"] = repr(e); out["forced_trace"] = traceback.format_exc()[-600:]
+            out["score_test_error"] = repr(e)
     except Exception as e:
         out["fetch_probe_error"] = repr(e)
     return out
