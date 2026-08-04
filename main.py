@@ -4788,6 +4788,23 @@ async def market_heatmap(
 
 # ── Quant Dashboard ───────────────────────────────────────────────────────────
 
+@app.get("/quant/scan-health")
+def quant_scan_health():
+    """PUBLIC ops probe (no auth, no sensitive data): counts of the cached quant scan
+    buckets, so an empty dashboard can be diagnosed without a user token. Reads the
+    served dashboard (cache) — no compute. `scored=0` ⇒ the scan cache is empty
+    (backend); populated ⇒ the data exists and any blank is app-side."""
+    try:
+        from engine.quant_score_service import get_quant_dashboard
+        d = get_quant_dashboard()
+        counts = {k: (len(v) if isinstance(v, list) else "obj") for k, v in d.items()}
+        return {"ok": True, "regime": (d.get("marketRegime") or {}).get("label"),
+                "scored": len(d.get("allScored") or []), "counts": counts}
+    except Exception as e:
+        import traceback
+        return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-800:]}
+
+
 @app.get("/quant/dashboard")
 async def quant_dashboard(request: Request):
     """
