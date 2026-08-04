@@ -4797,43 +4797,13 @@ def quant_scan_health():
     out: dict = {"ok": True}
     try:
         from engine.quant_score_service import get_quant_dashboard
-        d = get_quant_dashboard()
+        d = get_quant_dashboard()   # cache read only — no heavy compute
         out["scored"] = len(d.get("allScored") or [])
         out["regime"] = (d.get("marketRegime") or {}).get("label")
+        out["buckets"] = {k: len(v) for k, v in d.items() if isinstance(v, list)}
     except Exception as e:
-        out["dashboard_error"] = repr(e)
-    # Universe diagnostics — is the candidate pool broken, or the liquidity/bar fetch?
-    try:
-        from engine import quant_score_service as q
-        out["candidate_pool"] = len(q._candidate_pool())
-        out["universe_size"] = len(q._scan_universe())
-    except Exception as e:
-        out["universe_error"] = repr(e)
-    # Per-fetch counts over the FULL universe — _build_dashboard drops any ticker
-    # missing data, so whichever fetch returns ~20 (not ~150) is the culprit.
-    try:
-        from engine import quant_score_service as q
-        from engine.alpaca_client import get_multi_bars, get_latest_prices
-        uni = q._scan_universe()
-        out["universe_n"] = len(uni)
-        try: out["fetch_daily60"] = len(get_multi_bars(uni, timeframe="1Day", days=60) or {})
-        except Exception as e: out["fetch_daily60_err"] = repr(e)
-        try: out["fetch_long365"] = len(q._get_long_bars(uni) or {})
-        except Exception as e: out["fetch_long365_err"] = repr(e)
-        try: out["fetch_intraday5m"] = len(get_multi_bars(uni, timeframe="5Min", days=2) or {})
-        except Exception as e: out["fetch_intraday5m_err"] = repr(e)
-        try: out["fetch_prices"] = len(get_latest_prices(uni) or {})
-        except Exception as e: out["fetch_prices_err"] = repr(e)
-        # FORCE a fresh build (bypasses cache) — reveals if scoring drops tickers vs
-        # a stale cache, and writes the good result back if the build is healthy.
-        try:
-            fresh = q.get_quant_dashboard(force=True)
-            out["forced_scored"] = len(fresh.get("allScored") or [])
-        except Exception as e:
-            import traceback
-            out["forced_err"] = repr(e); out["forced_trace"] = traceback.format_exc()[-600:]
-    except Exception as e:
-        out["fetch_probe_error"] = repr(e)
+        out["ok"] = False
+        out["error"] = repr(e)
     return out
 
 
