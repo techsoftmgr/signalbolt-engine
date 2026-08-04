@@ -4824,6 +4824,14 @@ def quant_scan_health():
         except Exception as e: out["fetch_intraday5m_err"] = repr(e)
         try: out["fetch_prices"] = len(get_latest_prices(uni) or {})
         except Exception as e: out["fetch_prices_err"] = repr(e)
+        # FORCE a fresh build (bypasses cache) — reveals if scoring drops tickers vs
+        # a stale cache, and writes the good result back if the build is healthy.
+        try:
+            fresh = q.get_quant_dashboard(force=True)
+            out["forced_scored"] = len(fresh.get("allScored") or [])
+        except Exception as e:
+            import traceback
+            out["forced_err"] = repr(e); out["forced_trace"] = traceback.format_exc()[-600:]
     except Exception as e:
         out["fetch_probe_error"] = repr(e)
     return out
