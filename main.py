@@ -4794,15 +4794,29 @@ def quant_scan_health():
     buckets, so an empty dashboard can be diagnosed without a user token. Reads the
     served dashboard (cache) — no compute. `scored=0` ⇒ the scan cache is empty
     (backend); populated ⇒ the data exists and any blank is app-side."""
+    out: dict = {"ok": True}
     try:
         from engine.quant_score_service import get_quant_dashboard
         d = get_quant_dashboard()
-        counts = {k: (len(v) if isinstance(v, list) else "obj") for k, v in d.items()}
-        return {"ok": True, "regime": (d.get("marketRegime") or {}).get("label"),
-                "scored": len(d.get("allScored") or []), "counts": counts}
+        out["scored"] = len(d.get("allScored") or [])
+        out["regime"] = (d.get("marketRegime") or {}).get("label")
     except Exception as e:
-        import traceback
-        return {"ok": False, "error": str(e), "trace": traceback.format_exc()[-800:]}
+        out["dashboard_error"] = repr(e)
+    # Universe diagnostics — is the candidate pool broken, or the liquidity/bar fetch?
+    try:
+        from engine import quant_score_service as q
+        out["candidate_pool"] = len(q._candidate_pool())
+        out["universe_size"] = len(q._scan_universe())
+    except Exception as e:
+        out["universe_error"] = repr(e)
+    # Small bulk-bars probe — does the Alpaca REST bars call work at all?
+    try:
+        from engine.alpaca_client import get_multi_bars
+        test = get_multi_bars(["SPY", "MU", "AMD", "NVDA", "AMAT", "SOXL"], "1Day", 5) or {}
+        out["bars_test_returned"] = sorted(test.keys())
+    except Exception as e:
+        out["bars_test_error"] = repr(e)
+    return out
 
 
 @app.get("/quant/dashboard")
