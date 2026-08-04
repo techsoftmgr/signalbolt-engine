@@ -4809,13 +4809,23 @@ def quant_scan_health():
         out["universe_size"] = len(q._scan_universe())
     except Exception as e:
         out["universe_error"] = repr(e)
-    # Small bulk-bars probe — does the Alpaca REST bars call work at all?
+    # Per-fetch counts over the FULL universe — _build_dashboard drops any ticker
+    # missing data, so whichever fetch returns ~20 (not ~150) is the culprit.
     try:
-        from engine.alpaca_client import get_multi_bars
-        test = get_multi_bars(["SPY", "MU", "AMD", "NVDA", "AMAT", "SOXL"], "1Day", 5) or {}
-        out["bars_test_returned"] = sorted(test.keys())
+        from engine import quant_score_service as q
+        from engine.alpaca_client import get_multi_bars, get_latest_prices
+        uni = q._scan_universe()
+        out["universe_n"] = len(uni)
+        try: out["fetch_daily60"] = len(get_multi_bars(uni, timeframe="1Day", days=60) or {})
+        except Exception as e: out["fetch_daily60_err"] = repr(e)
+        try: out["fetch_long365"] = len(q._get_long_bars(uni) or {})
+        except Exception as e: out["fetch_long365_err"] = repr(e)
+        try: out["fetch_intraday5m"] = len(get_multi_bars(uni, timeframe="5Min", days=2) or {})
+        except Exception as e: out["fetch_intraday5m_err"] = repr(e)
+        try: out["fetch_prices"] = len(get_latest_prices(uni) or {})
+        except Exception as e: out["fetch_prices_err"] = repr(e)
     except Exception as e:
-        out["bars_test_error"] = repr(e)
+        out["fetch_probe_error"] = repr(e)
     return out
 
 
