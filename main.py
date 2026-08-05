@@ -4805,6 +4805,22 @@ def quant_scan_health(force: bool = False):
     except Exception as e:
         out["ok"] = False
         out["error"] = repr(e)
+    # RAW Alpaca REST bars probe — surfaces the exact reason bulk bars fail (key/401,
+    # rate-limit, outage) that get_multi_bars swallows. Small 3-ticker call.
+    try:
+        from engine import alpaca_client as ac
+        ac._init()
+        out["alpaca_ok"] = ac._ok
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        req = StockBarsRequest(symbol_or_symbols=["SPY", "AMD", "MU"],
+                               timeframe=TimeFrame(1, TimeFrameUnit.Day),
+                               start=_dt.now(_tz.utc) - _td(days=5), feed="sip")
+        bars = ac._client.get_stock_bars(req)
+        out["bars_rows"] = int(len(bars.df)) if getattr(bars, "df", None) is not None else 0
+    except Exception as e:
+        out["bars_error"] = repr(e)[:400]
     return out
 
 
