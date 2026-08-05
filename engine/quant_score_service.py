@@ -77,6 +77,11 @@ _LIQ_MIN_PRICE      = 5.0
 _LIQ_MIN_DOLLAR_VOL = 10_000_000     # $10M/day average
 _LIQ_MAX_NAMES      = 150            # per-cycle scan cap (cost on the web VM)
 _LIQ_TTL            = 3 * 3600       # rebuild at most every ~3h
+_MIN_UNIVERSE       = 50             # below this = a DEGRADED rebuild (bulk bars mostly
+                                     # failed → collapsed toward the ~27 core). Don't cache
+                                     # it / don't clobber the last-good; retry next call.
+_MIN_HEALTHY_SCORED = 40             # a dashboard build with fewer scored than this must
+                                     # NOT overwrite a healthier cached scan (anti-clobber).
 _liq_universe: list[str] = []
 _liq_built_ts: float     = 0.0
 
@@ -130,11 +135,18 @@ def _scan_universe() -> list[str]:
                 ranked.append((tk, dvol))
         ranked.sort(key=lambda x: x[1], reverse=True)
         liq = list(dict.fromkeys(keep_must + [t for t, _ in ranked]))[:_LIQ_MAX_NAMES]
-        if liq:
+        if len(liq) >= _MIN_UNIVERSE:
             _liq_universe = liq
             _liq_built_ts = time.monotonic()
             logger.info(f"[quant] liquid universe rebuilt: {len(liq)} of {len(pool)} candidates")
             return liq
+        # DEGRADED rebuild — the bulk bar fetch mostly returned nothing (e.g. a machine's
+        # Alpaca client failed to init), collapsing `liq` toward the core. Do NOT cache
+        # this (would stick for 3h) or overwrite a good universe — keep last-good, retry.
+        logger.warning(f"[quant] universe build degraded: only {len(liq)}/{len(pool)} passed "
+                       f"— keeping last-good ({len(_liq_universe)}), will retry")
+        if _liq_universe:
+            return _liq_universe
     except Exception as e:
         logger.warning(f"[quant] liquid universe build failed: {e}")
 
@@ -242,6 +254,23 @@ def get_quant_dashboard(symbols: Optional[list[str]] = None, force: bool = False
             _enrich_breakouts(result)
         except Exception as e:
             logger.debug(f"[quant] breakout enrich skipped: {e}")
+        # Anti-clobber: a DEGRADED build (few scored — e.g. one machine's Alpaca client
+        # failed → universe collapsed to core) must not overwrite a healthier cached scan
+        # that another (healthy) machine wrote. Keep the good cache; retry next cycle.
+        if symbols is None:
+            scored_n = len(result.get("allScored") or [])
+            if scored_n < _MIN_HEALTHY_SCORED:
+                prior = None
+                try:
+                    prior = cache.kv.get_json(_REDIS_KEY)
+                except Exception:
+                    prior = None
+                prior_n = len((prior or {}).get("allScored") or []) if isinstance(prior, dict) else 0
+                if prior_n > scored_n:
+                    logger.warning(f"[quant] degraded build ({scored_n} scored) — NOT clobbering "
+                                   f"cache ({prior_n} scored); serving last-good")
+                    _cache, _cache_ts = prior, now
+                    return prior
         _cache    = result
         _cache_ts = now
         try:

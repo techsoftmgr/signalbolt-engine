@@ -80,6 +80,39 @@ def test_snapshot_warm_never_cold_computes_and_reports_pending(monkeypatch):
     assert "__pending__" not in rows             # reserved key never leaks to the caller
 
 
+def test_degraded_build_does_not_clobber_healthy_cache(monkeypatch):
+    """A degraded scan (few scored — a machine's Alpaca client failed → universe
+    collapsed to core) must NOT overwrite a healthier cached dashboard. This is the
+    'watchlist + quant dashboard stuck at 20' regression (do-not-regress)."""
+    fake = _FakeKV()
+    monkeypatch.setattr(qs.cache, "kv", fake)
+    monkeypatch.setattr(qs, "_cache", None); monkeypatch.setattr(qs, "_cache_ts", 0.0)
+    healthy = {"allScored": [{"ticker": f"T{i}"} for i in range(120)], "marketRegime": {}}
+    fake.store[qs._REDIS_KEY] = healthy
+    monkeypatch.setattr(qs, "_scan_universe", lambda: ["SPY"])
+    monkeypatch.setattr(qs, "_enrich_breakouts", lambda r: None)
+    monkeypatch.setattr(qs, "_build_dashboard",
+                        lambda *a, **k: {"allScored": [{"ticker": "SPY"}] * 10, "marketRegime": {}})
+
+    out = qs.get_quant_dashboard(force=True)
+    assert len(out["allScored"]) == 120                       # served the healthy cache
+    assert len(fake.store[qs._REDIS_KEY]["allScored"]) == 120  # Redis NOT clobbered
+
+
+def test_degraded_universe_keeps_last_good(monkeypatch):
+    """When the bulk bar fetch mostly fails, _scan_universe must keep the last-good set,
+    not collapse to the ~27 DEFAULT_TICKERS (which then caches for 3h)."""
+    from engine import alpaca_client
+    good = [f"G{i}" for i in range(120)]
+    monkeypatch.setattr(qs, "_liq_universe", good)
+    monkeypatch.setattr(qs, "_liq_built_ts", 0.0)             # expired → forces a rebuild
+    monkeypatch.setattr(qs, "_candidate_pool", lambda: ["SPY", "AAA", "BBB", "CCC"])
+    monkeypatch.setattr(alpaca_client, "get_multi_bars", lambda *a, **k: {})   # fetch fails
+
+    out = qs._scan_universe()
+    assert out == good                                        # kept last-good, no collapse
+
+
 def test_recent_max_rsi_latches_through_rollover():
     """Peak-detector latch: a name that WAS overbought must still register as recently-overbought
     after it starts rolling over (current RSI < 60) — the MSFT 466→370 miss."""
