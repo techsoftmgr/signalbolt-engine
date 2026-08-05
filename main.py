@@ -60,6 +60,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("signalbolt")
 
+# Capture WARNING+ logs in memory from startup so /ops/diagnostics can surface silent
+# failures via curl (no Fly-log/CLI access needed).
+try:
+    from engine import ops_diagnostics as _ops_diag
+    _ops_diag.install()
+except Exception:
+    pass
+
 POLYGON_KEY = os.environ.get("POLYGON_API_KEY", "")
 
 # ── Alpaca data client singleton ──────────────────────────────
@@ -4821,6 +4829,22 @@ def quant_scan_health(force: bool = False):
         out["bars_rows"] = int(len(bars.df)) if getattr(bars, "df", None) is not None else 0
     except Exception as e:
         out["bars_error"] = repr(e)[:400]
+    return out
+
+
+@app.get("/ops/diagnostics")
+def ops_diagnostics_endpoint(logs: int = 80, contains: str = "", level: str = "", health: bool = True):
+    """PUBLIC ops/debug snapshot (PRE-LAUNCH — gate before launch). Recent WARNING+ log
+    ring buffer + live subsystem health, so a silent backend failure is diagnosable via
+    curl without Fly-log / CLI access. `?contains=alpaca` filters; `?health=0` skips the
+    live probe. Served by whichever machine takes the request — hit a few times for both."""
+    from engine import ops_diagnostics as od
+    out: dict = {"recent_logs": od.recent(limit=logs, contains=contains or None, level=level or None)}
+    if health:
+        try:
+            out["health"] = od.health()
+        except Exception as e:
+            out["health_error"] = repr(e)
     return out
 
 
