@@ -3915,8 +3915,10 @@ async def community_trending(limit: int = 30, force: bool = False):
     from engine import social_insights
     import anyio
     sb = _make_supabase()
+    # Request path serves warm-only (build_on_miss=False) — a cold cache returns a fast
+    # 'warming' shape, never a ~9s inline build that trips the app's timeout. Worker warms.
     return await anyio.to_thread.run_sync(
-        lambda: social_insights.get_enriched_trending(sb, limit=limit, force=force)
+        lambda: social_insights.get_enriched_trending(sb, limit=limit, force=force, build_on_miss=False)
     )
 
 
@@ -3941,8 +3943,10 @@ async def community_track_record(days: int = 30, horizon: int = 5, force: bool =
     from engine import social_insights
     import anyio
     sb = _make_supabase()
+    # Warm-only request path — a cold miss returns a fast 'building' shape, never the
+    # ~20s inline build that caused the Community-tab 'engine timeout'. Worker warms it.
     return await anyio.to_thread.run_sync(
-        lambda: social_insights.track_record(sb, days=days, horizon_days=horizon, force=force)
+        lambda: social_insights.track_record(sb, days=days, horizon_days=horizon, force=force, build_on_miss=False)
     )
 
 
@@ -4937,7 +4941,7 @@ async def watchlist_overview(request: Request, background_tasks: BackgroundTasks
     # 3) buzz — filter the worker-warmed trending cache to the watched tickers
     try:
         from engine import social_insights
-        tr = await anyio.to_thread.run_sync(lambda: social_insights.get_enriched_trending(sb, limit=100))
+        tr = await anyio.to_thread.run_sync(lambda: social_insights.get_enriched_trending(sb, limit=100, build_on_miss=False))
         want = set(tlist)
         for it in (tr.get("trending") or []):
             tk = (it.get("ticker") or "").upper()
