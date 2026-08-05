@@ -437,10 +437,14 @@ def _verdict(*, mentions_chg: Optional[float], price1d: Optional[float],
 # Public: enriched trending
 # ──────────────────────────────────────────────────────────────────────────────
 
-def get_enriched_trending(sb, limit: int = 30, force: bool = False) -> dict:
+def get_enriched_trending(sb, limit: int = 30, force: bool = False, build_on_miss: bool = True) -> dict:
     """
     Base trending feed + per-ticker insight layers. Cached 10 min.
     Returns {trending:[...enriched...], last_updated, sources_used, ...}.
+
+    build_on_miss=False (the REQUEST path): serve cache only — a cold miss returns a
+    fast 'warming' shape instead of the ~9s inline build that blows the client timeout.
+    The worker (force=True) keeps the cache warm.
     """
     if not force:
         try:
@@ -449,6 +453,8 @@ def get_enriched_trending(sb, limit: int = 30, force: bool = False) -> dict:
                 return cached
         except Exception:
             pass
+        if not build_on_miss:
+            return {"trending": [], "warming": True, "last_updated": None, "sources_used": []}
 
     from engine import social_sentiment
     base = social_sentiment.get_trending(limit=limit, force=force) or {}
@@ -665,11 +671,16 @@ def community_pulse(sb, force: bool = False) -> dict:
 # Public: trending → returns track record
 # ──────────────────────────────────────────────────────────────────────────────
 
-def track_record(sb, days: int = 30, horizon_days: int = 5, force: bool = False) -> dict:
+def track_record(sb, days: int = 30, horizon_days: int = 5, force: bool = False,
+                 build_on_miss: bool = True) -> dict:
     """
     Did trending names actually pay? For each matured snapshot we compare the
     price at capture vs `horizon_days` later, and net out SPY over the same
     window. Aggregated by rank bucket. Cached 6h.
+
+    build_on_miss=False (the REQUEST path): serve cache only — a cold miss returns a
+    fast 'building' shape instead of the ~20s inline build that blows the client timeout
+    (the Community-tab 'engine timeout'). The worker (force=True) keeps the cache warm.
     """
     if not force:
         try:
@@ -678,6 +689,10 @@ def track_record(sb, days: int = 30, horizon_days: int = 5, force: bool = False)
                 return cached
         except Exception:
             pass
+        if not build_on_miss:
+            return {"ready": False, "message": "Building history…", "buckets": [],
+                    "horizonDays": horizon_days, "windowDays": days,
+                    "generated_at": _iso_now(), "warming": True}
 
     out = {"ready": False, "message": "Not enough matured data yet — building history.",
            "buckets": [], "horizonDays": horizon_days, "windowDays": days,

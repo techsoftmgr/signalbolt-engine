@@ -2956,13 +2956,22 @@ def start_scheduler() -> BackgroundScheduler:
     # Same fix as quant: the /community/* enrichment (bars + manipulation + news
     # for ~30 names) was computed on the request path → timeouts. Precompute on
     # the worker so the endpoints serve the warm Redis cache instantly.
+    _track_warm_last = [0.0]   # closure throttle for the ~20s track_record build (6h TTL)
+
     def _run_community_refresh():
         try:
+            import time as _t
             from engine import social_insights
             sb = _supabase()
             social_insights.get_enriched_trending(sb, force=True)
             social_insights.community_pulse(sb, force=True)
             social_insights.whats_changed(sb, force=True)
+            # track_record is a ~20s build with a 6h TTL — the request path now serves
+            # warm-only, so the WORKER must keep it warm. Rebuild at most hourly (first
+            # run after startup rebuilds immediately, since _track_warm_last starts at 0).
+            if _t.monotonic() - _track_warm_last[0] > 3600:
+                social_insights.track_record(sb, force=True)
+                _track_warm_last[0] = _t.monotonic()
         except Exception as _e:
             logger.error(f"[runner] community refresh failed: {_e}")
 
