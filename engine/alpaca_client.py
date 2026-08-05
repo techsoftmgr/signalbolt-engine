@@ -526,31 +526,34 @@ def get_multi_bars(
         tf    = tf_map.get(timeframe, TimeFrame(1, TimeFrameUnit.Day))
         start = datetime.now(timezone.utc) - timedelta(days=days)
 
-        req  = StockBarsRequest(
-            symbol_or_symbols=tickers,
-            timeframe=tf,
-            start=start,
-            feed="sip",
-            adjustment="split",   # split-adjust price AND volume (see get_bars note) —
-                                  # keeps levels + relativeVolume continuous across splits
-        )
-        bars = _client.get_stock_bars(req)
-        df   = bars.df
-
-        if df is None or df.empty:
-            return result   # keep any crypto entries already collected
-
-        for ticker in tickers:
+        # CHUNK the request. A single multi-symbol call over the whole universe (~280
+        # names) is fragile: ONE delisted/invalid symbol makes Alpaca error the ENTIRE
+        # request → {} → the quant universe collapses to the ~27 core (the stuck-at-20
+        # dashboard + slow watchlist). Batching isolates a bad symbol to its own chunk,
+        # so the other ~230 names still return. Per-chunk try/except; never total-fail.
+        _CHUNK = 50
+        for _i in range(0, len(tickers), _CHUNK):
+            batch = tickers[_i:_i + _CHUNK]
             try:
-                if isinstance(df.index, pd.MultiIndex):
-                    t_df = df.xs(ticker, level=0).copy()
-                else:
-                    t_df = df.copy()
-                t_df.columns = [c.lower() for c in t_df.columns]
-                t_df.index   = pd.to_datetime(t_df.index, utc=True)
-                result[ticker] = t_df
-            except Exception:
-                pass  # ticker not in response — omit silently
+                req = StockBarsRequest(
+                    symbol_or_symbols=batch, timeframe=tf, start=start,
+                    feed="sip", adjustment="split",
+                )
+                df = _client.get_stock_bars(req).df
+                if df is None or df.empty:
+                    continue
+                for ticker in batch:
+                    try:
+                        t_df = df.xs(ticker, level=0).copy() if isinstance(df.index, pd.MultiIndex) else df.copy()
+                        t_df.columns = [c.lower() for c in t_df.columns]
+                        t_df.index   = pd.to_datetime(t_df.index, utc=True)
+                        result[ticker] = t_df
+                    except Exception:
+                        pass  # ticker not in this response — omit silently
+            except Exception as be:
+                logger.warning(f"[alpaca] get_multi_bars batch {_i // _CHUNK} "
+                               f"({len(batch)} tkrs, {timeframe}) failed: {be}")
+                continue   # a bad batch must not sink the others
         return result
 
     except Exception as e:
