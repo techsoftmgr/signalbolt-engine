@@ -634,27 +634,35 @@ def community_pulse(sb, force: bool = False) -> dict:
         top = [r["ticker"] for r in rows[:3] if r.get("ticker")]
         headline = "Retail's loudest: " + ", ".join(top) + "."
 
-        counts: dict[str, int] = {}
+        # Name the actual tickers per verdict (NOT a bare count — the digest should say
+        # WHICH names, e.g. "Buzz confirmed by price: SPCX, AMD, SPY").
+        by_verdict: dict[str, list[str]] = {}
         for r in rows[:15]:
             k = (r.get("verdict") or {}).get("key")
-            if k:
-                counts[k] = counts.get(k, 0) + 1
-        if counts.get("REAL_MOMENTUM"):
-            bullets.append(f"\U0001F680 {counts['REAL_MOMENTUM']} name(s) have buzz confirmed by price.")
-        if counts.get("HYPE_FADING"):
-            bullets.append(f"⚠️ {counts['HYPE_FADING']} look like hype with no follow-through.")
-        if counts.get("PUMP_RISK"):
-            bullets.append(f"\U0001F6A9 {counts['PUMP_RISK']} flagged for pump / manipulation risk.")
-        if counts.get("UNDER_RADAR"):
-            bullets.append(f"\U0001F440 {counts['UNDER_RADAR']} moving under the radar (price up, low chatter).")
+            tk = r.get("ticker")
+            if k and tk:
+                by_verdict.setdefault(k, []).append(tk)
+
+        def _names(key: str, cap: int = 8) -> str:
+            return ", ".join(by_verdict.get(key, [])[:cap])
+
+        if by_verdict.get("REAL_MOMENTUM"):
+            bullets.append(f"\U0001F680 Buzz confirmed by price: {_names('REAL_MOMENTUM')}.")
+        if by_verdict.get("HYPE_FADING"):
+            bullets.append(f"⚠️ Hype with no follow-through: {_names('HYPE_FADING')}.")
+        if by_verdict.get("PUMP_RISK"):
+            bullets.append(f"\U0001F6A9 Pump / manipulation risk: {_names('PUMP_RISK')}.")
+        if by_verdict.get("UNDER_RADAR"):
+            bullets.append(f"\U0001F440 Under the radar (price up, low chatter): {_names('UNDER_RADAR')}.")
 
         viral = [r["ticker"] for r in rows if r.get("goingViral")][:4]
         if viral:
             bullets.append("Going viral: " + ", ".join(viral) + ".")
 
-        confirmed = sum(1 for r in rows[:10] if (r.get("engine") or {}).get("confirmed"))
+        confirmed = [r["ticker"] for r in rows[:10]
+                     if (r.get("engine") or {}).get("confirmed") and r.get("ticker")]
         if confirmed:
-            bullets.append(f"Our engine agrees with {confirmed} of the top 10.")
+            bullets.append("Our engine agrees on: " + ", ".join(confirmed[:8]) + ".")
 
     if changed.get("newToday"):
         bullets.append("New today: " + ", ".join(c["ticker"] for c in changed["newToday"][:4]) + ".")
