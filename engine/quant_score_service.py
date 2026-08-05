@@ -685,10 +685,24 @@ def _build_dashboard(tickers: list[str]) -> dict:
         # instead of re-fetching ~90 names every 15 min.
         try:
             from datetime import datetime as _dt, timezone as _tz
-            cache.kv.set_json(_SCORED_KEY, scored, _SCORED_TTL)
-            # Stamp when this scan ran so the hub + watchlist can show "updated HH:MM"
-            # and prove they're reading the same snapshot.
-            cache.kv.set_json(_SCORED_TS_KEY, _dt.now(_tz.utc).isoformat(), _SCORED_TTL)
+            # Anti-clobber (same as the dashboard cache): a DEGRADED scan (few names —
+            # universe collapsed to core because the bulk bar fetch failed) must NOT
+            # overwrite a healthier scored universe that the WATCHLIST reads. Otherwise
+            # P/E, market cap, flow etc. cold-compute on every open (the 30-60s lag).
+            _write_scored = True
+            if len(scored) < _MIN_HEALTHY_SCORED:
+                try:
+                    _prior = cache.kv.get_json(_SCORED_KEY) or []
+                except Exception:
+                    _prior = []
+                if len(_prior) > len(scored):
+                    logger.warning(f"[quant] degraded scan ({len(scored)}) — NOT clobbering "
+                                   f"scored universe ({len(_prior)})")
+                    _write_scored = False
+            if _write_scored:
+                cache.kv.set_json(_SCORED_KEY, scored, _SCORED_TTL)
+                # Stamp when this scan ran so the hub + watchlist can show "updated HH:MM".
+                cache.kv.set_json(_SCORED_TS_KEY, _dt.now(_tz.utc).isoformat(), _SCORED_TTL)
         except Exception:
             pass
 
