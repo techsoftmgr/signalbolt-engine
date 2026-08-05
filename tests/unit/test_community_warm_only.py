@@ -30,6 +30,23 @@ def test_enriched_trending_warm_only_does_not_build(monkeypatch):
     assert r.get("warming") is True and r.get("trending") == []
 
 
+def test_pulse_names_tickers_not_counts(monkeypatch):
+    """The digest must NAME the tickers per verdict, not emit a bare count."""
+    monkeypatch.setattr(si.cache, "kv", _FakeKV())
+    rows = {"trending": [
+        {"ticker": "SPCX", "verdict": {"key": "REAL_MOMENTUM"}},
+        {"ticker": "AMD",  "verdict": {"key": "REAL_MOMENTUM"}},
+        {"ticker": "HYPX", "verdict": {"key": "HYPE_FADING"}},
+        {"ticker": "PMPX", "verdict": {"key": "PUMP_RISK"}},
+    ]}
+    monkeypatch.setattr(si, "get_enriched_trending", lambda *a, **k: rows)
+    monkeypatch.setattr(si, "whats_changed", lambda *a, **k: {"newToday": []})
+
+    text = " ".join(si.community_pulse(object())["bullets"])
+    assert "SPCX" in text and "AMD" in text and "HYPX" in text and "PMPX" in text
+    assert "name(s)" not in text          # no bare-count phrasing
+
+
 def test_build_on_miss_default_true_preserves_worker_path(monkeypatch):
     # The worker (force=True) and any build_on_miss=True caller still build — the fix
     # only changes the request path.
