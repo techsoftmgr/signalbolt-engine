@@ -4789,15 +4789,16 @@ async def market_heatmap(
 # ── Quant Dashboard ───────────────────────────────────────────────────────────
 
 @app.get("/quant/scan-health")
-def quant_scan_health():
+def quant_scan_health(force: bool = False):
     """PUBLIC ops probe (no auth, no sensitive data): counts of the cached quant scan
-    buckets, so an empty dashboard can be diagnosed without a user token. Reads the
-    served dashboard (cache) — no compute. `scored=0` ⇒ the scan cache is empty
-    (backend); populated ⇒ the data exists and any blank is app-side."""
-    out: dict = {"ok": True}
+    buckets, so an empty dashboard can be diagnosed without a user token. `scored=0` ⇒
+    the scan cache is empty; populated ⇒ data exists. `?force=1` forces a fresh rebuild
+    on whichever machine serves the request — used to re-establish a healthy scan after
+    a degraded build stuck the cache (the anti-clobber guards then protect it)."""
+    out: dict = {"ok": True, "forced": bool(force)}
     try:
         from engine.quant_score_service import get_quant_dashboard
-        d = get_quant_dashboard()   # cache read only — no heavy compute
+        d = get_quant_dashboard(force=True) if force else get_quant_dashboard()
         out["scored"] = len(d.get("allScored") or [])
         out["regime"] = (d.get("marketRegime") or {}).get("label")
         out["buckets"] = {k: len(v) for k, v in d.items() if isinstance(v, list)}
