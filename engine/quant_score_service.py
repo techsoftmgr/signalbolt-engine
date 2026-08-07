@@ -100,7 +100,13 @@ def _candidate_pool() -> list[str]:
         pool.update(_MOM)
     except Exception:
         pass
-    return sorted(pool)
+    # Authoritative delisting gate: keep only names Alpaca lists as active+tradable
+    # (drops EA-style taken-private tickers immediately). Fail-open if the list is down.
+    try:
+        from engine.alpaca_client import filter_active
+        return sorted(filter_active(pool))
+    except Exception:
+        return sorted(pool)
 
 
 def _scan_universe() -> list[str]:

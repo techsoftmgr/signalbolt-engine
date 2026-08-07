@@ -25,3 +25,15 @@ def test_drop_stale_removes_delisted_keeps_live():
 def test_drop_stale_failopen_without_ref():
     bars = {"XYZ": _df(["2026-01-01", "2026-01-02"])}
     assert ac.drop_stale(bars) == bars          # no SPY ref → keep everything (fail-open)
+
+
+def test_filter_active_drops_delisted(monkeypatch):
+    # authoritative gate: only Alpaca-active+tradable symbols survive
+    monkeypatch.setattr(ac, "active_symbols", lambda: {"SPY", "AAPL", "NVDA"})
+    assert ac.filter_active(["SPY", "AAPL", "EA", "NVDA"]) == ["SPY", "AAPL", "NVDA"]  # EA dropped
+
+
+def test_filter_active_failopen(monkeypatch):
+    # asset list unavailable → NEVER empty the universe (return input unchanged)
+    monkeypatch.setattr(ac, "active_symbols", lambda: None)
+    assert set(ac.filter_active(["SPY", "EA"])) == {"SPY", "EA"}

@@ -15,6 +15,7 @@ back to yfinance without crashing.
 
 import logging
 import os
+import time
 from typing import Optional
 
 import pandas as pd
@@ -596,6 +597,52 @@ def drop_stale(bars: dict, ref: str = "SPY", max_stale_days: int = 6) -> dict:
         logger.info(f"[alpaca] drop_stale: excluded {len(dropped)} delisted/halted "
                     f"(last bar > {max_stale_days}d behind {ref}): {', '.join(dropped[:8])}")
     return out
+
+
+# ── Active-asset gate (authoritative delisting check) ───────────────────────────
+# The AUTHORITATIVE 'does it really trade' check: Alpaca's Assets API marks a symbol
+# status=ACTIVE + tradable. A bought-out/delisted name (EA) flips to inactive
+# IMMEDIATELY — no waiting for bars to age (drop_stale is the belt-and-braces backstop).
+_assets_cache: Optional[set] = None
+_assets_ts: float = 0.0
+_ASSETS_TTL = 6 * 3600     # the asset universe changes rarely — refresh every ~6h
+
+
+def active_symbols() -> Optional[set]:
+    """Set of ACTIVE + TRADABLE US-equity symbols per Alpaca's Assets API. Returns None
+    on failure OR before the first successful fetch — callers MUST fail-open (don't filter
+    if this is None, so a transient asset-API blip can't empty the universe). Cached ~6h."""
+    global _assets_cache, _assets_ts
+    if _assets_cache is not None and (time.monotonic() - _assets_ts) < _ASSETS_TTL:
+        return _assets_cache
+    try:
+        from alpaca.trading.client import TradingClient
+        from alpaca.trading.requests import GetAssetsRequest
+        from alpaca.trading.enums import AssetStatus, AssetClass
+        key    = os.environ.get("ALPACA_API_KEY", "")
+        secret = os.environ.get("ALPACA_SECRET_KEY", "")
+        if not key or not secret:
+            return _assets_cache
+        tc = TradingClient(key, secret, paper=True)   # assets are universe-wide (paper ok)
+        assets = tc.get_all_assets(GetAssetsRequest(status=AssetStatus.ACTIVE, asset_class=AssetClass.US_EQUITY))
+        syms = {a.symbol for a in assets if getattr(a, "tradable", False)}
+        if len(syms) > 1000:          # sanity: a real full list is thousands; ignore a truncated/bad response
+            _assets_cache, _assets_ts = syms, time.monotonic()
+            logger.info(f"[alpaca] active tradable US equities: {len(syms)}")
+            return syms
+        logger.warning(f"[alpaca] active_symbols returned only {len(syms)} — ignoring (keeping last-good)")
+    except Exception as e:
+        logger.warning(f"[alpaca] active_symbols fetch failed: {e}")
+    return _assets_cache   # last-good if we have it, else None → caller fails open
+
+
+def filter_active(symbols) -> list:
+    """Keep only symbols Alpaca lists as active+tradable. Fail-open: if the asset list is
+    unavailable, return the input unchanged (never empty the universe on an API blip)."""
+    active = active_symbols()
+    if not active:
+        return list(symbols)
+    return [s for s in symbols if s in active]
 
 
 def get_multi_news(tickers: list[str], limit: int = 10) -> list[dict]:
