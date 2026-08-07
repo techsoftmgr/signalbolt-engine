@@ -1020,6 +1020,34 @@ def _process_smc_ticker(sb: Client, ticker: str, config: dict,
     if not scored["passes"]:
         return
 
+    # ── ENTRY GUARDS (SNOW/GLD analysis) — kill-switched, fail-open, logged ──
+    # Blocks are recorded to entry_gate_rejections so the gate-validator measures whether
+    # they killed losers (good) or winners (bad) before we trust them.
+    try:
+        from engine import entry_guards
+        _guard_reason = None
+        if entry_guards.cooldown_enabled():
+            _sup, _r = entry_guards.should_suppress(sb, ticker, direction)
+            if _sup:
+                _guard_reason = f"refire/dedup: {_r}"
+        if _guard_reason is None and direction == "SHORT" and entry_guards.short_veto_enabled():
+            _sv, _r = entry_guards.short_into_strength_check(ticker)
+            if _sv:
+                _guard_reason = f"short_strength: {_r}"
+        if _guard_reason:
+            logger.info(f"[runner] {ticker} [{strategy_type}] BLOCKED — {_guard_reason}")
+            try:
+                _gr = entry_gate.GateResult(allowed=False, reasons=[_guard_reason],
+                                            gate_log={"entry_guard": f"fail:{_guard_reason}"})
+                entry_gate.log_rejection(sb=sb, ticker=ticker, direction=direction,
+                                         strategy_type=strategy_type, price=price,
+                                         confidence_score=scored.get("total", 0), gate=_gr)
+            except Exception:
+                pass
+            return
+    except Exception as _eg_err:   # fail-open — guards never worsen today's engine
+        logger.debug(f"[runner] entry_guards skipped for {ticker}: {_eg_err}")
+
     # ── ENTRY GATE v2: multi-timeframe + pattern confirmation ─
     # Runs AFTER scoring passes (cheap fast-path) and BEFORE expensive
     # SL/TP calc. Rejects signals that look good on the entry timeframe
