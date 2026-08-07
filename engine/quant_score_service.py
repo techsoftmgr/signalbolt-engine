@@ -111,14 +111,16 @@ def _scan_universe() -> list[str]:
 
     pool = _candidate_pool()
     try:
-        from engine.alpaca_client import get_multi_bars
+        from engine.alpaca_client import get_multi_bars, drop_stale
         # Only the core is always-kept (mega-liquid). Today's movers are in the
         # pool and must pass the SAME liquidity filter — so we keep liquid movers
         # (real volume) and drop low-float % pumps. That's the whole point of a
         # liquidity base.
         must = set(DEFAULT_TICKERS)
 
-        bars = get_multi_bars(pool, "1Day", 30) or {}
+        # drop_stale first: exclude delisted/long-halted names (e.g. EA taken private)
+        # whose frozen bars would otherwise slip through the liquidity filter.
+        bars = drop_stale(get_multi_bars(pool, "1Day", 30) or {})
         keep_must: list[str] = []
         ranked:    list[tuple[str, float]] = []
         for tk, df in bars.items():

@@ -155,8 +155,10 @@ def compute_churn(limit: int = 25, force: bool = False) -> dict:
         if not syms:
             return empty
 
-        from engine.alpaca_client import get_multi_bars
-        bars = get_multi_bars(syms, "1Day", 50) or {}
+        from engine.alpaca_client import get_multi_bars, drop_stale
+        # drop_stale removes delisted/long-halted names (e.g. EA post-buyout) whose
+        # frozen bars would otherwise read as "no price move" = churn.
+        bars = drop_stale(get_multi_bars(syms, "1Day", 50) or {})
         if not bars:
             return empty
 
