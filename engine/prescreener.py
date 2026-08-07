@@ -60,7 +60,7 @@ EXTENDED_UNIVERSE = [
     # ── High-growth / momentum names ──────────────────────────
     # These are frequently the biggest intraday/earnings movers — must be in universe
     "SPOT", "RDDT", "APP", "CELH", "DUOL", "ONON", "DECK", "ELF",
-    "HIMS", "SNAP", "PINS", "DOCS", "WOLF", "TTWO", "EA", "RIVN",
+    "HIMS", "SNAP", "PINS", "DOCS", "WOLF", "TTWO", "RIVN",   # EA removed — taken private ($55B buyout), delisted
     "HOOD", "AFRM", "UPST", "OPEN", "COUR", "BMBL", "JOBY",
     # ── Indices / ETFs (1x) ────────────────────────────────────
     "SPY", "QQQ", "IWM", "DIA",

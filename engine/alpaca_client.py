@@ -561,6 +561,43 @@ def get_multi_bars(
         return result   # keep any crypto entries already collected
 
 
+def drop_stale(bars: dict, ref: str = "SPY", max_stale_days: int = 6) -> dict:
+    """Remove DELISTED / long-halted tickers from a {ticker: daily_df} map. A company
+    taken private (e.g. EA's $55B buyout → delisted at ~$210) still returns FROZEN bars
+    from Alpaca — its last bar lags the market's. SPY (the ref) defines 'the latest
+    trading day', so this is robust to weekends/holidays: a ticker whose last bar is more
+    than `max_stale_days` CALENDAR days behind SPY's last bar is dropped (6d covers a
+    normal week + weekend; a live liquid name always prints within that). Fail-open: if
+    the ref is missing, return as-is.
+
+    Only for CURRENT-state consumers (scan universe, churn) — NOT historical replays,
+    which legitimately want a since-delisted name's old bars.
+    """
+    import pandas as pd
+    ref_df = bars.get(ref)
+    try:
+        ref_last = pd.to_datetime(ref_df.index[-1]) if ref_df is not None and len(ref_df) else None
+    except Exception:
+        ref_last = None
+    if ref_last is None:
+        return bars
+    cutoff = ref_last - pd.Timedelta(days=max_stale_days)
+    out: dict = {}
+    dropped: list[str] = []
+    for t, df in bars.items():
+        try:
+            if df is not None and len(df) and pd.to_datetime(df.index[-1]) >= cutoff:
+                out[t] = df
+            else:
+                dropped.append(t)
+        except Exception:
+            out[t] = df   # can't parse the index → keep (fail-open)
+    if dropped:
+        logger.info(f"[alpaca] drop_stale: excluded {len(dropped)} delisted/halted "
+                    f"(last bar > {max_stale_days}d behind {ref}): {', '.join(dropped[:8])}")
+    return out
+
+
 def get_multi_news(tickers: list[str], limit: int = 10) -> list[dict]:
     """
     Batch news for multiple tickers from Alpaca News API.
