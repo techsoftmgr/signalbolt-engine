@@ -36,8 +36,21 @@ Per-strategy parameters:
 
 import logging
 import math
+import os
 
 logger = logging.getLogger("signalbolt.sl_tp")
+
+# ── Breakout min-stop widening (GLD shake-out fix) ────────────────────────────
+# A breakout expands range on the breakout day, so a floor-tight stop gets shaken out
+# on a normal pullback before the move (GLD: stopped ~scratch, then ran +2-3%). For
+# breakout setups, floor the MIN stop to ~ADR × mult so it clears the breakout-day
+# range. Kill-switched (default OFF) + capped at the ceiling + tagged in sl_adjustments.
+_BREAKOUT_STRATEGIES = {"breakout", "breakout_forming", "momentum_surge", "swing_breakout"}
+_BREAKOUT_MIN_ADR_MULT = float(os.environ.get("BREAKOUT_MIN_STOP_ADR_MULT", "1.2"))
+
+
+def _breakout_wide_stop_enabled() -> bool:
+    return os.environ.get("BREAKOUT_WIDE_STOP_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
 # ── ATR multipliers (base, before regime/session adjustments) ─────────────────
 # H-L ATR is ~40-60% of True Range ATR (no overnight gaps).
@@ -385,6 +398,19 @@ def calculate(
             adjustments.append(gamma_sl_reason)
 
     sl = round(sl, 2)
+
+    # ── Breakout SL floor (POST-gamma) — GLD shake-out fix ────────────────────
+    # A breakout needs room for the breakout-day range. Gamma/structure can pull the SL
+    # to a near-entry wall (GLD momentum breakout: 0.04% stop → instant shake-out), and
+    # unlike the max there's no min re-clamp after gamma. For breakout setups, ensure the
+    # FINAL stop is at least ADR × mult so a normal pullback can't eject us. Kill-switched
+    # (default off), breakout-scoped (zero blast radius elsewhere), capped at the ceiling.
+    if _breakout_wide_stop_enabled() and strategy_type in _BREAKOUT_STRATEGIES and adr > 0:
+        bo_floor = min(adr * _BREAKOUT_MIN_ADR_MULT, entry * ceiling_pct)
+        if abs(entry - sl) < bo_floor - 1e-9:
+            sl = round((entry - bo_floor) if direction == "LONG" else (entry + bo_floor), 2)
+            adjustments.append(f"breakout SL floored to {(bo_floor / entry) * 100:.2f}% "
+                               f"({_BREAKOUT_MIN_ADR_MULT:.1f}× ADR ${adr:.2f}, post-gamma)")
 
     # Recalculate actual risk after all adjustments
     risk = abs(entry - sl)
