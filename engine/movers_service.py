@@ -97,7 +97,14 @@ def _candidate_symbols() -> list[str]:
     except Exception as e:
         logger.debug(f"[movers] universe load failed: {e}")
     syms |= set(_vetted_screener_symbols())
-    return [s for s in syms if _is_common(s)]
+    common = [s for s in syms if _is_common(s)]
+    # Authoritative delisting gate: keep only Alpaca-active+tradable names (drops EA-style
+    # taken-private tickers from churn/movers immediately). Fail-open if the list is down.
+    try:
+        from engine.alpaca_client import filter_active
+        return filter_active(common)
+    except Exception:
+        return common
 
 
 def peek_movers() -> dict | None:

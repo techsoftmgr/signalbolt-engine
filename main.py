@@ -4817,6 +4817,15 @@ def quant_scan_health(force: bool = False):
     except Exception as e:
         out["ok"] = False
         out["error"] = repr(e)
+    # Active-asset gate visibility — confirms the delisting filter is live (count should
+    # be thousands; a delisted name like EA should be absent).
+    try:
+        from engine.alpaca_client import active_symbols
+        act = active_symbols()
+        out["active_assets"] = len(act) if act else 0
+        out["EA_active"] = ("EA" in act) if act else None
+    except Exception as e:
+        out["active_err"] = repr(e)
     # RAW Alpaca REST bars probe — surfaces the exact reason bulk bars fail (key/401,
     # rate-limit, outage) that get_multi_bars swallows. Small 3-ticker call.
     try:
