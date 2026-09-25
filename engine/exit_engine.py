@@ -346,3 +346,99 @@ def config_from_env() -> ExitConfig:
     except (TypeError, ValueError):
         pass
     return c
+
+
+# ── exhaustion / extension take-profit (OBSERVE-ONLY, shadow) ─────────────────
+# Ground-truth (2026-09): momentum tops ARE parabolic stretches — the names that ran
+# huge then reversed (MRVL, ARM) PEAKED 4.8-5.7×ATR above their 20-EMA. A close-based
+# trend/trail exit can never bank that (it only confirms the top AFTER price comes off
+# it → ~40% MFE capture ceiling). A profit-target into strength CAN: it is a LIMIT, not
+# a stop, so it fills on the spike and cannot be wicked out — checking it intraday is
+# safe. This is measured in shadow before it ever manages a live cent.
+def extension_atr(direction: str, daily_df: pd.DataFrame,
+                  ema_span: int = 20, atr_len: int = 14) -> Optional[float]:
+    """How far the LAST close is stretched beyond its mean, in ATR units, signed so a
+    large POSITIVE value = extended in the trade's favour (= exhaustion risk). None if
+    insufficient data. Pure — for observation only."""
+    d = _norm(daily_df)
+    if d is None or len(d) < max(ema_span, atr_len) + 1:
+        return None
+    close, high, low = d["close"], d["high"], d["low"]
+    ema = float(close.ewm(span=ema_span, adjust=False).mean().iloc[-1])
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr = float(tr.rolling(atr_len).mean().iloc[-1])
+    if not atr or np.isnan(atr):
+        return None
+    ext = (float(close.iloc[-1]) - ema) / atr
+    return round(ext if direction.upper() == "LONG" else -ext, 2)
+
+
+def replay_ext_tp(direction: str, entry: float, stop: float, daily_df: pd.DataFrame, *,
+                  entry_date=None, spy_df: Optional[pd.DataFrame] = None,
+                  cfg: Optional[ExitConfig] = None, k: float = 5.0, scale: float = 0.5,
+                  arm: Optional[float] = None, ema_span: int = 20, atr_len: int = 14,
+                  max_hold: int = 25) -> Optional[dict]:
+    """HYBRID exit replay: sell `scale` of the position with an INTRADAY limit into an
+    exhaustion stretch (≥ k×ATR beyond the ema_span mean), let the remainder ride the
+    normal smart-exit lifecycle (`replay`). Blended pnl = scale·(exhaustion fill) +
+    (1-scale)·(trail exit). If the stretch is never reached, pnl == the trail.
+
+    An exhaustion take-profit is a PROFIT tool: it only fires (1) after a real run-up
+    (running peak gain ≥ `arm`, default the giveback arm) and (2) when the fill is in
+    profit (level beyond entry). Without those guards a bounce toward a FALLING mean in a
+    losing trade would 'take profit' at a big loss. Pure + deterministic; OBSERVE-ONLY."""
+    cfg = cfg or config_from_env()
+    arm = cfg.giveback_arm_pct if arm is None else arm
+    base = replay(direction, entry, stop, daily_df, entry_date=entry_date,
+                  spy_df=spy_df, cfg=cfg, max_hold=max_hold)
+    if base is None:
+        return None
+    cols = {c.lower(): c for c in daily_df.columns}
+    if not all(x in cols for x in ("high", "low", "close")):
+        return None
+    hi = pd.to_numeric(daily_df[cols["high"]], errors="coerce")
+    lo = pd.to_numeric(daily_df[cols["low"]], errors="coerce")
+    cl = pd.to_numeric(daily_df[cols["close"]], errors="coerce")
+    is_long = direction.upper() == "LONG"
+    ema = cl.ewm(span=ema_span, adjust=False).mean()
+    tr = pd.concat([hi - lo, (hi - cl.shift()).abs(), (lo - cl.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(atr_len).mean()
+
+    start = None
+    if entry_date is not None and hasattr(daily_df.index, "date"):
+        for i in range(len(daily_df)):
+            if daily_df.index[i].date() >= entry_date:
+                start = i
+                break
+    if start is None:
+        start = max(0, len(daily_df) - max_hold)
+
+    peak_ext = None
+    peak_price = entry
+    ext_pnl = None
+    ext_day = None
+    for i in range(start, min(start + max_hold, len(daily_df))):
+        hi_i, lo_i = float(hi.iloc[i]), float(lo.iloc[i])
+        peak_price = max(peak_price, hi_i) if is_long else min(peak_price, lo_i)
+        run = ((peak_price - entry) if is_long else (entry - peak_price)) / entry * 100.0
+        a = float(atr.iloc[i]) if not pd.isna(atr.iloc[i]) else None
+        if not a or a <= 0:
+            continue
+        e_i = float(ema.iloc[i])
+        stretch = (hi_i - e_i) / a if is_long else (e_i - lo_i) / a
+        peak_ext = stretch if peak_ext is None else max(peak_ext, stretch)
+        if ext_pnl is None and run >= arm:                 # only after a genuine run-up
+            lvl = e_i + k * a if is_long else e_i - k * a
+            hit = (hi_i >= lvl) if is_long else (lo_i <= lvl)
+            if hit:
+                g = ((lvl - entry) if is_long else (entry - lvl)) / entry * 100.0
+                if g > 0:                                   # take PROFIT into strength only
+                    ext_pnl = g
+                    ext_day = i - start
+    ext_hit = ext_pnl is not None
+    blended = (scale * ext_pnl + (1 - scale) * base["pnl_pct"]) if ext_hit else base["pnl_pct"]
+    return {"pnl_pct": round(blended, 3), "ext_hit": ext_hit,
+            "ext_pnl": round(ext_pnl, 3) if ext_hit else None, "ext_day": ext_day,
+            "peak_ext": round(peak_ext, 2) if peak_ext is not None else None,
+            "trail_pnl": base["pnl_pct"], "trail_reason": base["exit_reason"],
+            "k": k, "scale": scale, "v": VERSION}

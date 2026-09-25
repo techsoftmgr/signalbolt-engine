@@ -138,3 +138,70 @@ def test_kill_switches_default_off(monkeypatch):
     assert ex.enabled() is False and ex.shadow() is False
     monkeypatch.setenv("SMART_EXIT_SHADOW", "true")
     assert ex.shadow() is True
+
+
+# ── exhaustion / extension take-profit (observe-only, shadow) ────────────────
+def test_extension_atr_flags_a_parabolic_stretch():
+    # a flat base then a sharp spike → the last close sits far above the 20-EMA in ATR
+    closes = list(np.linspace(100, 102, 34)) + [104, 110, 120]
+    df = _df(closes)
+    ext = ex.extension_atr("LONG", df)
+    assert ext is not None and ext > 3           # clearly stretched in the trade's favour
+    # a quiet, mean-hugging series is NOT extended
+    assert ex.extension_atr("LONG", _df(list(np.linspace(100, 101, 40)))) < 2
+
+
+def _daily(closes, highs=None):
+    closes = np.asarray(closes, float)
+    idx = pd.date_range("2026-05-01", periods=len(closes), freq="D")
+    return pd.DataFrame({"open": closes, "high": closes + 1 if highs is None else np.asarray(highs, float),
+                         "low": closes - 1, "close": closes, "volume": [1e6] * len(closes)}, index=idx)
+
+
+def test_replay_ext_tp_books_into_an_exhaustion_spike():
+    # entry NEAR the mean (realistic momentum entry), a modest run, then a 1-bar blow-off
+    # spike, then a gap-down straight through the stop. The trail exits LOW (stop); the
+    # exhaustion TP already banked a partial into the spike → blended pnl beats the trail.
+    # (the ARM/PANW pattern from the 2026-09 ground-truth.)
+    hist = list(np.linspace(99, 100, 40))
+    closes = hist + [101, 102, 103, 125, 90]
+    highs = [c + 1 for c in hist] + [102, 103, 104, 128, 96]
+    lows = [c - 1 for c in hist] + [100, 101, 102, 120, 88]     # last bar gaps down through 92
+    idx = pd.date_range("2026-05-01", periods=len(closes), freq="D")
+    df = pd.DataFrame({"open": closes, "high": highs, "low": lows, "close": closes,
+                       "volume": [1e6] * len(closes)}, index=idx)
+    ed = df.index[40].date()
+    trail = ex.replay("LONG", 100, 92, df, entry_date=ed)
+    hyb = ex.replay_ext_tp("LONG", 100, 92, df, entry_date=ed, k=4.0, scale=0.5)
+    assert hyb is not None and hyb["ext_hit"] is True
+    assert hyb["peak_ext"] is not None and hyb["peak_ext"] >= 4.0
+    assert hyb["ext_pnl"] > hyb["trail_pnl"]          # the exhaustion leg banked the spike
+    assert hyb["pnl_pct"] > trail["pnl_pct"]          # blended capture beats the pure trail
+
+
+def test_replay_ext_tp_falls_back_to_trail_without_a_spike():
+    # a steady grind that never reaches k×ATR → no exhaustion fill → pnl == the trail
+    closes = list(np.linspace(80, 100, 40)) + list(np.linspace(100, 112, 8))
+    df = _daily(closes)
+    ed = df.index[40].date()
+    trail = ex.replay("LONG", 100, 90, df, entry_date=ed)
+    hyb = ex.replay_ext_tp("LONG", 100, 90, df, entry_date=ed, k=6.0, scale=0.5)
+    assert hyb["ext_hit"] is False
+    assert abs(hyb["pnl_pct"] - trail["pnl_pct"]) < 1e-6
+
+
+def test_replay_ext_tp_never_books_a_loss_on_an_adverse_bounce():
+    # entry then an immediate crash, then a dead-cat bounce that is "extended" above the
+    # FALLING mean but still far BELOW entry. The exhaustion TP must NOT fire (a profit
+    # tool never books a loss) — this is the CRWD -74% bug guard.
+    hist = list(np.linspace(99, 100, 40))
+    closes = hist + [92, 80, 70, 78, 74]        # crash then a bounce to 78 (below entry 100)
+    highs = [c + 1 for c in hist] + [93, 81, 71, 82, 75]
+    lows = [c - 1 for c in hist] + [88, 78, 68, 76, 72]
+    idx = pd.date_range("2026-05-01", periods=len(closes), freq="D")
+    df = pd.DataFrame({"open": closes, "high": highs, "low": lows, "close": closes,
+                       "volume": [1e6] * len(closes)}, index=idx)
+    ed = df.index[40].date()
+    hyb = ex.replay_ext_tp("LONG", 100, 60, df, entry_date=ed, k=2.0, scale=0.5)
+    assert hyb["ext_hit"] is False                 # never armed / never a profitable fill
+    assert hyb["pnl_pct"] == hyb["trail_pnl"]      # pure trail, no phantom -74% "profit"
