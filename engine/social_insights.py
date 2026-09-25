@@ -147,6 +147,7 @@ def _active_signals(sb) -> dict[str, dict]:
         res = (
             sb.table("signals")
             .select("ticker,direction,confidence_score,strategy_type")
+            .or_("origin.is.null,origin.neq.ab_control")   # exclude A/B control twins
             .eq("status", "active")
             .execute()
         )

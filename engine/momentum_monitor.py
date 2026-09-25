@@ -24,10 +24,26 @@ import logging
 import numpy as np
 import pandas as pd
 
-from engine import alpaca_client
+import os
+
+from engine import alpaca_client, exit_engine
 from engine.signal_monitor import _update_sl, _close_signal, _log_event
 
 logger = logging.getLogger("signalbolt.momentum_monitor")
+
+
+def _smart_exit_on() -> bool:
+    """Kill switch — route TREND_MOMENTUM through exit_engine (giveback + confluence
+    + exhaustion TP) instead of the chandelier. Per-signal: only arms NOT tagged
+    ab_arm='control' (the A/B control twin stays on the chandelier for comparison)."""
+    return os.environ.get("MOMENTUM_SMART_EXIT_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _ext_k() -> float:
+    try:
+        return float(os.environ.get("SMART_EXIT_EXT_K", "5.0"))
+    except (TypeError, ValueError):
+        return 5.0
 
 _ATR_PERIOD   = 22
 _ATR_MULT     = 3.0     # base chandelier distance (let early trends breathe)
@@ -89,6 +105,10 @@ def manage(sb) -> dict:
         return stats
 
     logger.info(f"[momentum_monitor] managing {len(mom)} TREND_MOMENTUM signal(s)")
+    try:
+        _spy = alpaca_client.get_bars("SPY", "1Day", 90)
+    except Exception:
+        _spy = None
     for sig in mom:
         try:
             # MANUAL override: admin owns it — engine does not trail/exit.
@@ -111,6 +131,13 @@ def manage(sb) -> dict:
             atr   = _atr(df)
             sma50 = float(np.mean(closes[-_SMA_STRUCT:]))
             price = alpaca_client.get_latest_price(ticker) or last_close
+
+            # ── A/B: route the smart-exit arm through exit_engine; the control twin
+            #    (ab_arm='control') and everything when the kill switch is off stay
+            #    on the chandelier below, so we compare the two exits on the SAME setup.
+            if _smart_exit_on() and (sig.get("score_breakdown") or {}).get("ab_arm") != "control":
+                _manage_smart_exit(sb, sig, df, price, entry, sl, is_long, _spy, stats)
+                continue
 
             # Open gain off the DAILY close (never the live/AH price) so the
             # trail stays a pure daily-close decision. The multiple tightens as
@@ -192,6 +219,69 @@ def _close_momentum(sb, sig_id, ticker, direction, entry, price, why: str) -> No
                note=(f"{'✅' if won else '🔴'} Trend exit ({why}) @ ${price:.2f} "
                      f"({'+' if pnl >= 0 else ''}{pnl:.1f}%) — rode the move"))
     logger.info(f"[momentum_monitor] {ticker} CLOSED via {why} @ ${price:.2f} ({pnl:+.1f}%)")
+
+
+def _peak_since_entry(df: pd.DataFrame, created_at, is_long: bool) -> float:
+    """Best price since entry (MFE anchor for the giveback cap). Uses bars on/after
+    the entry date when the frame carries a datetime index; falls back to the whole
+    frame otherwise."""
+    sub = df
+    try:
+        ed = pd.to_datetime(created_at).date()
+        mask = [ix.date() >= ed for ix in df.index]
+        if any(mask):
+            sub = df[mask]
+    except Exception:
+        sub = df
+    if is_long:
+        return float(sub["high"].values.astype(float).max())
+    return float(sub["low"].values.astype(float).min())
+
+
+def _manage_smart_exit(sb, sig: dict, df: pd.DataFrame, price: float, entry: float,
+                       sl: float, is_long: bool, spy, stats: dict) -> None:
+    """A/B arm A: manage ONE TREND_MOMENTUM signal with exit_engine (giveback cap +
+    price-anchored confluence + exhaustion take-profit) instead of the chandelier.
+    Same DAILY-CLOSE discipline as the chandelier — decisions on the completed bar,
+    the stored stop as the intraday backstop. Best-effort; never raises."""
+    direction = "LONG" if is_long else "SHORT"
+    sig_id = sig["id"]; ticker = sig["ticker"]
+    last_close = float(df["close"].values.astype(float)[-1])
+
+    # 1) hard stop (stored SL) on a CONFIRMED daily close — the backstop
+    if (is_long and last_close < sl) or ((not is_long) and last_close > sl):
+        _close_momentum(sb, sig_id, ticker, direction, entry, price, "smart-exit stop")
+        stats["closed"] += 1
+        return
+
+    # 2) exhaustion take-profit — sell into a >= k*ATR stretch above the mean, in profit
+    ext = exit_engine.extension_atr(direction, df)
+    in_profit = (last_close > entry) if is_long else (last_close < entry)
+    if ext is not None and ext >= _ext_k() and in_profit:
+        _close_momentum(sb, sig_id, ticker, direction, entry, price, f"exhaustion TP ({ext:.1f}xATR)")
+        stats["closed"] += 1
+        return
+
+    # 3) giveback cap + confluence trend-exit (exit_engine, daily-close basis)
+    peak = _peak_since_entry(df, sig.get("created_at"), is_long)
+    xr = exit_engine.evaluate(direction, entry, last_close, peak, df,
+                              spy_df=spy, cfg=exit_engine.config_from_env())
+    if xr.get("exit"):
+        _close_momentum(sb, sig_id, ticker, direction, entry, price, f"smart-exit {xr.get('reason')}")
+        stats["closed"] += 1
+        return
+
+    # 4) ratchet the stored stop UP to the giveback floor (never down; can't force an exit)
+    gf = xr.get("giveback_floor")
+    if gf is not None:
+        eff = round(max(sl, gf), 2) if is_long else round(min(sl, gf), 2)
+        if (is_long and eff > sl + 0.01) or ((not is_long) and eff < sl - 0.01):
+            _update_sl(sb, sig_id, eff, sig=sig)
+            _locked = (((eff - entry) if is_long else (entry - eff)) / entry * 100)
+            _log_event(sb, sig_id, "be_move", price=price,
+                       note=(f"🔒 Smart-exit profit-lock → ${eff:.2f} "
+                             f"(giveback floor, locks {'+' if _locked >= 0 else ''}{_locked:.0f}%)"))
+            stats["trailed"] += 1
 
 
 def stop_backstop(sb) -> dict:
