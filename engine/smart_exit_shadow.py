@@ -13,6 +13,7 @@ touches result / result_pct / status / closed_reason. Sibling of gate_validator.
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 import logging
+import os
 
 from engine import exit_engine, alpaca_client
 
@@ -22,10 +23,20 @@ _MAX_HOLD = 25            # trading days the replay manages a position
 _FULL_WINDOW_DAYS = 35    # calendar days after entry for a full replay window to exist
 
 
+def _ext_params() -> tuple:
+    """Exhaustion take-profit knobs — live-tunable without a deploy (observe-only)."""
+    try:
+        return float(os.environ.get("SMART_EXIT_EXT_K", "5.0")), float(os.environ.get("SMART_EXIT_EXT_SCALE", "0.5"))
+    except (TypeError, ValueError):
+        return 5.0, 0.5
+
+
 def _needs_backfill(bd) -> bool:
+    # process while EITHER the trail replay OR the exhaustion-TP replay is missing, so
+    # already-finalized shadows still pick up the new extension leg on the next pass.
     return (isinstance(bd, dict) and bd.get("smart_exit_managed")
             and bd.get("smart_exit_mode") == "shadow"
-            and not bd.get("smart_exit_shadow_final"))
+            and not (bd.get("smart_exit_shadow_final") and bd.get("smart_exit_shadow_ext")))
 
 
 def backfill_batch(sb, limit: int = 300, lookback_days: int = 60) -> dict:
@@ -46,7 +57,8 @@ def backfill_batch(sb, limit: int = 300, lookback_days: int = 60) -> dict:
     except Exception:
         spy = None
 
-    done = better = worse = pending = 0
+    ext_k, ext_scale = _ext_params()
+    done = better = worse = pending = ext_done = 0
     for r in todo:
         try:
             ed = datetime.fromisoformat(r["created_at"].replace("Z", "+00:00"))
@@ -62,19 +74,33 @@ def backfill_batch(sb, limit: int = 300, lookback_days: int = 60) -> dict:
                 pending += 1
                 continue
             actual = r.get("result_pct")
-            delta = round(res["pnl_pct"] - float(actual), 3) if actual is not None else None
             bd = dict(r.get("score_breakdown") or {})
-            bd["smart_exit_shadow_final"] = {**res, "actual_pct": actual, "delta": delta,
-                                             "v": exit_engine.VERSION}
-            sb.table("signals").update({"score_breakdown": bd}).eq("id", r["id"]).execute()
-            done += 1
-            if delta is not None:
-                better += delta > 0.01
-                worse += delta < -0.01
+            changed = False
+            if not bd.get("smart_exit_shadow_final"):
+                delta = round(res["pnl_pct"] - float(actual), 3) if actual is not None else None
+                bd["smart_exit_shadow_final"] = {**res, "actual_pct": actual, "delta": delta,
+                                                 "v": exit_engine.VERSION}
+                changed = True
+                if delta is not None:
+                    better += delta > 0.01
+                    worse += delta < -0.01
+            # exhaustion / extension take-profit — the leg that reaches toward MFE
+            if not bd.get("smart_exit_shadow_ext"):
+                ext = exit_engine.replay_ext_tp(
+                    r["direction"], float(r["entry_price"]), float(r["stop_loss"]), daily,
+                    entry_date=ed.date(), spy_df=spy, k=ext_k, scale=ext_scale, max_hold=_MAX_HOLD)
+                if ext:
+                    ext_delta = round(ext["pnl_pct"] - float(actual), 3) if actual is not None else None
+                    bd["smart_exit_shadow_ext"] = {**ext, "actual_pct": actual, "delta": ext_delta}
+                    changed = True
+                    ext_done += 1
+            if changed:
+                sb.table("signals").update({"score_breakdown": bd}).eq("id", r["id"]).execute()
+                done += 1
         except Exception as e:
             logger.debug(f"[shadow_backfill] {r.get('ticker')} failed: {e}")
     summary = {"candidates": len(todo), "evaluated": done, "pending": pending,
-               "smart_better": better, "smart_worse": worse}
+               "smart_better": better, "smart_worse": worse, "ext_evaluated": ext_done}
     logger.info(f"[shadow_backfill] {summary}")
     return summary
 
@@ -100,7 +126,8 @@ def scorecard(sb, days: int = 45) -> dict:
 
     def _new():
         return {"n": 0, "actual": 0.0, "shadow": 0.0, "better": 0, "worse": 0,
-                "awin": 0, "swin": 0, "reasons": defaultdict(int)}
+                "awin": 0, "swin": 0, "reasons": defaultdict(int),
+                "ext": 0.0, "extn": 0, "extbetter": 0, "exthit": 0}
     seg: dict = defaultdict(_new)
     overall = _new()
     evaluated = 0
@@ -118,6 +145,14 @@ def scorecard(sb, days: int = 45) -> dict:
             b["worse"] += shadow < actual - 0.01
             b["awin"] += actual > 0; b["swin"] += shadow > 0
         d["reasons"][f.get("exit_reason") or "?"] += 1
+        # exhaustion / extension take-profit leg (the reach-toward-MFE variant)
+        e = bd.get("smart_exit_shadow_ext") if isinstance(bd, dict) else None
+        if isinstance(e, dict) and e.get("pnl_pct") is not None:
+            ep = float(e["pnl_pct"])
+            for b in (d, overall):
+                b["ext"] += ep; b["extn"] += 1
+                b["extbetter"] += ep > actual + 0.01
+                b["exthit"] += 1 if e.get("ext_hit") else 0
 
     def _pack(b, name=None):
         n = b["n"] or 1
@@ -126,6 +161,11 @@ def scorecard(sb, days: int = 45) -> dict:
              "actual_avg": round(b["actual"] / n, 3), "shadow_avg": round(b["shadow"] / n, 3),
              "shadow_better": b["better"], "shadow_worse": b["worse"],
              "actual_win": round(100 * b["awin"] / n, 1), "shadow_win": round(100 * b["swin"] / n, 1)}
+        if b["extn"]:
+            en = b["extn"]
+            o.update(ext_n=en, ext_total=round(b["ext"], 1), ext_avg=round(b["ext"] / en, 3),
+                     ext_delta_total=round(b["ext"] - b["actual"], 1), ext_better=b["extbetter"],
+                     ext_hit_rate=round(100 * b["exthit"] / en, 1))
         if name is not None:
             o["detector"] = name
             o["exit_reasons"] = dict(b["reasons"])
