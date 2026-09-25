@@ -1968,6 +1968,13 @@ _MOMENTUM_T1_R       = 4.0
 _MOMENTUM_T2_R       = 8.0
 
 
+def _momentum_ab_on() -> bool:
+    """A/B twin switch — when on, every new TREND_MOMENTUM setup fires as a PAIR:
+    arm A (smart-exit) + arm B (ab_arm='control', chandelier). The control twin is
+    marked origin='ab_control' so it's excluded from the feed and all analytics."""
+    return os.environ.get("MOMENTUM_AB_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _fire_momentum(sb: Client, ms, direction: str) -> None:
     """Fire a swing momentum signal (detector_source=TREND_MOMENTUM)."""
     strategy_type = "swing_trade"
@@ -2060,7 +2067,19 @@ def _fire_momentum(sb: Client, ms, direction: str) -> None:
         "confidence_grade":   "B+",
         "setup_type":         "TREND_MOMENTUM",
     }
+    # arm A = smart-exit (managed by momentum_monitor via exit_engine); the A/B control
+    # twin (arm B) rides the current chandelier so the two exits race on the SAME setup.
+    signal_row["score_breakdown"]["ab_arm"] = "smart_exit"
     new_id = _write_signal(sb, signal_row)
+    if _momentum_ab_on():
+        try:
+            control = dict(signal_row)
+            control["origin"] = "ab_control"      # top-level marker → excluded from feed/analytics
+            control["score_breakdown"] = {**signal_row["score_breakdown"], "ab_arm": "control"}
+            _write_signal(sb, control)
+            logger.info(f"[runner] {ms.ticker} A/B control twin fired (chandelier arm)")
+        except Exception as _ce:
+            logger.debug(f"[runner] {ms.ticker} A/B control twin insert failed: {_ce}")
     try:
         push.send_signal_alert(ms.ticker, direction, 75, "stock",
                                signal_id=str(new_id) if new_id else None)

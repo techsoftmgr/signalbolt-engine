@@ -916,6 +916,44 @@ def get_smart_exit_scorecard(days: int = 45):
     return smart_exit_shadow.scorecard(sb, days=max(7, min(int(days), 180)))
 
 
+@app.get("/momentum-ab-scorecard")
+def get_momentum_ab_scorecard(days: int = 60):
+    """PUBLIC: the LIVE TREND_MOMENTUM A/B — arm A (smart-exit: giveback + confluence +
+    exhaustion TP) vs arm B (control: the chandelier trail), on the SAME setups. The
+    control twins (ab_arm='control') are excluded from every other analytic; this is the
+    one place they're read, purely for the head-to-head. Empty until MOMENTUM_AB_ENABLED
+    fires twins and some close."""
+    from datetime import datetime, timezone, timedelta
+    sb = _make_supabase()
+    since = (datetime.now(timezone.utc) - timedelta(days=max(7, min(int(days), 365)))).isoformat()
+    rows = (sb.table("signals")
+            .select("ticker,direction,status,result_pct,created_at,closed_reason,score_breakdown")
+            .gte("created_at", since).limit(4000).execute().data) or []
+
+    def _bd(r):
+        b = r.get("score_breakdown") or {}
+        return b if isinstance(b, dict) else {}
+    tm = [r for r in rows if _bd(r).get("detector_source") == "TREND_MOMENTUM"]
+
+    def _agg(sub):
+        closed = [float(r["result_pct"]) for r in sub
+                  if r.get("status") == "closed" and r.get("result_pct") is not None]
+        wins = sum(1 for p in closed if p > 0)
+        return {"total": len(sub), "active": sum(1 for r in sub if r.get("status") == "active"),
+                "closed": len(closed),
+                "avg_pct": round(sum(closed) / len(closed), 2) if closed else None,
+                "total_pct": round(sum(closed), 1) if closed else 0.0,
+                "win_rate": round(100 * wins / len(closed), 1) if closed else None}
+
+    smart = [r for r in tm if _bd(r).get("ab_arm") != "control"]   # arm A + existing untagged
+    control = [r for r in tm if _bd(r).get("ab_arm") == "control"]  # arm B
+    a, b = _agg(smart), _agg(control)
+    edge = (round(a["avg_pct"] - b["avg_pct"], 2)
+            if a["avg_pct"] is not None and b["avg_pct"] is not None else None)
+    return {"days": days, "smart_exit": a, "control": b, "avg_edge_pct": edge,
+            "note": "avg_edge_pct = smart_exit.avg − control.avg (positive → smart-exit banks more)"}
+
+
 @app.get("/jobs/status")
 def get_jobs_status():
     """Daily Jobs report — every scheduled job (catalog) merged with its last-run
@@ -1939,7 +1977,9 @@ async def get_signals(user_id: str = "", strategy_type: str = ""):
     """
     try:
         sb    = await _make_supabase_async()
-        query = sb.table("signals").select("*").order("created_at", desc=True)
+        query = (sb.table("signals").select("*")
+                 .or_("origin.is.null,origin.neq.ab_control")   # exclude A/B control twins
+                 .order("created_at", desc=True))
         if strategy_type:
             query = query.eq("strategy_type", strategy_type)
         result = await query.limit(50).execute()
@@ -4106,6 +4146,7 @@ async def admin_detector_stats(request: Request, days: int = 7):
             sb.table("signals")
               .select("ticker, direction, strategy_type, entry_price, result, result_pct, "
                       "status, score_breakdown, created_at")
+              .or_("origin.is.null,origin.neq.ab_control")   # exclude A/B control twins
               .gte("created_at", since)
               .order("created_at", desc=True)
               .limit(1000)
@@ -4241,6 +4282,7 @@ async def admin_detector_scorecard(request: Request, days: int = 30, cost_pct: f
             sb.table("signals")
               .select("result, result_pct, status, score_breakdown, strategy_type, "
                       "regime_type, confidence_score, created_at, direction")
+              .or_("origin.is.null,origin.neq.ab_control")   # exclude A/B control twins
               .eq("status", "closed")
               .gte("created_at", since)
               .limit(5000)
@@ -5085,6 +5127,7 @@ def _ticker_track_record(sb, sym: str) -> Optional[dict]:
     try:
         rows = (sb.table("signals")
                 .select("result,result_pct,closed_at,closed_reason")
+                .or_("origin.is.null,origin.neq.ab_control")   # exclude A/B control twins
                 .eq("ticker", sym)
                 .eq("status", "closed")
                 .order("closed_at", desc=True)
