@@ -1977,13 +1977,13 @@ async def get_signals(user_id: str = "", strategy_type: str = ""):
     """
     try:
         sb    = await _make_supabase_async()
-        query = (sb.table("signals").select("*")
-                 .or_("origin.is.null,origin.neq.ab_control")   # exclude A/B control twins
-                 .order("created_at", desc=True))
+        query = sb.table("signals").select("*").order("created_at", desc=True)
         if strategy_type:
             query = query.eq("strategy_type", strategy_type)
         result = await query.limit(50).execute()
-        return {"signals": result.data, "count": len(result.data)}
+        rows = [r for r in (result.data or [])
+                if not (isinstance(r, dict) and r.get("origin") == "ab_control")]  # drop A/B control twins
+        return {"signals": rows, "count": len(rows)}
     except Exception as e:
         logger.error(f"GET /signals error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
