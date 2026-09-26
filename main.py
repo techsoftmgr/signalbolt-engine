@@ -945,8 +945,11 @@ def get_momentum_ab_scorecard(days: int = 60):
                 "total_pct": round(sum(closed), 1) if closed else 0.0,
                 "win_rate": round(100 * wins / len(closed), 1) if closed else None}
 
-    smart = [r for r in tm if _bd(r).get("ab_arm") != "control"]   # arm A + existing untagged
-    control = [r for r in tm if _bd(r).get("ab_arm") == "control"]  # arm B
+    # ONLY the A/B cohort — signals born into an arm (tagged at fire time). Untagged
+    # signals (historical closes under the OLD chandelier, and the pre-flag active book)
+    # are NOT smart-exit's record and are excluded from both buckets.
+    smart = [r for r in tm if _bd(r).get("ab_arm") == "smart_exit"]   # arm A (new twins)
+    control = [r for r in tm if _bd(r).get("ab_arm") == "control"]    # arm B (new twins)
     a, b = _agg(smart), _agg(control)
     edge = (round(a["avg_pct"] - b["avg_pct"], 2)
             if a["avg_pct"] is not None and b["avg_pct"] is not None else None)
