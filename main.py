@@ -991,12 +991,44 @@ def get_momentum_ab_scorecard(days: int = 90):
     control = [r for r in tm if _bd(r).get("ab_arm") == "control"]    # arm B
     ctrl_by = {(r["ticker"], r.get("direction")): r for r in control}
 
+    # current prices for OPEN arms → live P/L (both arms of an open pair are identical)
+    live: dict = {}
+    open_tickers = sorted({r["ticker"] for r in smart + control if r.get("status") == "active"})
+    if open_tickers:
+        try:
+            from engine.alpaca_client import get_latest_prices
+            live = get_latest_prices(open_tickers) or {}
+        except Exception:
+            live = {}
+    now_utc = datetime.now(timezone.utc)
+
+    def _days_open(x):
+        try:
+            a0 = datetime.fromisoformat(x["created_at"].replace("Z", "+00:00"))
+            end = (datetime.fromisoformat(x["closed_at"].replace("Z", "+00:00"))
+                   if x.get("closed_at") else now_utc)
+            return max(0, (end - a0).days)
+        except Exception:
+            return None
+
     def _arm(x):
         if x is None:
             return None
         b = _bd(x)
+        realized = round(float(x["result_pct"]), 2) if x.get("result_pct") is not None else None
+        pl = realized
+        if x.get("status") != "closed":                 # live unrealized P/L
+            try:
+                e = float(x["entry_price"]); px = live.get(x["ticker"])
+                if px:
+                    pl = round(((float(px) - e) if x.get("direction") == "LONG" else (e - float(px))) / e * 100, 2)
+            except Exception:
+                pass
         return {"status": x.get("status"),
-                "result_pct": (round(float(x["result_pct"]), 2) if x.get("result_pct") is not None else None),
+                "opened": (x.get("created_at") or "")[:10],
+                "closed": ((x.get("closed_at") or "")[:10] or None),
+                "days_open": _days_open(x),
+                "pl_pct": pl, "result_pct": realized,
                 "locked_pct": _locked(x), "mfe_pct": b.get("mfe_pct"), "mae_pct": b.get("mae_pct"),
                 "closed_reason": x.get("closed_reason")}
 
