@@ -26,7 +26,7 @@ import pandas as pd
 
 import os
 
-from engine import alpaca_client, exit_engine
+from engine import alpaca_client, exit_engine, excursion
 from engine.signal_monitor import _update_sl, _close_signal, _log_event
 
 logger = logging.getLogger("signalbolt.momentum_monitor")
@@ -44,6 +44,29 @@ def _ext_k() -> float:
         return float(os.environ.get("SMART_EXIT_EXT_K", "5.0"))
     except (TypeError, ValueError):
         return 5.0
+
+
+def _update_excursion(sb, sig: dict, df) -> None:
+    """Ratchet score_breakdown.mfe_pct / mae_pct (best/worst % since entry) from daily
+    bars. Writes only on a new extreme. Best-effort — never raises into the manager."""
+    try:
+        entry = float(sig["entry_price"])
+        try:
+            ed = pd.to_datetime(sig.get("created_at")).date()
+        except Exception:
+            ed = None
+        mm = excursion.mfe_mae(sig["direction"], entry, df, ed)
+        if not mm:
+            return
+        bd = sig.get("score_breakdown") or {}
+        bd = bd if isinstance(bd, dict) else {}
+        mfe, mae = excursion.merge(bd.get("mfe_pct"), bd.get("mae_pct"), mm[0], mm[1])
+        if mfe != bd.get("mfe_pct") or mae != bd.get("mae_pct"):
+            nb = {**bd, "mfe_pct": mfe, "mae_pct": mae}
+            sb.table("signals").update({"score_breakdown": nb}).eq("id", sig["id"]).execute()
+            sig["score_breakdown"] = nb
+    except Exception as e:
+        logger.debug(f"[momentum_monitor] excursion update failed {sig.get('ticker')}: {e}")
 
 _ATR_PERIOD   = 22
 _ATR_MULT     = 3.0     # base chandelier distance (let early trends breathe)
@@ -131,6 +154,10 @@ def manage(sb) -> dict:
             atr   = _atr(df)
             sma50 = float(np.mean(closes[-_SMA_STRUCT:]))
             price = alpaca_client.get_latest_price(ticker) or last_close
+
+            # Track MFE/MAE (best/worst excursion since entry) on BOTH arms — pure
+            # observability: capture ratio = realized ÷ MFE, MAE = stop-placement heat.
+            _update_excursion(sb, sig, df)
 
             # ── A/B: route the smart-exit arm through exit_engine; the control twin
             #    (ab_arm='control') and everything when the kill switch is off stay

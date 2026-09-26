@@ -964,6 +964,11 @@ def get_momentum_ab_scorecard(days: int = 90):
         wins = [p for p in pcts if p > 0]; losses = [p for p in pcts if p <= 0]
         holds = [h for r in closed_rows if (h := _hold_days(r)) is not None]
         gross_w, gross_l = sum(wins), abs(sum(losses))
+        mfes = [float(_bd(r)["mfe_pct"]) for r in sub if _bd(r).get("mfe_pct") is not None]
+        maes = [float(_bd(r)["mae_pct"]) for r in sub if _bd(r).get("mae_pct") is not None]
+        cap = [(float(r["result_pct"]), float(_bd(r)["mfe_pct"]))
+               for r in closed_rows if _bd(r).get("mfe_pct") is not None]
+        cap_den = sum(m for _, m in cap)
         return {
             "total": len(sub), "active": sum(1 for r in sub if r.get("status") == "active"),
             "closed": len(pcts),
@@ -976,6 +981,9 @@ def get_momentum_ab_scorecard(days: int = 90):
             "best": round(max(pcts), 2) if pcts else None,
             "worst": round(min(pcts), 2) if pcts else None,
             "avg_hold_days": round(sum(holds) / len(holds), 1) if holds else None,
+            "avg_mfe": round(sum(mfes) / len(mfes), 2) if mfes else None,
+            "avg_mae": round(sum(maes) / len(maes), 2) if maes else None,
+            "capture_pct": round(100 * sum(p for p, _ in cap) / cap_den, 1) if cap_den > 0 else None,
             "exit_reasons": dict(Counter(r.get("closed_reason") or "?" for r in closed_rows)),
         }
 
@@ -986,9 +994,11 @@ def get_momentum_ab_scorecard(days: int = 90):
     def _arm(x):
         if x is None:
             return None
+        b = _bd(x)
         return {"status": x.get("status"),
                 "result_pct": (round(float(x["result_pct"]), 2) if x.get("result_pct") is not None else None),
-                "locked_pct": _locked(x), "closed_reason": x.get("closed_reason")}
+                "locked_pct": _locked(x), "mfe_pct": b.get("mfe_pct"), "mae_pct": b.get("mae_pct"),
+                "closed_reason": x.get("closed_reason")}
 
     pairs = []
     for r in sorted(smart, key=lambda x: x.get("created_at") or "", reverse=True):
