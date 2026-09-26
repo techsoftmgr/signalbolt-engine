@@ -926,9 +926,15 @@ def get_momentum_ab_scorecard(days: int = 60):
     from datetime import datetime, timezone, timedelta
     sb = _make_supabase()
     since = (datetime.now(timezone.utc) - timedelta(days=max(7, min(int(days), 365)))).isoformat()
-    rows = (sb.table("signals")
-            .select("ticker,direction,status,result_pct,created_at,closed_reason,score_breakdown")
-            .gte("created_at", since).limit(4000).execute().data) or []
+    rows = []      # paginate + order (a bare .limit() returns an arbitrary slice that
+    for off in range(0, 20000, 1000):   # can miss the recent A/B twins on a big window)
+        chunk = (sb.table("signals")
+                 .select("ticker,direction,status,result_pct,created_at,closed_reason,score_breakdown")
+                 .gte("created_at", since).order("created_at", desc=True)
+                 .range(off, off + 999).execute().data) or []
+        rows += chunk
+        if len(chunk) < 1000:
+            break
 
     def _bd(r):
         b = r.get("score_breakdown") or {}
