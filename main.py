@@ -917,19 +917,21 @@ def get_smart_exit_scorecard(days: int = 45):
 
 
 @app.get("/momentum-ab-scorecard")
-def get_momentum_ab_scorecard(days: int = 60):
+def get_momentum_ab_scorecard(days: int = 90):
     """PUBLIC: the LIVE TREND_MOMENTUM A/B — arm A (smart-exit: giveback + confluence +
-    exhaustion TP) vs arm B (control: the chandelier trail), on the SAME setups. The
-    control twins (ab_arm='control') are excluded from every other analytic; this is the
-    one place they're read, purely for the head-to-head. Empty until MOMENTUM_AB_ENABLED
-    fires twins and some close."""
+    exhaustion TP) vs arm B (control: the chandelier trail), on the SAME setups. Returns
+    rich per-arm analytics + a per-pair head-to-head. Control twins (ab_arm='control')
+    are read ONLY here; excluded from every other analytic. Counts ONLY tagged twins —
+    never the untagged historical/chandelier closes."""
     from datetime import datetime, timezone, timedelta
+    from collections import Counter
     sb = _make_supabase()
     since = (datetime.now(timezone.utc) - timedelta(days=max(7, min(int(days), 365)))).isoformat()
     rows = []      # paginate + order (a bare .limit() returns an arbitrary slice that
     for off in range(0, 20000, 1000):   # can miss the recent A/B twins on a big window)
         chunk = (sb.table("signals")
-                 .select("ticker,direction,status,result_pct,created_at,closed_reason,score_breakdown")
+                 .select("ticker,direction,entry_price,stop_loss,status,result_pct,"
+                         "created_at,closed_at,closed_reason,score_breakdown")
                  .gte("created_at", since).order("created_at", desc=True)
                  .range(off, off + 999).execute().data) or []
         rows += chunk
@@ -941,25 +943,67 @@ def get_momentum_ab_scorecard(days: int = 60):
         return b if isinstance(b, dict) else {}
     tm = [r for r in rows if _bd(r).get("detector_source") == "TREND_MOMENTUM"]
 
-    def _agg(sub):
-        closed = [float(r["result_pct"]) for r in sub
-                  if r.get("status") == "closed" and r.get("result_pct") is not None]
-        wins = sum(1 for p in closed if p > 0)
-        return {"total": len(sub), "active": sum(1 for r in sub if r.get("status") == "active"),
-                "closed": len(closed),
-                "avg_pct": round(sum(closed) / len(closed), 2) if closed else None,
-                "total_pct": round(sum(closed), 1) if closed else 0.0,
-                "win_rate": round(100 * wins / len(closed), 1) if closed else None}
+    def _hold_days(r):
+        try:
+            a0 = datetime.fromisoformat(r["created_at"].replace("Z", "+00:00"))
+            b0 = datetime.fromisoformat(r["closed_at"].replace("Z", "+00:00"))
+            return max(0, (b0 - a0).days)
+        except Exception:
+            return None
 
-    # ONLY the A/B cohort — signals born into an arm (tagged at fire time). Untagged
-    # signals (historical closes under the OLD chandelier, and the pre-flag active book)
-    # are NOT smart-exit's record and are excluded from both buckets.
-    smart = [r for r in tm if _bd(r).get("ab_arm") == "smart_exit"]   # arm A (new twins)
-    control = [r for r in tm if _bd(r).get("ab_arm") == "control"]    # arm B (new twins)
+    def _locked(r):   # how much profit the current STOP locks in (live divergence)
+        try:
+            e = float(r["entry_price"]); s = float(r["stop_loss"])
+            return round(((s - e) if r.get("direction") == "LONG" else (e - s)) / e * 100, 1)
+        except Exception:
+            return None
+
+    def _agg(sub):
+        closed_rows = [r for r in sub if r.get("status") == "closed" and r.get("result_pct") is not None]
+        pcts = [float(r["result_pct"]) for r in closed_rows]
+        wins = [p for p in pcts if p > 0]; losses = [p for p in pcts if p <= 0]
+        holds = [h for r in closed_rows if (h := _hold_days(r)) is not None]
+        gross_w, gross_l = sum(wins), abs(sum(losses))
+        return {
+            "total": len(sub), "active": sum(1 for r in sub if r.get("status") == "active"),
+            "closed": len(pcts),
+            "win_rate": round(100 * len(wins) / len(pcts), 1) if pcts else None,
+            "avg_pct": round(sum(pcts) / len(pcts), 2) if pcts else None,
+            "total_pct": round(sum(pcts), 1) if pcts else 0.0,
+            "avg_win": round(sum(wins) / len(wins), 2) if wins else None,
+            "avg_loss": round(sum(losses) / len(losses), 2) if losses else None,
+            "profit_factor": round(gross_w / gross_l, 2) if gross_l else None,
+            "best": round(max(pcts), 2) if pcts else None,
+            "worst": round(min(pcts), 2) if pcts else None,
+            "avg_hold_days": round(sum(holds) / len(holds), 1) if holds else None,
+            "exit_reasons": dict(Counter(r.get("closed_reason") or "?" for r in closed_rows)),
+        }
+
+    smart = [r for r in tm if _bd(r).get("ab_arm") == "smart_exit"]   # arm A
+    control = [r for r in tm if _bd(r).get("ab_arm") == "control"]    # arm B
+    ctrl_by = {(r["ticker"], r.get("direction")): r for r in control}
+
+    def _arm(x):
+        if x is None:
+            return None
+        return {"status": x.get("status"),
+                "result_pct": (round(float(x["result_pct"]), 2) if x.get("result_pct") is not None else None),
+                "locked_pct": _locked(x), "closed_reason": x.get("closed_reason")}
+
+    pairs = []
+    for r in sorted(smart, key=lambda x: x.get("created_at") or "", reverse=True):
+        c = ctrl_by.get((r["ticker"], r.get("direction")))
+        sa, ca = _arm(r), _arm(c)
+        edge = (round(sa["result_pct"] - ca["result_pct"], 2)
+                if sa and ca and sa["result_pct"] is not None and ca["result_pct"] is not None else None)
+        pairs.append({"ticker": r["ticker"], "direction": r.get("direction"),
+                      "entry": r.get("entry_price"), "created_at": r.get("created_at"),
+                      "smart_exit": sa, "control": ca, "edge": edge})
+
     a, b = _agg(smart), _agg(control)
     edge = (round(a["avg_pct"] - b["avg_pct"], 2)
             if a["avg_pct"] is not None and b["avg_pct"] is not None else None)
-    return {"days": days, "smart_exit": a, "control": b, "avg_edge_pct": edge,
+    return {"days": days, "smart_exit": a, "control": b, "avg_edge_pct": edge, "pairs": pairs,
             "note": "avg_edge_pct = smart_exit.avg − control.avg (positive → smart-exit banks more)"}
 
 
