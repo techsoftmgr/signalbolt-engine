@@ -26,7 +26,7 @@ import pandas as pd
 
 import os
 
-from engine import alpaca_client, exit_engine, excursion
+from engine import alpaca_client, exit_engine, excursion, earnings_guard
 from engine.signal_monitor import _update_sl, _close_signal, _log_event
 
 logger = logging.getLogger("signalbolt.momentum_monitor")
@@ -159,6 +159,22 @@ def manage(sb) -> dict:
             # observability: capture ratio = realized ÷ MFE, MAE = stop-placement heat.
             _update_excursion(sb, sig, df)
 
+            # ── EARNINGS GUARD (smart-exit / live arm only) — flatten before the
+            #    earnings print; a daily-close system can't stop an overnight gap. The
+            #    control arm holds through, so the A/B measures whether skipping helps.
+            if earnings_guard.enabled() and (sig.get("score_breakdown") or {}).get("ab_arm") != "control":
+                _eg, _ei = earnings_guard.should_close(ticker)
+                if _eg:
+                    _w = (_ei or {}).get("when") or ""
+                    _dt = (_ei or {}).get("date") or ""
+                    _close_momentum(sb, sig_id, ticker, sig["direction"], entry, price,
+                                    f"earnings guard — flat before {_dt} report ({_w})",
+                                    reason="earnings_guard")
+                    logger.info(f"[momentum_monitor] {ticker} CLOSED — earnings guard "
+                                f"(reports {_dt} {_w})")
+                    stats["closed"] += 1
+                    continue
+
             # ── A/B: route the smart-exit arm through exit_engine; the control twin
             #    (ab_arm='control') and everything when the kill switch is off stay
             #    on the chandelier below, so we compare the two exits on the SAME setup.
@@ -236,11 +252,12 @@ def manage(sb) -> dict:
     return stats
 
 
-def _close_momentum(sb, sig_id, ticker, direction, entry, price, why: str) -> None:
+def _close_momentum(sb, sig_id, ticker, direction, entry, price, why: str,
+                    reason: str = None) -> None:
     pnl = ((price - entry) / entry * 100) if direction == "LONG" \
           else ((entry - price) / entry * 100)
     won = pnl > 0
-    _close_signal(sb, sig_id, "target_hit" if won else "stop_hit",
+    _close_signal(sb, sig_id, reason or ("target_hit" if won else "stop_hit"),
                   current_price=price, entry_price=entry, direction=direction, ticker=ticker)
     _log_event(sb, sig_id, "closed_win" if won else "closed_loss", price=price,
                note=(f"{'✅' if won else '🔴'} Trend exit ({why}) @ ${price:.2f} "
