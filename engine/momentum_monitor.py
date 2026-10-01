@@ -282,6 +282,27 @@ def _peak_since_entry(df: pd.DataFrame, created_at, is_long: bool) -> float:
     return float(sub["low"].values.astype(float).min())
 
 
+def _chandelier_level(df: pd.DataFrame, is_long: bool, last_close: float,
+                      entry: float, atr: float) -> float:
+    """The chandelier trail level — MIRRORS the control branch exactly (roll_high −
+    mult×ATR, mult tightening as the gain grows, plus the >25%-gain giveback cap). Used
+    as a FLOOR under the smart-exit giveback so the smart-exit arm never locks LESS than
+    the control chandelier."""
+    gain_pct = ((last_close - entry) / entry * 100) if is_long else ((entry - last_close) / entry * 100)
+    mult = _atr_mult_for_gain(gain_pct)
+    if is_long:
+        roll_high = float(np.max(df["high"].values.astype(float)[-_HIGH_WINDOW:]))
+        chand = roll_high - mult * atr
+        if gain_pct >= _GIVEBACK_MIN_GAIN:
+            chand = max(chand, last_close * (1 - _GIVEBACK_CAP))
+    else:
+        roll_low = float(np.min(df["low"].values.astype(float)[-_HIGH_WINDOW:]))
+        chand = roll_low + mult * atr
+        if gain_pct >= _GIVEBACK_MIN_GAIN:
+            chand = min(chand, last_close * (1 + _GIVEBACK_CAP))
+    return chand
+
+
 def _manage_smart_exit(sb, sig: dict, df: pd.DataFrame, price: float, entry: float,
                        sl: float, is_long: bool, spy, stats: dict) -> None:
     """A/B arm A: manage ONE TREND_MOMENTUM signal with exit_engine (giveback cap +
@@ -315,17 +336,24 @@ def _manage_smart_exit(sb, sig: dict, df: pd.DataFrame, price: float, entry: flo
         stats["closed"] += 1
         return
 
-    # 4) ratchet the stored stop UP to the giveback floor (never down; can't force an exit)
+    # 4) ratchet the stored stop UP to the HIGHER of the giveback floor and the chandelier
+    #    — so the smart-exit arm locks AT LEAST as much as the control chandelier, and MORE
+    #    when the giveback floor protects a pulled-back winner (the chandelier loosens as a
+    #    winner fades; the giveback holds). Below the giveback arm%, the chandelier alone
+    #    still trails, so the stop never just sits at its original level.
+    chand = _chandelier_level(df, is_long, last_close, entry, _atr(df))
     gf = xr.get("giveback_floor")
-    if gf is not None:
-        eff = round(max(sl, gf), 2) if is_long else round(min(sl, gf), 2)
-        if (is_long and eff > sl + 0.01) or ((not is_long) and eff < sl - 0.01):
-            _update_sl(sb, sig_id, eff, sig=sig)
-            _locked = (((eff - entry) if is_long else (entry - eff)) / entry * 100)
-            _log_event(sb, sig_id, "be_move", price=price,
-                       note=(f"🔒 Smart-exit profit-lock → ${eff:.2f} "
-                             f"(giveback floor, locks {'+' if _locked >= 0 else ''}{_locked:.0f}%)"))
-            stats["trailed"] += 1
+    floor = chand if gf is None else (max(gf, chand) if is_long else min(gf, chand))
+    eff = round(max(sl, floor), 2) if is_long else round(min(sl, floor), 2)
+    if (is_long and eff > sl + 0.01) or ((not is_long) and eff < sl - 0.01):
+        _update_sl(sb, sig_id, eff, sig=sig)
+        _locked = (((eff - entry) if is_long else (entry - eff)) / entry * 100)
+        _src = ("giveback floor" if gf is not None and ((is_long and gf >= chand) or ((not is_long) and gf <= chand))
+                else "chandelier")
+        _log_event(sb, sig_id, "be_move", price=price,
+                   note=(f"🔒 Smart-exit profit-lock → ${eff:.2f} "
+                         f"({_src}, locks {'+' if _locked >= 0 else ''}{_locked:.0f}%)"))
+        stats["trailed"] += 1
 
 
 def stop_backstop(sb) -> dict:
