@@ -84,3 +84,18 @@ def test_hard_stop_on_daily_close_below_stop(monkeypatch):
 def test_peak_since_entry_uses_bars_after_entry():
     df = _daily([90, 95, 100, 110, 105])              # entry date = first bar
     assert mm._peak_since_entry(df, "2026-05-01", True) == 111.0   # max high (110+1)
+
+
+def test_locks_at_least_the_chandelier(monkeypatch):
+    # smooth low-ATR uptrend to ~+20% held near the high: the 0.5*peak giveback floor
+    # (+10%) is LOOSER than the chandelier, so the smart-exit stop must ratchet to the
+    # chandelier — never lock LESS than the control. (The bug the owner caught.)
+    rec = _Rec(); _patch(monkeypatch, rec)
+    closes = list(np.linspace(100, 120, 26))
+    df = _daily(closes)
+    chand = mm._chandelier_level(df, True, float(closes[-1]), 100.0, mm._atr(df))
+    mm._manage_smart_exit(None, _sig("X"), df, float(closes[-1]), 100.0, 95.0, True, None,
+                          {"closed": 0, "trailed": 0})
+    assert rec.sl, "should have ratcheted the stop"
+    assert rec.sl[0] >= round(chand, 2) - 0.01      # locked the chandelier floor
+    assert rec.sl[0] > 110.0                         # above the +10% giveback-only floor
