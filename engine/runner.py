@@ -2077,6 +2077,23 @@ def _fire_momentum(sb: Client, ms, direction: str, reentry: dict | None = None) 
     # arm A = smart-exit (managed by momentum_monitor via exit_engine); the A/B control
     # twin (arm B) rides the current chandelier so the two exits race on the SAME setup.
     signal_row["score_breakdown"]["ab_arm"] = "smart_exit"
+    # Record the EXIT config in effect at fire time, so future analysis can segment each
+    # signal by the arm/keep (and flags) that managed it — not just the live values, which
+    # drift as we tune. Stamped on both twins (control inherits it; it just ignores it).
+    try:
+        from engine import exit_engine as _ee
+        _ec = _ee.config_from_env()
+        _env = os.environ.get
+        _on = lambda k: _env(k, "false").strip().lower() in ("1", "true", "yes", "on")
+        signal_row["score_breakdown"]["exit_cfg"] = {
+            "giveback_arm":    _ec.giveback_arm_pct,
+            "giveback_keep":   _ec.giveback_keep,
+            "ext_k":           float(_env("SMART_EXIT_EXT_K", "5.0")),
+            "smart_exit":      _on("MOMENTUM_SMART_EXIT_ENABLED"),
+            "reentry_enabled": _on("RE_ENTRY_ENABLED"),
+        }
+    except Exception as _ce:
+        logger.debug(f"[runner] exit_cfg stamp failed: {_ce}")
     if reentry is not None:                    # tag for A/B measurement of the re-entry feature
         signal_row["score_breakdown"]["reentry"] = reentry
         signal_row["confidence_factors"] = [f"Re-entry (reclaimed entry after shakeout) — {setup_reason}"]
