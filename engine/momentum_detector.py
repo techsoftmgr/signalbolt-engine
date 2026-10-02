@@ -59,25 +59,70 @@ _MIN_VOL_ADJ    = 0.5             # minimum vol-adjusted momentum to qualify
 # A stable, liquid universe for cross-sectional ranking. Momentum needs a
 # CONSISTENT universe (not the daily movers list) so relative strength is
 # comparable day to day.
+# Broadened 2026-10 from 91 → ~260 liquid, optionable US large/mid-caps across ALL
+# sectors. Rationale: the old tech/semi-heavy list was highly correlated, so the
+# cross-sectional rank kept surfacing the SAME ~20-30 semis/software leaders — which
+# are already in the book (dedup blocks a re-fire), starving fresh fires (~2/day). A
+# broader, less-correlated universe rotates more NEW names into momentum each day and
+# diversifies away from the single "semis trade". Bad/illisted tickers fail get_bars
+# and are skipped; the active/delisted guards still apply.
 UNIVERSE = [
-    # mega-cap tech / semis
+    # ── mega-cap tech / semis ──────────────────────────────────────────────────
     "AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "TSLA", "NFLX", "AMD",
     "AVGO", "QCOM", "TXN", "MU", "AMAT", "LRCX", "KLAC", "MRVL", "ARM", "SMCI",
-    # software / cloud / growth
+    "ORCL", "CSCO", "IBM", "ADBE", "INTC", "INTU", "ADI", "MCHP", "NXPI", "ON",
+    "MPWR", "TER", "ANET", "DELL", "HPQ", "HPE", "WDC", "STX", "GLW", "KEYS",
+    "TDY", "GRMN", "CDW", "ZBRA", "TRMB",
+    # ── software / cloud / growth ─────────────────────────────────────────────
     "CRM", "NOW", "SNOW", "PLTR", "DDOG", "NET", "CRWD", "ZS", "PANW", "FTNT",
     "SHOP", "MELI", "SE", "U", "RBLX", "APP", "TTD", "RDDT", "SPOT",
-    # fintech / consumer growth
+    "WDAY", "TEAM", "HUBS", "DOCU", "OKTA", "MDB", "TWLO", "ZM", "PATH", "GTLB",
+    "S", "DBX", "CFLT", "ESTC", "BILL", "TOST", "ROKU", "DKNG", "EA", "TTWO",
+    # ── internet / media / telecom / China ────────────────────────────────────
+    "T", "VZ", "TMUS", "CMCSA", "CHTR", "WBD", "PARA", "FOXA", "OMC", "LYV",
+    "MTCH", "BABA", "JD", "PDD", "BIDU", "NTES",
+    # ── fintech / payments / consumer growth ──────────────────────────────────
     "COIN", "HOOD", "SOFI", "AFRM", "UPST", "CELH", "DUOL", "ONON", "DECK",
-    "ELF", "HIMS", "SNAP", "PINS", "ABNB", "UBER", "DASH",
-    # financials / industrials / energy / healthcare
-    "JPM", "GS", "MS", "BAC", "V", "MA", "XOM", "CVX", "COP", "CAT", "DE",
-    "BA", "GE", "LLY", "UNH", "MRK", "ABBV", "NVO",
-    # consumer / other megacaps
-    "COST", "WMT", "HD", "MCD", "NKE", "DIS", "KO", "PEP",
-    # crypto-adjacent / high-beta
+    "ELF", "HIMS", "SNAP", "PINS", "ABNB", "UBER", "DASH", "PYPL", "FI", "GPN",
+    # ── financials / banks / insurers / asset mgrs ────────────────────────────
+    "JPM", "GS", "MS", "BAC", "V", "MA", "WFC", "C", "USB", "PNC", "TFC", "SCHW",
+    "BLK", "SPGI", "MCO", "ICE", "CME", "CB", "AXP", "COF", "DFS", "SYF", "ALLY",
+    "FITB", "HBAN", "RF", "MTB", "BK", "STT", "AIG", "MET", "PRU", "AFL", "TRV",
+    "ALL", "PGR", "BX", "KKR", "APO",
+    # ── industrials / aero-defense / machinery / transport ────────────────────
+    "CAT", "DE", "BA", "GE", "HON", "UNP", "UPS", "RTX", "LMT", "NOC", "GD",
+    "MMM", "EMR", "ETN", "PH", "ITW", "CMI", "PCAR", "CARR", "OTIS", "JCI",
+    "ROK", "AME", "DOV", "IR", "FAST", "GWW", "URI", "PWR", "FDX", "CSX", "NSC",
+    "DAL", "UAL", "LUV", "AAL", "WM", "RSG",
+    # ── materials / chemicals / metals / mining ───────────────────────────────
+    "LIN", "APD", "SHW", "ECL", "FCX", "NEM", "NUE", "STLD", "DOW", "DD", "PPG",
+    "ALB", "CF", "CTVA", "VMC", "MLM", "GOLD", "SCCO",
+    # ── energy ────────────────────────────────────────────────────────────────
+    "XOM", "CVX", "COP", "SLB", "HAL", "BKR", "EOG", "OXY", "PSX", "MPC", "VLO",
+    "DVN", "FANG", "HES", "WMB", "KMI", "OKE", "LNG", "TRGP", "CTRA",
+    # ── healthcare / pharma / biotech / devices ───────────────────────────────
+    "LLY", "UNH", "MRK", "ABBV", "NVO", "JNJ", "PFE", "ABT", "TMO", "DHR", "BMY",
+    "AMGN", "GILD", "VRTX", "REGN", "BIIB", "MRNA", "BNTX", "ISRG", "MDT", "SYK",
+    "BSX", "EW", "BDX", "HCA", "CI", "CVS", "ELV", "HUM", "CNC", "MCK", "ZTS",
+    "DXCM", "IDXX", "IQV", "RMD", "ALGN", "PODD", "GEHC", "VEEV",
+    # ── consumer discretionary / retail / restaurants / autos ─────────────────
+    "COST", "WMT", "HD", "MCD", "NKE", "DIS", "LOW", "TJX", "SBUX", "CMG", "ORLY",
+    "AZO", "ROST", "TGT", "DG", "DLTR", "YUM", "MAR", "HLT", "BKNG", "RCL", "CCL",
+    "NCLH", "LVS", "WYNN", "MGM", "GM", "F", "RIVN", "LCID", "APTV", "LULU",
+    "ULTA", "BBY", "DPZ", "DRI", "EBAY", "ETSY",
+    # ── consumer staples ──────────────────────────────────────────────────────
+    "KO", "PEP", "PG", "MDLZ", "CL", "KMB", "GIS", "KHC", "HSY", "STZ", "MO",
+    "PM", "KDP", "MNST", "KR", "SYY", "ADM", "TSN", "CLX",
+    # ── utilities ─────────────────────────────────────────────────────────────
+    "NEE", "DUK", "SO", "D", "AEP", "EXC", "SRE", "XEL", "ED", "PEG", "WEC",
+    "CEG", "VST",
+    # ── REITs ─────────────────────────────────────────────────────────────────
+    "AMT", "PLD", "EQIX", "CCI", "PSA", "O", "SPG", "WELL", "DLR", "VICI",
+    # ── crypto-adjacent / high-beta ───────────────────────────────────────────
     "MSTR", "MARA", "RIOT", "CLSK",
-    # sector / index ETFs (trend reference)
-    "SPY", "QQQ", "IWM", "XLK", "XLF", "XLE", "SMH",
+    # ── sector / index ETFs (trend reference) ─────────────────────────────────
+    "SPY", "QQQ", "IWM", "DIA", "XLK", "XLF", "XLE", "SMH", "XLV", "XLI", "XLY",
+    "XLP", "XLU", "XLB", "XLRE", "XLC", "XBI", "XOP", "GDX", "KRE", "SOXX", "IGV",
 ]
 
 

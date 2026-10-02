@@ -1975,8 +1975,14 @@ def _momentum_ab_on() -> bool:
     return os.environ.get("MOMENTUM_AB_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _fire_momentum(sb: Client, ms, direction: str) -> None:
-    """Fire a swing momentum signal (detector_source=TREND_MOMENTUM)."""
+def _fire_momentum(sb: Client, ms, direction: str, reentry: dict | None = None) -> None:
+    """Fire a swing momentum signal (detector_source=TREND_MOMENTUM).
+
+    reentry: when set (from engine.reentry), this is a re-engagement of a name we were
+    shaken out of that has RECLAIMED its original entry. The reclaim + 20-EMA hold +
+    fresh momentum re-score ARE the confirmation, so the intraday entry-gate is skipped
+    (it would double-gate a validated pullback-reclaim); the dict is tagged into
+    score_breakdown.reentry for A/B measurement."""
     strategy_type = "swing_trade"
     if _has_active_signal(sb, ms.ticker, strategy_type):
         return
@@ -1996,21 +2002,22 @@ def _fire_momentum(sb: Client, ms, direction: str) -> None:
         return
 
     entry_gate_log: dict = {}
-    try:
-        from engine import alpaca_client as _alpaca
-        df_e = _alpaca.get_bars(ms.ticker, timeframe="1Hour", days=10)
-        gate = entry_gate.check(ticker=ms.ticker, direction=direction,
-                                strategy_type=strategy_type, df_entry=df_e,
-                                price=price, entry_tf="1h", detector="TREND_MOMENTUM")
-        entry_gate_log = dict(gate.gate_log)
-        if not gate.allowed:
-            logger.info(f"[runner] {ms.ticker} TREND_MOMENTUM blocked: {' | '.join(gate.reasons)}")
-            entry_gate.log_rejection(sb=sb, ticker=ms.ticker, direction=direction,
-                                     strategy_type=strategy_type, price=price,
-                                     confidence_score=75, gate=gate, detector="TREND_MOMENTUM")
-            return
-    except Exception as e:
-        logger.warning(f"[runner] {ms.ticker} TREND_MOMENTUM gate error (failing open): {e}")
+    if reentry is None:                       # re-entries skip the intraday gate (already confirmed)
+        try:
+            from engine import alpaca_client as _alpaca
+            df_e = _alpaca.get_bars(ms.ticker, timeframe="1Hour", days=10)
+            gate = entry_gate.check(ticker=ms.ticker, direction=direction,
+                                    strategy_type=strategy_type, df_entry=df_e,
+                                    price=price, entry_tf="1h", detector="TREND_MOMENTUM")
+            entry_gate_log = dict(gate.gate_log)
+            if not gate.allowed:
+                logger.info(f"[runner] {ms.ticker} TREND_MOMENTUM blocked: {' | '.join(gate.reasons)}")
+                entry_gate.log_rejection(sb=sb, ticker=ms.ticker, direction=direction,
+                                         strategy_type=strategy_type, price=price,
+                                         confidence_score=75, gate=gate, detector="TREND_MOMENTUM")
+                return
+        except Exception as e:
+            logger.warning(f"[runner] {ms.ticker} TREND_MOMENTUM gate error (failing open): {e}")
 
     risk_chk = risk_manager.check(sb, ms.ticker, 75)
     if not risk_chk["allowed"]:
@@ -2070,6 +2077,9 @@ def _fire_momentum(sb: Client, ms, direction: str) -> None:
     # arm A = smart-exit (managed by momentum_monitor via exit_engine); the A/B control
     # twin (arm B) rides the current chandelier so the two exits race on the SAME setup.
     signal_row["score_breakdown"]["ab_arm"] = "smart_exit"
+    if reentry is not None:                    # tag for A/B measurement of the re-entry feature
+        signal_row["score_breakdown"]["reentry"] = reentry
+        signal_row["confidence_factors"] = [f"Re-entry (reclaimed entry after shakeout) — {setup_reason}"]
     new_id = _write_signal(sb, signal_row)
     if _momentum_ab_on():
         try:
@@ -2141,6 +2151,15 @@ def _run_momentum_scan() -> None:
             _fire_momentum(sb, s, "SHORT")
         logger.info(f"[runner] ═══ Momentum scan done — {len(scores)} qualified, "
                     f"fired {len(longs)} longs / {len(shorts)} shorts (regime={regime.get('regime_type')}) ═══")
+
+        # ── Shakeout re-entry (default-OFF, RE_ENTRY_ENABLED) ──────────────────
+        # Re-engage names we were shaken out of that have reclaimed their entry.
+        # Runs AFTER the fresh scan so the re-entry dedup sees anything just fired.
+        try:
+            from engine import reentry
+            reentry.scan(sb)
+        except Exception as _re:
+            logger.debug(f"[runner] reentry scan skipped: {_re}")
     except Exception as e:
         sentry_sdk.capture_exception(e)
         logger.error(f"[runner] Momentum scan failed: {e}", exc_info=True)
